@@ -97,6 +97,26 @@ the kitchen, recipe-based stock, purchasing and supplier invoices, finance and A
   `<server-ip>.sslip.io`. Full Vultr guide: [`deploy/vultr/README.md`](deploy/vultr/README.md). Secrets never enter Git or
   the images.
 
+### Built during Agent Rush (3–8 November 2026)
+
+Automation Restaurant existed before the hackathon; this repository is a clean snapshot of
+it (one commit, without the earlier private history). During the event we added:
+
+- **The Vultr deployment:** the app and API running on a Vultr Cloud Compute VM, with
+  Docker images, Caddy HTTPS, a one-command deploy script and the
+  [Vultr guide](deploy/vultr/README.md) ([`deploy/vultr/`](deploy/vultr)).
+- **The integration API:** read-only, per-restaurant API keys that let other agent systems
+  (Virtual AI Department's "Connect & discover" REST contract) read menu, inventory,
+  suppliers, invoices, sales and food cost, with keys stored only as a SHA-256 hash
+  ([`apps/api/src/routes/integration.ts`](apps/api/src/routes/integration.ts), see
+  [Integration API](#integration-api)).
+- **The hackathon pitch deck and demo** on the live Vultr deployment.
+
+Everything else described in this README (ordering, kitchen, stock, purchasing, finance,
+AI assistant, branches) was built before the event.
+
+Licensed under the [MIT License](LICENSE).
+
 ## Screenshots
 
 <table>
