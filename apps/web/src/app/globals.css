@@ -1,0 +1,325 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design tokens (RULE-UI-03). Values are space-separated RGB channels so Tailwind
+   can apply opacity via rgb(var(--x) / <alpha-value>). */
+:root {
+  /* Platform brand colour: black (the Brand Kit's "Minimal Black" preset).
+     A restaurant's own Brand Kit colour, when set, overrides it. */
+  --primary: 24 24 27;
+  --primary-fg: 255 255 255;
+  --bg-main: 248 250 252;
+  --bg-surface: 255 255 255;
+  --border-color: 226 232 240;
+  --text-body: 15 23 42;
+  --text-muted: 100 116 139;
+  --ok: 5 150 105;
+  --warn: 217 119 6;
+  --danger: 225 29 72;
+  --radius: 12px;
+
+  /* Marketing-site-only tokens (additive — never read by the RMS portal UI,
+     which keeps its own --bg-main/--text-body dark-mode pair above). A near-
+     black "ink" tone for the site's dark command-center sections, and a
+     gold accent reserved for AI content so it reads as a distinct layer
+     rather than another use of the primary brand color. */
+  --ink: 9 9 14;
+  --ink-fg: 250 250 250;
+  --ink-muted: 161 161 170;
+  --gold: 202 138 4;
+}
+
+/* Dark mode (RULE-UI-03) — a restaurant's own Brand Kit "Appearance"
+   setting (light/dark/system) is the ONLY thing that switches these, via
+   ThemeProvider setting data-theme on <html> (see components/ThemeProvider
+   and lib/theme.ts). A near-neutral near-black, refined to match the
+   Owner Dashboard's "Command Center" redesign — previously a navy slate.
+   This must stay conditional: an explicit 'light' choice (data-theme=
+   'light') always wins, exactly as before. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    /* Black stays black on a dark page, lifted one step so buttons don't
+       vanish into the near-black background. */
+    --primary: 63 63 70;
+    --bg-main: 9 9 14;
+    --bg-surface: 20 20 26;
+    --border-color: 38 38 45;
+    --text-body: 245 245 247;
+    --text-muted: 158 158 168;
+  }
+}
+
+:root[data-theme='dark'] {
+  --primary: 63 63 70;
+  --bg-main: 9 9 14;
+  --bg-surface: 20 20 26;
+  --border-color: 38 38 45;
+  --text-body: 245 245 247;
+  --text-muted: 158 158 168;
+}
+
+html,
+body {
+  background: rgb(var(--bg-main));
+  color: rgb(var(--text-body));
+}
+
+/* Hides the scrollbar on horizontally-scrollable strips (category pills,
+   image galleries) while keeping the element natively scrollable. */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* ── Marketing site motion — restrained, and off entirely for anyone who's
+   asked for reduced motion. Scoped by these specific classes, so nothing
+   in the RMS portal is affected. ────────────────────────────────────── */
+@keyframes site-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.site-fade-in {
+  animation: site-fade-in 0.18s ease-out both;
+}
+
+.site-reveal {
+  opacity: 0;
+  transform: translateY(16px);
+  transition: opacity 0.6s ease-out, transform 0.6s ease-out;
+}
+.site-reveal.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .site-fade-in,
+  .site-reveal {
+    animation: none !important;
+    transition: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+}
+
+/* ── Accessibility (lib/a11y.ts) ─────────────────────────────────────────
+   Preferences are data attributes on <html>, set before first paint by the
+   root layout and changed from the Accessibility menu. They change real
+   rendering: root text size (every rem-based size follows), colour tokens,
+   motion, link styling, text spacing and control sizes. */
+
+:root {
+  /* Focus ring: visible on every surface, in both themes. */
+  --focus: 37 99 235;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --focus: 96 165 250;
+  }
+}
+:root[data-theme='dark'] {
+  --focus: 96 165 250;
+}
+
+/* Keyboard focus is always visible (inputs that use outline-none included). */
+:focus-visible {
+  outline: 2px solid rgb(var(--focus));
+  outline-offset: 2px;
+}
+:root[data-a11y-contrast='high'] :focus-visible {
+  outline-width: 3px;
+}
+
+/* Visually hidden until focused: the "Skip to main content" link. */
+.skip-link {
+  position: absolute;
+  left: 0.75rem;
+  top: -10rem;
+  z-index: 100;
+  border-radius: 0.5rem;
+  background: rgb(var(--bg-surface));
+  color: rgb(var(--text-body));
+  padding: 0.5rem 0.875rem;
+  font-weight: 700;
+  font-size: 0.875rem;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.25);
+}
+.skip-link:focus {
+  top: 0.75rem;
+}
+
+/* Text size. */
+:root[data-a11y-text='112'] {
+  font-size: 112.5%;
+}
+:root[data-a11y-text='125'] {
+  font-size: 125%;
+}
+:root[data-a11y-text='150'] {
+  font-size: 150%;
+}
+
+/* High contrast: darker text and muted text, stronger borders and status colours. */
+:root[data-a11y-contrast='high']:not([data-theme='dark']) {
+  --bg-main: 255 255 255;
+  --bg-surface: 255 255 255;
+  --border-color: 71 85 105;
+  --text-body: 0 0 0;
+  --text-muted: 30 41 59;
+  --ok: 4 108 78;
+  --warn: 146 64 14;
+  --danger: 176 17 54;
+  --ink-muted: 228 228 231;
+  --gold: 161 98 7;
+  --focus: 29 78 216;
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-a11y-contrast='high']:not([data-theme='light']) {
+    --bg-main: 0 0 0;
+    --bg-surface: 10 10 12;
+    --border-color: 161 161 170;
+    --text-body: 255 255 255;
+    --text-muted: 228 228 231;
+    --ok: 74 222 128;
+    --warn: 251 191 36;
+    --danger: 251 113 133;
+    --ink-muted: 228 228 231;
+    --gold: 250 204 21;
+    --focus: 147 197 253;
+  }
+}
+:root[data-theme='dark'][data-a11y-contrast='high'] {
+  --bg-main: 0 0 0;
+  --bg-surface: 10 10 12;
+  --border-color: 161 161 170;
+  --text-body: 255 255 255;
+  --text-muted: 228 228 231;
+  --ok: 74 222 128;
+  --warn: 251 191 36;
+  --danger: 251 113 133;
+  --ink-muted: 228 228 231;
+  --gold: 250 204 21;
+  --focus: 147 197 253;
+}
+/* Faded helper text (opacity-60 etc.) is shown at full strength; disabled controls keep their cue. */
+:root[data-a11y-contrast='high'] :is(.opacity-50, .opacity-60, .opacity-70, .opacity-75, .opacity-80):not(:disabled):not([aria-disabled='true']) {
+  opacity: 1;
+}
+
+/* Reduced motion: the OS setting, or the in-app choice. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+:root[data-a11y-motion='reduce'] *,
+:root[data-a11y-motion='reduce'] *::before,
+:root[data-a11y-motion='reduce'] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+:root[data-a11y-motion='reduce'] .site-reveal {
+  opacity: 1 !important;
+  transform: none !important;
+}
+
+/* Underlined links. */
+:root[data-a11y-links='underline'] a[href] {
+  text-decoration-line: underline !important;
+  text-underline-offset: 0.18em;
+}
+
+/* Wider text spacing (WCAG 1.4.12 values). */
+:root[data-a11y-spacing='wide'] body {
+  letter-spacing: 0.06em;
+  word-spacing: 0.16em;
+}
+:root[data-a11y-spacing='wide'] :is(p, li, dd, td, label, blockquote) {
+  line-height: 1.6 !important;
+}
+
+/* Larger touch targets. */
+:root[data-a11y-targets='large']
+  :is(button, [role='button'], [role='tab'], select, summary, input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='hidden'])) {
+  min-height: 2.75rem;
+}
+:root[data-a11y-targets='large'] :is(button, [role='button'], [role='tab']) {
+  min-width: 2.75rem;
+}
+:root[data-a11y-targets='large'] :is(input[type='checkbox'], input[type='radio']) {
+  width: 1.375rem;
+  height: 1.375rem;
+}
+
+/* Readable text colours (WCAG AA 4.5:1). Fills and borders keep the brand and
+   status colours; text-primary / text-ok / text-warn / text-danger read these
+   (tailwind.config.ts textColor). --primary-text-light/-dark are computed from
+   the Brand Kit colour in lib/theme.ts. */
+:root {
+  --primary-text: var(--primary-text-light, var(--primary));
+  --ok-text: 4 120 87;
+  --warn-text: 180 83 9;
+  --danger-text: 190 18 60;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --primary-text: var(--primary-text-dark, 212 212 216);
+    --ok-text: 52 211 153;
+    --warn-text: 251 191 36;
+    --danger-text: 251 113 133;
+  }
+}
+:root[data-theme='dark'] {
+  --primary-text: var(--primary-text-dark, 212 212 216);
+  --ok-text: 52 211 153;
+  --warn-text: 251 191 36;
+  --danger-text: 251 113 133;
+}
+:root[data-a11y-contrast='high']:not([data-theme='dark']) {
+  --ok-text: 4 96 69;
+  --warn-text: 124 45 18;
+  --danger-text: 159 18 57;
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-a11y-contrast='high']:not([data-theme='light']) {
+    --ok-text: 110 231 183;
+    --warn-text: 252 211 77;
+    --danger-text: 253 164 175;
+  }
+}
+:root[data-theme='dark'][data-a11y-contrast='high'] {
+  --ok-text: 110 231 183;
+  --warn-text: 252 211 77;
+  --danger-text: 253 164 175;
+}
+
+/* ── Screen language (lib/i18n) ──────────────────────────────────────────
+   Restaurant pages can be shown in Urdu (and other languages) right to left.
+   Layouts use logical classes (ms-/me-/ps-/pe-/start-/end-/text-start), so
+   they mirror by themselves; these rules cover what classes can't. */
+
+/* Hidden only until the first translation pass (max 1.5 s, see uiLanguageScript.ts). */
+html[data-ui-pending] body {
+  opacity: 0;
+}
+
+/* Urdu, Arabic, Persian and Pashto in a font made for the script. */
+html:is([lang='ur'], [lang='ar'], [lang='fa'], [lang='ps'], [lang='sd']) body {
+  font-family: var(--font-arabic-script), 'Segoe UI', Tahoma, sans-serif;
+}
+
+/* space-x-* spaces from the left; in right-to-left it must space from the right. */
+[dir='rtl'] [class*='space-x-'] > :not([hidden]) ~ :not([hidden]) {
+  --tw-space-x-reverse: 1;
+}

@@ -1,0 +1,565 @@
+'use client';
+
+import { useState } from 'react';
+import { useRouter, useParams } from 'next/navigation';
+import { usePortalSupabase } from '@/components/PortalProvider';
+import { Button, Card, Field, Input, Select } from '@/components/ui';
+import { formatCents } from '@/lib/format';
+
+const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
+
+type Item = {
+  id: string;
+  name: string;
+  unit: string;
+  stock_qty: number;
+  min_threshold: number;
+  target_stock_qty: number | null;
+  auto_reorder_email: boolean;
+  supplier_name: string | null;
+  cost_cents_per_base_unit: number;
+};
+type Supplier = { id: string; name: string; email: string | null };
+
+/** adjust_stock / record_ingredient_waste / submit_stock_count reject over
+ *  the wire with terse Postgres error codes (e.g. "insufficient_stock: <uuid>")
+ *  rather than a message meant for an end user — translate the ones staff can
+ *  actually trigger into plain language naming the item they were editing. */
+function friendlyStockError(message: string, item: Item): string {
+  if (message.startsWith('insufficient_stock')) {
+    return `Only ${item.stock_qty} ${item.unit} of ${item.name} in stock — enter an amount at or below that.`;
+  }
+  if (message.startsWith('would_go_negative')) {
+    return `That would take ${item.name} below zero stock.`;
+  }
+  if (message.startsWith('reason_required')) {
+    return 'A reason is required to record waste.';
+  }
+  if (message.startsWith('bad_qty')) {
+    return 'Enter a quantity greater than zero.';
+  }
+  if (message.startsWith('forbidden')) {
+    return "You don't have permission to do that.";
+  }
+  return message;
+}
+
+export function InventoryManager({
+  items,
+  canViewCost,
+  canManageAutomation,
+  canAddItem,
+  canRestock,
+  canWaste,
+  canCount,
+  suppliers,
+  preferredBySupplierItem,
+  lowStockEmailEnabled,
+}: {
+  items: Item[];
+  canViewCost: boolean;
+  canManageAutomation: boolean;
+  /** stock.update — matches inventory_items' mgr_write RLS policy (creating a new item row). */
+  canAddItem: boolean;
+  /** stock.adjust or inventory.manage — matches adjust_stock()'s has_perm check. */
+  canRestock: boolean;
+  /** inventory.manage_waste or stock.adjust — matches record_ingredient_waste()'s has_perm check. */
+  canWaste: boolean;
+  /** stock.count or stock.adjust — matches submit_stock_count()'s has_perm check. */
+  canCount: boolean;
+  suppliers: Supplier[];
+  preferredBySupplierItem: Record<string, { supplierItemId: string; supplierId: string }>;
+  lowStockEmailEnabled: boolean;
+}) {
+  const router = useRouter();
+  const params = useParams();
+  const slug = (params?.slug as string) ?? '';
+  const supabase = usePortalSupabase();
+  const [error, setError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [deltas, setDeltas] = useState<Record<string, string>>({});
+  const [automationBusy, setAutomationBusy] = useState(false);
+  const [sweepBusy, setSweepBusy] = useState(false);
+  const [sweepMessage, setSweepMessage] = useState<string | null>(null);
+
+  const [newName, setNewName] = useState('');
+  const [newUnit, setNewUnit] = useState('unit');
+  const [newMin, setNewMin] = useState('0');
+  const [adding, setAdding] = useState(false);
+
+  async function triggerLowStockSweep() {
+    setSweepBusy(true);
+    setError(null);
+    setSweepMessage(null);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`${API}/api/inventory/low-stock/sweep`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session?.access_token ?? ''}`,
+        },
+        body: JSON.stringify({ slug }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(data.message ?? 'Failed to send low stock reorder emails.');
+      } else {
+        setSweepMessage(data.message ?? 'Low stock check completed.');
+      }
+    } catch {
+      setError('Network error triggering low stock email.');
+    } finally {
+      setSweepBusy(false);
+      router.refresh();
+    }
+  }
+
+  async function adjust(item: Item, sign: 1 | -1) {
+    const raw = parseFloat(deltas[item.id] ?? '');
+    if (Number.isNaN(raw) || raw <= 0) {
+      setError('Enter a positive amount to add or remove.');
+      return;
+    }
+    setBusyId(item.id);
+    setError(null);
+    const { error } = await supabase.rpc('adjust_stock', {
+      p_inventory_item_id: item.id,
+      p_delta: sign * raw,
+      p_reason: sign > 0 ? 'restock' : 'adjustment',
+      p_note: null,
+    });
+    setBusyId(null);
+    if (error) {
+      setError(friendlyStockError(error.message, item));
+      return;
+    }
+    setDeltas((d) => ({ ...d, [item.id]: '' }));
+    router.refresh();
+
+    // If new stock is at or below threshold, trigger immediate low-stock reorder sweep
+    const nextQty = Number(item.stock_qty) + sign * raw;
+    if (nextQty <= Number(item.min_threshold)) {
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        fetch(`${API}/api/inventory/low-stock/sweep`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session?.access_token ?? ''}`,
+          },
+          body: JSON.stringify({ slug }),
+        }).catch(() => {});
+      });
+    }
+  }
+
+  async function waste(item: Item) {
+    const raw = parseFloat(deltas[item.id] ?? '');
+    if (Number.isNaN(raw) || raw <= 0) {
+      setError('Enter a positive amount wasted.');
+      return;
+    }
+    const reason = window.prompt(`Reason for wasting ${raw} ${item.unit} of ${item.name}:`);
+    if (!reason) return;
+    setBusyId(item.id);
+    setError(null);
+    const { error } = await supabase.rpc('record_ingredient_waste', {
+      p_inventory_item_id: item.id,
+      p_qty: raw,
+      p_note: reason,
+    });
+    setBusyId(null);
+    if (error) {
+      setError(friendlyStockError(error.message, item));
+      return;
+    }
+    setDeltas((d) => ({ ...d, [item.id]: '' }));
+    router.refresh();
+
+    // If new stock is at or below threshold, trigger immediate low-stock reorder sweep
+    const nextQty = Number(item.stock_qty) - raw;
+    if (nextQty <= Number(item.min_threshold)) {
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        fetch(`${API}/api/inventory/low-stock/sweep`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${session?.access_token ?? ''}`,
+          },
+          body: JSON.stringify({ slug }),
+        }).catch(() => {});
+      });
+    }
+  }
+
+  async function count(item: Item) {
+    const v = window.prompt(`Physical count for ${item.name} (currently ${item.stock_qty} ${item.unit}):`, String(item.stock_qty));
+    if (v == null) return;
+    const counted = parseFloat(v);
+    if (Number.isNaN(counted) || counted < 0) {
+      setError('Enter a valid non-negative count.');
+      return;
+    }
+    setBusyId(item.id);
+    setError(null);
+    const { error } = await supabase.rpc('submit_stock_count', {
+      p_inventory_item_id: item.id,
+      p_counted_qty: counted,
+      p_note: null,
+    });
+    setBusyId(null);
+    if (error) {
+      setError(friendlyStockError(error.message, item));
+      return;
+    }
+    router.refresh();
+  }
+
+  async function setCost(item: Item) {
+    const v = window.prompt(
+      `Cost per ${item.unit} for ${item.name} (used for recipe/food-cost calculations):`,
+      (item.cost_cents_per_base_unit / 100).toFixed(4),
+    );
+    if (v == null) return;
+    const cents = Math.round(parseFloat(v) * 100);
+    if (Number.isNaN(cents) || cents < 0) {
+      setError('Enter a valid cost.');
+      return;
+    }
+    setBusyId(item.id);
+    setError(null);
+    const { error } = await supabase
+      .from('inventory_items')
+      .update({ cost_cents_per_base_unit: cents })
+      .eq('id', item.id);
+    setBusyId(null);
+    if (error) {
+      setError(error.message);
+      return;
+    }
+    router.refresh();
+  }
+
+  async function setTarget(item: Item) {
+    const v = window.prompt(
+      `Target stock for ${item.name} (${item.unit}) — used to size the automatic low-stock reorder email. Leave blank to clear.`,
+      item.target_stock_qty != null ? String(item.target_stock_qty) : '',
+    );
+    if (v == null) return;
+    const trimmed = v.trim();
+    const target = trimmed === '' ? null : parseFloat(trimmed);
+    if (trimmed !== '' && (Number.isNaN(target) || (target as number) < 0)) {
+      setError('Enter a valid non-negative target, or leave blank to clear it.');
+      return;
+    }
+    setBusyId(item.id);
+    setError(null);
+    const { error } = await supabase.from('inventory_items').update({ target_stock_qty: target }).eq('id', item.id);
+    setBusyId(null);
+    if (error) {
+      setError(error.message);
+      return;
+    }
+    router.refresh();
+  }
+
+  async function setPreferredSupplier(item: Item, supplierId: string) {
+    setBusyId(item.id);
+    setError(null);
+    const existing = preferredBySupplierItem[item.id];
+    if (existing && existing.supplierId === supplierId) {
+      setBusyId(null);
+      return;
+    }
+    // Only one preferred supplier per item — clear any other preferred row
+    // for this item before setting the new one (or clearing to "none").
+    if (existing) {
+      await supabase.from('supplier_items').update({ is_preferred: false }).eq('id', existing.supplierItemId);
+    }
+    if (supplierId) {
+      const { data: already } = await supabase
+        .from('supplier_items')
+        .select('id')
+        .eq('supplier_id', supplierId)
+        .eq('inventory_item_id', item.id)
+        .maybeSingle();
+      const { error } = already
+        ? await supabase.from('supplier_items').update({ is_preferred: true }).eq('id', already.id)
+        : await supabase.from('supplier_items').insert({ supplier_id: supplierId, inventory_item_id: item.id, is_preferred: true });
+      setBusyId(null);
+      if (error) {
+        setError(error.message);
+        return;
+      }
+    } else {
+      setBusyId(null);
+    }
+    router.refresh();
+  }
+
+  async function toggleItemAutomation(item: Item) {
+    setBusyId(item.id);
+    setError(null);
+    const { error } = await supabase.from('inventory_items').update({ auto_reorder_email: !item.auto_reorder_email }).eq('id', item.id);
+    setBusyId(null);
+    if (error) {
+      setError(error.message);
+      return;
+    }
+    router.refresh();
+  }
+
+  async function toggleLowStockEmailEnabled() {
+    setAutomationBusy(true);
+    setError(null);
+    const { error } = await supabase.from('purchasing_settings').update({ low_stock_email_enabled: !lowStockEmailEnabled }).eq('id', true);
+    setAutomationBusy(false);
+    if (error) {
+      setError(error.message);
+      return;
+    }
+    router.refresh();
+  }
+
+  async function addItem(e: React.FormEvent) {
+    e.preventDefault();
+    if (!newName.trim()) {
+      setError('Name is required.');
+      return;
+    }
+    setAdding(true);
+    setError(null);
+    const { error } = await supabase.from('inventory_items').insert({
+      name: newName.trim(),
+      unit: newUnit.trim() || 'unit',
+      min_threshold: Number(newMin) || 0,
+      stock_qty: 0,
+    });
+    setAdding(false);
+    if (error) {
+      setError(error.message);
+      return;
+    }
+    setNewName('');
+    setNewUnit('unit');
+    setNewMin('0');
+    router.refresh();
+  }
+
+  return (
+    <div className="space-y-6">
+      {error && (
+        <div className="rounded border border-danger/40 bg-danger/10 text-danger p-3 text-xs">
+          {error}
+        </div>
+      )}
+
+      {sweepMessage && (
+        <div className="rounded border border-ok/40 bg-ok/10 text-ok p-3 text-xs">
+          {sweepMessage}
+        </div>
+      )}
+
+      {canManageAutomation && (
+        <Card className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="font-bold text-sm">AI Management — low-stock supplier email</h2>
+            <p className="text-[0.6875rem] text-muted mt-0.5">
+              When an ingredient falls to or below its minimum and has a preferred supplier set below,
+              automatically email that supplier a reorder request. Never sends twice for the same low-stock spell,
+              and stops once stock recovers.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="ghost"
+              disabled={sweepBusy}
+              onClick={triggerLowStockSweep}
+              title="Immediately check low stock and send reorder emails to suppliers"
+            >
+              {sweepBusy ? 'Sending…' : 'Send Reorder Emails Now'}
+            </Button>
+            <Button
+              variant={lowStockEmailEnabled ? 'danger' : 'primary'}
+              disabled={automationBusy}
+              onClick={toggleLowStockEmailEnabled}
+            >
+              {lowStockEmailEnabled ? 'Turn off' : 'Turn on'}
+            </Button>
+          </div>
+        </Card>
+      )}
+
+      {canAddItem && (
+      <Card>
+        <h2 className="font-bold mb-3 text-sm">Add ingredient</h2>
+        <p className="text-[0.6875rem] text-muted mb-3">
+          Enter this ingredient&apos;s <b>base unit</b> — the smallest amount recipes measure in (e.g. &ldquo;g&rdquo;
+          for grams, &ldquo;ml&rdquo;, or &ldquo;piece&rdquo;). Stock and recipe quantities are always in this unit.
+        </p>
+        <form onSubmit={addItem} className="grid grid-cols-1 sm:grid-cols-4 gap-3 items-end">
+          <Field label="Name">
+            <Input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Chicken Breast" />
+          </Field>
+          <Field label="Base unit">
+            <Input value={newUnit} onChange={(e) => setNewUnit(e.target.value)} placeholder="g" />
+          </Field>
+          <Field label="Min threshold">
+            <Input
+              type="number"
+              min="0"
+              step="0.001"
+              value={newMin}
+              onChange={(e) => setNewMin(e.target.value)}
+            />
+          </Field>
+          <Button type="submit" disabled={adding}>
+            Add
+          </Button>
+        </form>
+      </Card>
+      )}
+
+      <Card className="p-0 overflow-hidden">
+        <div className="overflow-x-auto" tabIndex={0} role="group" aria-label="Table — scroll to see more">
+        <table className="w-full text-start text-xs">
+          <thead className="text-muted border-b border-border">
+            <tr>
+              <th className="p-3 font-semibold">Ingredient</th>
+              <th className="p-3 font-semibold text-end">On hand</th>
+              <th className="p-3 font-semibold text-end">Min</th>
+              {canManageAutomation && <th className="p-3 font-semibold text-end">Target</th>}
+              {canManageAutomation && <th className="p-3 font-semibold">Preferred supplier</th>}
+              {canViewCost && <th className="p-3 font-semibold text-end">Cost</th>}
+              {canViewCost && <th className="p-3 font-semibold text-end">Value</th>}
+              <th className="p-3 font-semibold">Record</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.length === 0 ? (
+              <tr>
+                <td colSpan={4 + (canManageAutomation ? 2 : 0) + (canViewCost ? 2 : 0)} className="p-3 text-muted">
+                  No ingredients yet.
+                </td>
+              </tr>
+            ) : (
+              items.map((it) => {
+                const low = Number(it.stock_qty) <= Number(it.min_threshold);
+                return (
+                  <tr key={it.id} className="border-b border-border/60">
+                    <td className="p-3 font-semibold">
+                      {it.name}
+                      {low && <span className="ms-2 text-danger">low</span>}
+                    </td>
+                    <td className="p-3 text-end font-mono">
+                      {it.stock_qty} {it.unit}
+                    </td>
+                    <td className="p-3 text-end text-muted">{it.min_threshold}</td>
+                    {canManageAutomation && (
+                      <td className="p-3 text-end">
+                        <button onClick={() => setTarget(it)} className="font-mono text-primary underline decoration-dotted">
+                          {it.target_stock_qty != null ? it.target_stock_qty : 'set'}
+                        </button>
+                      </td>
+                    )}
+                    {canManageAutomation && (
+                      <td className="p-3">
+                        <div className="flex items-center gap-2">
+                          <Select
+                            aria-label={`Preferred supplier for ${it.name}`}
+                            value={preferredBySupplierItem[it.id]?.supplierId ?? ''}
+                            onChange={(e) => setPreferredSupplier(it, e.target.value as string)}
+                            disabled={busyId === it.id}
+                            className="text-[0.6875rem]"
+                          >
+                            <option value="">— none —</option>
+                            {suppliers.map((s) => (
+                              <option key={s.id} value={s.id} disabled={!s.email}>
+                                {s.name}
+                                {!s.email ? ' (no email)' : ''}
+                              </option>
+                            ))}
+                          </Select>
+                          <label className="flex items-center gap-1 text-[0.625rem] text-muted whitespace-nowrap" title="Include this ingredient in the automatic low-stock reorder email">
+                            <input
+                              type="checkbox"
+                              checked={it.auto_reorder_email}
+                              onChange={() => toggleItemAutomation(it)}
+                              disabled={busyId === it.id}
+                            />
+                            auto-email
+                          </label>
+                        </div>
+                      </td>
+                    )}
+                    {canViewCost && (
+                      <td className="p-3 text-end">
+                        <button onClick={() => setCost(it)} className="font-mono text-primary underline decoration-dotted">
+                          {formatCents(Math.round(it.cost_cents_per_base_unit))}/{it.unit}
+                        </button>
+                      </td>
+                    )}
+                    {canViewCost && (
+                      <td className="p-3 text-end font-mono text-muted">
+                        {formatCents(Math.round(Number(it.stock_qty) * Number(it.cost_cents_per_base_unit)))}
+                      </td>
+                    )}
+                    <td className="p-3">
+                      {canRestock || canWaste || canCount ? (
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <Input
+                            type="number"
+                            min="0"
+                            step="0.001"
+                            placeholder="qty"
+                            className="w-20"
+                            value={deltas[it.id] ?? ''}
+                            onChange={(e) =>
+                              setDeltas((d) => ({ ...d, [it.id]: e.target.value }))
+                            }
+                          />
+                          {canRestock && (
+                            <Button
+                              variant="ghost"
+                              disabled={busyId === it.id}
+                              onClick={() => adjust(it, 1)}
+                            >
+                              + restock
+                            </Button>
+                          )}
+                          {canWaste && (
+                            <Button
+                              variant="danger"
+                              disabled={busyId === it.id}
+                              onClick={() => waste(it)}
+                            >
+                              − waste
+                            </Button>
+                          )}
+                          {canCount && (
+                            <Button
+                              variant="ghost"
+                              disabled={busyId === it.id}
+                              onClick={() => count(it)}
+                            >
+                              Stock count
+                            </Button>
+                          )}
+                        </div>
+                      ) : (
+                        <span className="text-muted">—</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+        </div>
+      </Card>
+    </div>
+  );
+}

@@ -1,0 +1,172 @@
+import { createServerClient, type CookieOptions } from '@supabase/ssr';
+import { NextResponse, type NextRequest } from 'next/server';
+import { ADMIN_COOKIE_PATH, tenantCookieName, tenantCookiePath } from './cookieScope';
+import { baseSlug, slotOf, slotSlug } from '../sessionSlot';
+
+type CookieToSet = { name: string; value: string; options: CookieOptions };
+
+// The control-plane URL/anon key are public by design (RLS enforces access,
+// see VERCEL_DEPLOY.md) — never fall back to a service_role key here. This
+// runs in Edge Middleware on every /admin and /r/* request, so a
+// service_role fallback would both leak in source AND bypass RLS on every
+// session-cookie refresh.
+function requireEnv(value: string | undefined, name: string): string {
+  if (!value) throw new Error(`Missing ${name} — set it in the deployment environment.`);
+  return value;
+}
+const CP_URL = requireEnv(
+  process.env.NEXT_PUBLIC_CONTROL_PLANE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL,
+  'NEXT_PUBLIC_CONTROL_PLANE_URL',
+);
+const CP_ANON = requireEnv(
+  process.env.NEXT_PUBLIC_CONTROL_PLANE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+  'NEXT_PUBLIC_CONTROL_PLANE_ANON_KEY',
+);
+
+async function tenantConfig(slug: string): Promise<{ url: string; anonKey: string } | null> {
+  try {
+    const res = await fetch(
+      `${CP_URL}/rest/v1/tenant_directory?slug=eq.${encodeURIComponent(slug)}&select=project_url,anon_key`,
+      { headers: { apikey: CP_ANON, Authorization: `Bearer ${CP_ANON}` } },
+    );
+    if (!res.ok) return null;
+    const rows = (await res.json()) as { project_url: string; anon_key: string }[] | null;
+    const row = rows?.[0];
+    return row ? { url: row.project_url, anonKey: row.anon_key } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Refreshes a Supabase session cookie for `url`/`anonKey` against `request`,
+ *  returns { response, user }. The cookie is written at `path` only. */
+async function refresh(request: NextRequest, url: string, anonKey: string, path: string, name?: string) {
+  let response = NextResponse.next({ request });
+  const supabase = createServerClient(url, anonKey, {
+    cookieOptions: { path, ...(name ? { name } : {}) },
+    cookies: {
+      getAll() {
+        return request.cookies.getAll();
+      },
+      setAll(cookiesToSet: CookieToSet[]) {
+        cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
+        response = NextResponse.next({ request });
+        cookiesToSet.forEach(({ name, value, options }) =>
+          response.cookies.set(name, value, options),
+        );
+      },
+    },
+  });
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  return { response, user };
+}
+
+const SCOPED_MARKER = 'ar_cookie_scope';
+const COOKIE_MAX_AGE = 400 * 24 * 60 * 60;
+
+/** Moves session cookies written before they were path-scoped: this project's
+ *  session is re-written at `path` (so the person stays signed in) and every
+ *  site-wide `sb-*` cookie is expired. Sessions for other restaurants are
+ *  signed out rather than left to bloat every request.
+ *
+ *  Runs whenever such a cookie shows up, not just once: another restaurant's
+ *  session can only reach this path if it sits site-wide, so seeing one means
+ *  a leftover to clear — before the cookies grow past what Vercel accepts
+ *  (494 REQUEST_HEADER_TOO_LARGE), after which no request reaches this code. */
+function retireSiteWideCookies(request: NextRequest, response: NextResponse, url: string, path: string) {
+  const ownPrefix = `sb-${new URL(url).hostname.split('.')[0]}-auth-token`;
+  const all = request.cookies.getAll().filter((c) => c.name.startsWith('sb-'));
+  const foreign = all.some((c) => !c.name.startsWith(ownPrefix));
+  if (request.cookies.has(SCOPED_MARKER) && !foreign) return response;
+  const legacy = all;
+  for (const c of legacy) {
+    if (c.name.startsWith(ownPrefix) && !response.cookies.get(c.name)) {
+      response.cookies.set(c.name, c.value, { path, sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
+    }
+  }
+  response.cookies.set(SCOPED_MARKER, '1', { path: '/', sameSite: 'lax', maxAge: COOKIE_MAX_AGE });
+  // Raw headers, appended last: ResponseCookies keys by name, so it can't hold
+  // "delete at /" and "set at /r/<slug>" for the same cookie name at once.
+  for (const c of legacy) {
+    response.headers.append('Set-Cookie', `${c.name}=; Path=/; Max-Age=0; SameSite=Lax`);
+  }
+  return response;
+}
+
+/** Gates /r/<slug>/... and /admin/... : refreshes the right session and
+ *  redirects unauthenticated users to the matching login page. */
+export async function updateTenantSession(request: NextRequest) {
+  const { pathname } = request.nextUrl;
+
+  // ── Platform super-admin area ──
+  if (pathname === '/admin' || pathname.startsWith('/admin/')) {
+    const isLogin = pathname === '/admin/login';
+    const { response, user } = await refresh(request, CP_URL, CP_ANON, ADMIN_COOKIE_PATH);
+    const done = (r: NextResponse) => retireSiteWideCookies(request, r, CP_URL, ADMIN_COOKIE_PATH);
+    const meta = user?.app_metadata as { role?: string; permissions?: string[] } | undefined;
+    const role = meta?.role;
+    // A granular platform admin (any role with a non-empty permissions
+    // array) is let through the edge — the real per-page gate is
+    // gateAdminPage(), which checks the SPECIFIC permission that page
+    // needs, not just "is this a platform admin at all".
+    const isPlatformAdmin = role === 'super_admin' || (Array.isArray(meta?.permissions) && meta!.permissions!.length > 0);
+    if ((!user || !isPlatformAdmin) && !isLogin) {
+      const u = request.nextUrl.clone();
+      u.pathname = '/admin/login';
+      return done(NextResponse.redirect(u));
+    }
+    if (user && isPlatformAdmin && isLogin) {
+      const u = request.nextUrl.clone();
+      u.pathname = '/admin';
+      return done(NextResponse.redirect(u));
+    }
+    return done(response);
+  }
+
+  // ── Per-restaurant portals ──
+  const match = pathname.match(/^\/r\/([^/]+)(\/.*)?$/);
+  if (!match) {
+    // Any other page (website, guest ordering, onboarding): no session belongs here, so every
+    // sign-in cookie this request carries is a site-wide leftover — expire it.
+    const response = NextResponse.next({ request });
+    for (const c of request.cookies.getAll()) {
+      if (c.name.startsWith('sb-')) response.headers.append('Set-Cookie', `${c.name}=; Path=/; Max-Age=0; SameSite=Lax`);
+    }
+    return response;
+  }
+
+  const slug = match[1];
+  const rest = match[2] ?? '';
+  const isLogin = rest === '/login' || rest === '/login/';
+  // The owner's one-time sign-in into a branch (lib/branchTenants.ts ownerSignInToken) — open without a session.
+  const isSso = rest === '/auth/sso' || rest === '/auth/sso/';
+
+  // Each portal runs in its own session slot (lib/sessionSlot.ts), so it can stay signed in
+  // next to the owner's panel in the same browser: /r/<slug>/portal/<key>/… → /r/<slug>~<key>/portal/<key>/…
+  const portalMatch = rest.match(/^\/portal\/([a-z0-9][a-z0-9-]{0,39})(\/.*)?$/);
+  if (portalMatch && !slotOf(slug)) {
+    const u = request.nextUrl.clone();
+    u.pathname = `/r/${slotSlug(baseSlug(slug), portalMatch[1])}/portal/${portalMatch[1]}${portalMatch[2] ?? ''}`;
+    return NextResponse.redirect(u);
+  }
+
+  const config = await tenantConfig(baseSlug(slug));
+  if (!config) return NextResponse.next({ request });
+
+  const path = tenantCookiePath(slug);
+  const { response, user } = await refresh(request, config.url, config.anonKey, path, tenantCookieName(config.url, slug));
+  const done = (r: NextResponse) => retireSiteWideCookies(request, r, config.url, path);
+  if (!user && !isLogin && !isSso) {
+    const u = request.nextUrl.clone();
+    u.pathname = `/r/${slug}/login`;
+    return done(NextResponse.redirect(u));
+  }
+  if (user && isLogin) {
+    const u = request.nextUrl.clone();
+    u.pathname = `/r/${slug}`;
+    return done(NextResponse.redirect(u));
+  }
+  return done(response);
+}

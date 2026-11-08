@@ -1,0 +1,226 @@
+'use client';
+
+import { useMemo, useState } from 'react';
+import { usePortalSupabase } from '@/components/PortalProvider';
+import { Button, Card, Input, Select } from '@/components/ui';
+import { formatCents } from '@/lib/format';
+
+type Category = { id: string; name: string };
+// computed_available comes from the recipe-driven availability engine
+// (tenant-migrations/0052/0054) — absent/true = orderable. place_order()
+// itself still does the real, authoritative stock check at order time
+// (and rejects with insufficient_stock if it's actually short); this just
+// steers the cashier away from something a priority reallocation or a
+// stock change has already made unlikely to succeed.
+type Variant = { id: string; name: string; price_cents: number; sort_order: number; is_available: boolean; computed_available?: boolean };
+type RawItem = { id: string; name: string; category_id: string | null; menu_variants: Variant[] };
+type Item = { id: string; name: string; price_cents: number; category_id: string | null };
+type CartLine = { item: Item; qty: number };
+
+const CHANNELS = ['dine_in', 'takeaway', 'delivery'] as const;
+
+/** One row per available variant, labelled with its item. id = variant id. */
+function toProducts(items: RawItem[]): Item[] {
+  const out: Item[] = [];
+  for (const it of items) {
+    for (const v of (it.menu_variants ?? [])
+      .filter((x) => x.is_available && x.computed_available !== false)
+      .sort((a, b) => a.sort_order - b.sort_order)) {
+      out.push({
+        id: v.id,
+        name: v.name === 'Regular' ? it.name : `${it.name} · ${v.name}`,
+        price_cents: v.price_cents,
+        category_id: it.category_id,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * Counter POS folded into Checkout: build a new order here, tap Send, and
+ * Checkout switches straight to its own existing bill/payment view for the
+ * order just created — one flow instead of two separate screens.
+ */
+export function NewOrderPanel({
+  taxRateBps,
+  categories,
+  items,
+  onPlaced,
+}: {
+  taxRateBps: number;
+  categories: Category[];
+  items: RawItem[];
+  onPlaced: (orderId: string) => void;
+}) {
+  const supabase = usePortalSupabase();
+  const [activeCat, setActiveCat] = useState<string>('all');
+  const [cart, setCart] = useState<Record<string, CartLine>>({});
+  const products = useMemo(() => toProducts(items), [items]);
+  const [channel, setChannel] = useState<(typeof CHANNELS)[number]>('dine_in');
+  const [table, setTable] = useState('');
+  const [promo, setPromo] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const shown = products.filter((i) => activeCat === 'all' || i.category_id === activeCat);
+  const lines = Object.values(cart);
+  const subtotal = useMemo(() => lines.reduce((s, l) => s + l.item.price_cents * l.qty, 0), [lines]);
+  const tax = Math.round((subtotal * taxRateBps) / 10000);
+  const total = subtotal + tax;
+
+  function bump(id: string, delta: number) {
+    setCart((c) => {
+      const next = { ...c };
+      const line = next[id];
+      const item = products.find((p) => p.id === id);
+      if (!line && item && delta > 0) {
+        next[id] = { item, qty: delta };
+        return next;
+      }
+      if (!line) return c;
+      const qty = line.qty + delta;
+      if (qty <= 0) delete next[id];
+      else next[id] = { ...line, qty };
+      return next;
+    });
+  }
+
+  async function send() {
+    if (lines.length === 0) return;
+    setBusy(true);
+    setError(null);
+    const { data, error: e } = await supabase.rpc('place_order', {
+      p_channel: channel,
+      p_table_label: table.trim() || null,
+      p_customer_name: null,
+      p_tax_rate_bps: taxRateBps,
+      p_lines: lines.map((l) => ({ variant_id: l.item.id, qty: l.qty })),
+      p_promo_code: promo.trim() || null,
+    });
+    setBusy(false);
+    if (e) {
+      setError(e.message);
+      return;
+    }
+    const row = Array.isArray(data) ? data[0] : data;
+    if (promo.trim() && (row.discount_cents ?? 0) === 0) {
+      setError(`Code "${promo.trim()}" isn't valid — order sent at full price.`);
+    }
+    setCart({});
+    setTable('');
+    setPromo('');
+    onPlaced(row.order_id);
+  }
+
+  return (
+    <div className="flex flex-col lg:flex-row gap-4">
+      <div className="flex-1 min-w-0 space-y-3">
+        <div className="flex gap-1.5 overflow-x-auto pb-1">
+          <button
+            onClick={() => setActiveCat('all')}
+            className={`px-3 py-1.5 rounded text-xs font-semibold whitespace-nowrap ${
+              activeCat === 'all' ? 'bg-primary text-primary-fg' : 'bg-surface border border-border'
+            }`}
+          >
+            All
+          </button>
+          {categories.map((c) => (
+            <button
+              key={c.id}
+              onClick={() => setActiveCat(c.id)}
+              className={`px-3 py-1.5 rounded text-xs font-semibold whitespace-nowrap ${
+                activeCat === c.id ? 'bg-primary text-primary-fg' : 'bg-surface border border-border'
+              }`}
+            >
+              {c.name}
+            </button>
+          ))}
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-2.5">
+          {shown.length === 0 ? (
+            <Card className="col-span-full text-muted text-xs">No available items.</Card>
+          ) : (
+            shown.map((it) => (
+              <button
+                key={it.id}
+                onClick={() => bump(it.id, 1)}
+                className="rounded-lg border border-border bg-surface p-3 text-start hover:border-primary transition-colors"
+              >
+                <div className="font-semibold text-xs">{it.name}</div>
+                <div className="text-primary font-bold text-sm mt-1">{formatCents(it.price_cents)}</div>
+              </button>
+            ))
+          )}
+        </div>
+      </div>
+
+      <Card className="w-full lg:w-80 shrink-0 self-start">
+        <h2 className="font-bold text-sm mb-3">New order</h2>
+
+        <div className="grid grid-cols-2 gap-2 mb-3">
+          <Select value={channel} onChange={(e) => setChannel(e.target.value as typeof channel)}>
+            {CHANNELS.map((c) => (
+              <option key={c} value={c}>
+                {c.replace('_', ' ')}
+              </option>
+            ))}
+          </Select>
+          <Input placeholder="Table" value={table} onChange={(e) => setTable(e.target.value)} />
+          <Input
+            placeholder="Promo code"
+            value={promo}
+            onChange={(e) => setPromo(e.target.value)}
+            className="col-span-2 uppercase placeholder:normal-case"
+          />
+        </div>
+
+        {lines.length === 0 ? (
+          <p className="text-muted text-xs py-6 text-center">Tap items to add them.</p>
+        ) : (
+          <div className="space-y-1.5 mb-3">
+            {lines.map((l) => (
+              <div key={l.item.id} className="flex items-center justify-between text-xs">
+                <span className="truncate flex-1">{l.item.name}</span>
+                <div className="flex items-center gap-1.5">
+                  <button onClick={() => bump(l.item.id, -1)} className="w-5 h-5 rounded border border-border font-bold">
+                    −
+                  </button>
+                  <span className="w-4 text-center">{l.qty}</span>
+                  <button onClick={() => bump(l.item.id, 1)} className="w-5 h-5 rounded border border-border font-bold">
+                    +
+                  </button>
+                  <span className="w-14 text-end font-semibold">{formatCents(l.item.price_cents * l.qty)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="border-t border-border pt-2 space-y-1 text-xs text-muted">
+          <div className="flex justify-between">
+            <span>Subtotal</span>
+            <span>{formatCents(subtotal)}</span>
+          </div>
+          {taxRateBps > 0 && (
+            <div className="flex justify-between">
+              <span>Tax ({taxRateBps / 100}%)</span>
+              <span>{formatCents(tax)}</span>
+            </div>
+          )}
+          <div className="flex justify-between text-body font-black text-sm pt-1">
+            <span>Total</span>
+            <span>{formatCents(total)}</span>
+          </div>
+        </div>
+
+        {error && <p className="text-danger text-xs mt-2">{error}</p>}
+
+        <Button className="w-full mt-3 py-2.5 text-sm" disabled={busy || lines.length === 0} onClick={send}>
+          {busy ? 'Sending…' : 'Send to kitchen'}
+        </Button>
+      </Card>
+    </div>
+  );
+}

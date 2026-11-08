@@ -1,0 +1,14 @@
+# Build context for deploy/vultr: never send secrets or local builds to Docker.
+**/node_modules
+**/.next
+**/dist
+.git
+**/.env
+**/.env.*
+deploy/vultr/*.env
+deploy/vultr/.env
+.claude
+docs
+VectCutAPI
+supabase/.temp
+supabase/.branches

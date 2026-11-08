@@ -1,0 +1,53 @@
+# Automation Restaurant on one Vultr VM: web + api behind Caddy (automatic HTTPS).
+# deploy.sh writes ./.env (DOMAIN, API_DOMAIN and the public build values) and
+# expects api.env / web.env next to this file (copies of apps/api/.env and
+# apps/web/.env.local); it adds the Gemini settings to web.runtime.env.
+# None of those files are committed.
+name: automation-restaurant
+
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/vultr/Dockerfile.api
+    env_file: api.env
+    environment:
+      PORT: "4000"
+      APP_URL: https://${DOMAIN}
+      ALLOWED_ORIGINS: https://${DOMAIN}
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ../..
+      dockerfile: deploy/vultr/Dockerfile.web
+      args:
+        NEXT_PUBLIC_CONTROL_PLANE_URL: ${NEXT_PUBLIC_CONTROL_PLANE_URL}
+        NEXT_PUBLIC_CONTROL_PLANE_ANON_KEY: ${NEXT_PUBLIC_CONTROL_PLANE_ANON_KEY}
+        NEXT_PUBLIC_API_URL: https://${API_DOMAIN}
+        NEXT_PUBLIC_SITE_URL: https://${DOMAIN}
+    env_file: web.runtime.env
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+      API_DOMAIN: ${API_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - api
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

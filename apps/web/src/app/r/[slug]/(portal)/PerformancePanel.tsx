@@ -1,0 +1,1165 @@
+'use client';
+
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { usePortalSupabase } from '@/components/PortalProvider';
+import { formatCents } from '@/lib/format';
+import { saveAndStoreReportPdf } from '@/lib/generateReport';
+import { ProfitDrilldownModal } from '@/components/ProfitDrilldown';
+import type {
+  ReportPurchasing,
+  ReportSupplierPayable,
+  ReportManagementActivity,
+  ReportAttentionItem,
+  ReportDeal,
+  ReportPromotion,
+  ReportInventory,
+  ReportAiInsights,
+} from '@/lib/generateReport';
+
+const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000';
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  PieChart,
+  Pie,
+  Cell,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  type TooltipProps,
+} from 'recharts';
+
+// last_3_months/last_6_months/last_year mirror the same additions made to
+// the API's own Period (apps/api/src/lib/aiTools.ts) for the Restaurant
+// Performance & Owner Activity Intelligence tools (spec §1) — the
+// dashboard's charts now offer the same range the AI chat/PDF/Excel export
+// already support.
+// 'this_year' is deliberately NOT in PERIODS below (which drives the
+// Dashboard's own visible buttons — left untouched) — it exists on the
+// type/periodRange() so the new per-section report pages (Suppliers,
+// Purchasing, Inventory, Orders, Expenses), which define their own period
+// button list, can offer a calendar-year option without changing the
+// Dashboard.
+export type Period = 'today' | 'yesterday' | 'this_week' | 'last_week' | 'this_month' | 'last_month' | 'last_3_months' | 'last_6_months' | 'this_year' | 'last_year';
+const PERIODS: { key: Period; label: string }[] = [
+  { key: 'today', label: 'Today' },
+  { key: 'yesterday', label: 'Yesterday' },
+  { key: 'this_week', label: 'This week' },
+  { key: 'last_week', label: 'Last week' },
+  { key: 'this_month', label: 'This month' },
+  { key: 'last_month', label: 'Last month' },
+  { key: 'last_3_months', label: '3 months' },
+  { key: 'last_6_months', label: '6 months' },
+  { key: 'last_year', label: '1 year' },
+];
+const PERIOD_LABEL: Record<Period, string> = Object.fromEntries(PERIODS.map((p) => [p.key, p.label])) as Record<Period, string>;
+
+// Mirrors EXCEL_OPTIONAL_SHEETS (apps/api/src/lib/excelExport.ts) — the
+// Custom Export domain picker (spec §37). Executive Summary, Profit
+// Summary and Verification are always included server-side regardless of
+// selection, so they aren't offered as checkboxes here.
+const EXCEL_OPTIONAL_SHEETS = [
+  'Daily Performance', 'Orders', 'Product Profitability', 'Deal Profitability', 'Promotions',
+  'Purchasing', 'Accounts Payable', 'Supplier Payments', 'Supplier Performance', 'Inventory',
+  'Expenses', 'Management Activity', 'AI Actions',
+] as const;
+
+// ── Dates in the RESTAURANT'S timezone ──────────────────────────────────────
+// Periods ("Today", "This week"…) are the restaurant's calendar days
+// (business_settings.timezone), not the viewing computer's: a browser set to
+// another timezone used to start "Today" hours early or late.
+export const browserTimeZone = () => Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+/** Calendar parts of `d` as seen in `tz` (m is 0-based, dow 0 = Sunday). */
+function partsIn(d: Date, tz: string) {
+  const p = new Intl.DateTimeFormat('en-US', { timeZone: tz, year: 'numeric', month: 'numeric', day: 'numeric', weekday: 'short' }).formatToParts(d);
+  const get = (t: string) => p.find((x) => x.type === t)?.value ?? '';
+  return { y: Number(get('year')), m: Number(get('month')) - 1, d: Number(get('day')), dow: ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(get('weekday')) };
+}
+/** How far `tz` is ahead of UTC at instant `ms`. */
+function tzOffsetMs(ms: number, tz: string): number {
+  const p = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric',
+  }).formatToParts(new Date(ms));
+  const g = (t: string) => Number(p.find((x) => x.type === t)?.value ?? 0);
+  return Date.UTC(g('year'), g('month') - 1, g('day'), g('hour'), g('minute'), g('second')) - Math.floor(ms / 1000) * 1000;
+}
+/** The instant calendar day (y, m, d) begins in `tz`; m and d may overflow
+ *  (d = 0 is the last day of the previous month, like Date.UTC). */
+function midnightIn(y: number, m: number, d: number, tz: string): Date {
+  const guess = Date.UTC(y, m, d);
+  const first = guess - tzOffsetMs(guess, tz);
+  return new Date(guess - tzOffsetMs(first, tz)); // second pass settles DST changes
+}
+/** 'YYYY-MM-DD' of `d` in `tz`. */
+export const dateIn = (d: Date, tz: string) =>
+  new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+
+export function periodRange(period: Period, tz: string = browserTimeZone()) {
+  const { y, m, d, dow } = partsIn(new Date(), tz);
+  const day = (n: number) => midnightIn(y, m, n, tz); // a day of this month (n may overflow)
+  const month = (k: number) => midnightIn(y, m + k, 1, tz); // 1st of a month relative to this one
+  const tomorrow = day(d + 1);
+  const monOff = (dow + 6) % 7; // Monday = 0
+  switch (period) {
+    case 'yesterday':
+      return { from: day(d - 1), to: day(d), prevFrom: day(d - 2), prevTo: day(d - 1) };
+    case 'this_week':
+      return { from: day(d - monOff), to: tomorrow, prevFrom: day(d - monOff - 7), prevTo: day(d - monOff) };
+    case 'last_week':
+      return { from: day(d - monOff - 7), to: day(d - monOff), prevFrom: day(d - monOff - 14), prevTo: day(d - monOff - 7) };
+    case 'this_month':
+      return { from: month(0), to: tomorrow, prevFrom: month(-1), prevTo: month(0) };
+    case 'last_month':
+      return { from: month(-1), to: month(0), prevFrom: month(-2), prevTo: month(-1) };
+    case 'last_3_months':
+      return { from: month(-3), to: tomorrow, prevFrom: month(-6), prevTo: month(-3) };
+    case 'last_6_months':
+      return { from: month(-6), to: tomorrow, prevFrom: month(-12), prevTo: month(-6) };
+    case 'this_year':
+      return { from: midnightIn(y, 0, 1, tz), to: tomorrow, prevFrom: midnightIn(y - 1, 0, 1, tz), prevTo: midnightIn(y, 0, 1, tz) };
+    case 'last_year':
+      return { from: midnightIn(y - 1, m, d, tz), to: tomorrow, prevFrom: midnightIn(y - 2, m, d, tz), prevTo: midnightIn(y - 1, m, d, tz) };
+    default:
+      return { from: day(d), to: tomorrow, prevFrom: day(d - 1), prevTo: day(d) };
+  }
+}
+/** Ranges have an exclusive `to` (the next midnight); whole-date queries
+ *  (sales_by_day, expense_date) need the last day INSIDE the range. */
+const lastDayIn = (to: Date, tz: string) => dateIn(new Date(to.getTime() - 1), tz);
+function rangeCaption(from: Date, to: Date, tz: string): string {
+  const end = new Date(to.getTime() - 1);
+  const fmt = (x: Date, withYear: boolean) =>
+    x.toLocaleDateString('en-US', { timeZone: tz, month: 'short', day: 'numeric', ...(withYear ? { year: 'numeric' } : {}) });
+  if (dateIn(from, tz) === dateIn(end, tz)) return fmt(from, true);
+  return `${fmt(from, dateIn(from, tz).slice(0, 4) !== dateIn(end, tz).slice(0, 4))} – ${fmt(end, true)}`;
+}
+
+export type CustomRange = { from: string; to: string };
+/** An owner-chosen date range from the two <input type="date"> fields
+ *  below (spec §1's "Custom Period") — the previous-period comparison
+ *  window is the immediately preceding range of the SAME length, so %
+ *  changes stay meaningful. Both dates are the restaurant's calendar days. */
+function resolveRange(period: Period, custom: CustomRange | null, tz: string): { from: Date; to: Date; prevFrom: Date; prevTo: Date } {
+  if (custom && custom.from && custom.to) {
+    const [fy, fm, fd] = custom.from.split('-').map(Number) as [number, number, number];
+    const [ty, tm, td] = custom.to.split('-').map(Number) as [number, number, number];
+    const from = midnightIn(fy, fm - 1, fd, tz);
+    const to = midnightIn(ty, tm - 1, td + 1, tz);
+    const spanMs = Math.max(to.getTime() - from.getTime(), 86400_000);
+    return { from, to, prevFrom: new Date(from.getTime() - spanMs), prevTo: from };
+  }
+  return periodRange(period, tz);
+}
+function customRangeLabel(custom: CustomRange): string {
+  const fmt = (s: string) => new Date(`${s}T00:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  return `${fmt(custom.from)} - ${fmt(custom.to)}`;
+}
+
+type DaySum = { net_sales_cents: number; orders_count: number };
+// Full period_profitability() row — widened from the old {gross_profit_cents,
+// food_cost_pct} shape so Net Profit (already computed by that RPC, just
+// never rendered here) can reach the dashboard's own KPI row instead of
+// living only on the separate /finance page and inside AI chat answers.
+type Profitability = {
+  gross_sales_cents: number;
+  discount_cents: number;
+  refunded_cents: number;
+  net_sales_cents: number;
+  theoretical_cogs_cents: number;
+  cogs_lines_total: number;
+  cogs_lines_missing: number;
+  gross_profit_cents: number;
+  gross_margin_pct: number | null;
+  food_cost_pct: number | null;
+  actual_cogs_cents: number;
+  cogs_variance_cents: number;
+  expenses_cents: number;
+  net_profit_cents: number;
+  net_profit_margin_pct: number | null;
+} | null;
+type Slice = { name: string; value: number };
+type DealRow = {
+  deal_id: string;
+  name: string;
+  orders_count: number;
+  qty_sold: number;
+  revenue_cents: number;
+  cogs_cents: number | null;
+  contribution_cents: number | null;
+  contribution_margin_pct: number | null;
+};
+
+type ItemRow = {
+  name: string;
+  qty_sold: number;
+  revenue_cents: number;
+  cogs_cents: number;
+  contribution_cents: number;
+  contribution_margin_pct: number | null;
+};
+type AttendanceRow = { membership_id: string; full_name: string | null; role: string; status: string; late_minutes: number };
+type FeedbackRow = {
+  responses: number;
+  avg_overall: number | null;
+  avg_food: number | null;
+  avg_service: number | null;
+  avg_cleanliness: number | null;
+  avg_speed: number | null;
+  avg_ambiance: number | null;
+};
+
+const PIE_COLORS = ['rgb(var(--primary))', 'rgb(var(--ok))', 'rgb(var(--warn))', 'rgb(var(--danger))', 'rgb(var(--text-muted))'];
+
+const ATTENDANCE_DOT: Record<string, string> = {
+  present: 'bg-ok',
+  late: 'bg-warn',
+  early_departure: 'bg-warn',
+  incomplete: 'bg-warn',
+  absent: 'bg-danger',
+  leave: 'bg-primary',
+  not_marked: 'bg-border',
+};
+
+function PieTooltip({ active, payload }: TooltipProps<number, string>) {
+  if (!active || !payload || !payload[0]) return null;
+  const p = payload[0];
+  return (
+    <div className="rounded border border-border bg-surface px-3 py-1.5 text-[0.6875rem] shadow-lg">
+      <span className="font-bold text-body">{p.name}</span>
+      <span className="text-muted ms-2 font-mono">{formatCents(Number(p.value) * 100)}</span>
+    </div>
+  );
+}
+
+function Delta({ curr, prev }: { curr: number; prev: number }) {
+  if (prev === 0) return null;
+  const pct = Math.round(((curr - prev) / prev) * 1000) / 10;
+  if (pct === 0) return <span className="text-muted text-[0.6875rem]">flat vs previous period</span>;
+  const up = pct > 0;
+  return (
+    <span className={`text-[0.6875rem] font-semibold ${up ? 'text-ok' : 'text-danger'}`}>
+      {up ? '↑' : '↓'} {Math.abs(pct)}% <span className="text-muted font-normal">vs previous period</span>
+    </span>
+  );
+}
+
+function Kpi({ label, value, delta, tone, onClick }: { label: string; value: string; delta?: React.ReactNode; tone?: 'ok' | 'danger'; onClick?: () => void }) {
+  const Tag = onClick ? 'button' : 'div';
+  return (
+    <Tag
+      onClick={onClick}
+      className={`rounded-lg border border-border bg-surface p-4 text-start w-full ${onClick ? 'hover:border-primary/50 cursor-pointer' : ''}`}
+    >
+      <div className="text-muted text-[0.6875rem] font-semibold flex items-center gap-1">
+        {label}
+        {onClick && <span className="text-primary">↴</span>}
+      </div>
+      <div className={`mt-1 text-xl font-black tabular-nums transition-all ${tone === 'ok' ? 'text-ok' : tone === 'danger' ? 'text-danger' : ''}`}>{value}</div>
+      {delta && <div className="mt-1">{delta}</div>}
+    </Tag>
+  );
+}
+
+/**
+ * Restaurant Performance: a period selector (spec §29) driving a KPI row
+ * with period-over-period change (§16), revenue/payment mix pies (§10),
+ * top products (§11), today's attendance (§13) and customer experience
+ * (§12). Every number here comes from an authoritative RPC — sales_by_day
+ * for net sales/orders (same population as the trend chart above),
+ * period_profitability for gross profit/food cost (silently omitted for a
+ * role without finance permission — the backend enforces this, not a
+ * frontend hide), and the existing attendance/feedback systems.
+ */
+export function PerformancePanel({
+  slug,
+  restaurantName,
+  logoUrl,
+  period,
+  onPeriodChange,
+  customRange,
+  onCustomRangeChange,
+  aiSummary,
+}: {
+  slug: string;
+  restaurantName: string;
+  logoUrl?: string | null;
+  period: Period;
+  onPeriodChange: (p: Period) => void;
+  customRange: CustomRange | null;
+  onCustomRangeChange: (r: CustomRange | null) => void;
+  aiSummary?: string | null;
+}) {
+  const supabase = usePortalSupabase();
+  // The branch being viewed (multi-branch) — the API narrows reports and answers to it.
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [customDraft, setCustomDraft] = useState<CustomRange>(customRange ?? { from: '', to: '' });
+  const [customOpen, setCustomOpen] = useState(false);
+  const periodLabel = customRange ? customRangeLabel(customRange) : PERIOD_LABEL[period];
+  // null = full workbook (every sheet); a Set here means "only these
+  // optional sheets" — the Custom Export domain picker (spec §37).
+  const [sheetPickerOpen, setSheetPickerOpen] = useState(false);
+  const [selectedSheets, setSelectedSheets] = useState<Set<string> | null>(null);
+
+  const [sales, setSales] = useState<DaySum | null>(null);
+  const [prevSales, setPrevSales] = useState<DaySum | null>(null);
+  const [profit, setProfit] = useState<Profitability>(null);
+  const [prevProfit, setPrevProfit] = useState<Profitability>(null);
+  const [canSeeProfit, setCanSeeProfit] = useState(true);
+  const [categoryMix, setCategoryMix] = useState<Slice[]>([]);
+  const [paymentMixData, setPaymentMixData] = useState<Slice[]>([]);
+  const [topItems, setTopItems] = useState<ItemRow[]>([]);
+  // Deals sold in the period (deal_sales, 0074) with cost/margin merged in
+  // from deal_profitability when the viewer can see costs.
+  const [dealRows, setDealRows] = useState<DealRow[]>([]);
+  // Tax collected on the same orders (period_tax, 0079) — shown next to net
+  // sales, never counted in it or in profit. null = not available.
+  const [taxInfo, setTaxInfo] = useState<{ tax_cents: number; sales_incl_tax_cents: number } | null>(null);
+  const [topSort, setTopSort] = useState<'revenue_cents' | 'qty_sold'>('revenue_cents');
+  const [feedback, setFeedback] = useState<FeedbackRow | null>(null);
+  const [attendance, setAttendance] = useState<AttendanceRow[] | null>(null);
+  const [dailyRows, setDailyRows] = useState<{ business_date: string; net_sales_cents: number }[]>([]);
+  const [drilldownLevel, setDrilldownLevel] = useState<'net_profit' | 'gross_profit' | null>(null);
+
+  // Live figures: any order, payment or expense change (debounced), plus a
+  // once-a-minute re-read while the tab is visible, bumps refreshTick; the
+  // loader below then re-reads quietly (no loading state, no flicker).
+  const [refreshTick, setRefreshTick] = useState(0);
+  // The restaurant's timezone (business_settings.timezone); null until read.
+  const [restaurantTz, setRestaurantTz] = useState<string | null>(null);
+  const tz = restaurantTz ?? browserTimeZone();
+  useEffect(() => {
+    let cancelled = false;
+    supabase
+      .from('business_settings')
+      .select('timezone')
+      .eq('id', true)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (cancelled) return;
+        const candidate = (data as { timezone?: string | null } | null)?.timezone;
+        let valid = browserTimeZone();
+        try {
+          if (candidate) {
+            new Intl.DateTimeFormat('en-US', { timeZone: candidate });
+            valid = candidate;
+          }
+        } catch {
+          /* unknown zone name — keep the browser's */
+        }
+        setRestaurantTz(valid);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [supabase]);
+  const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
+  const lastRangeKey = useRef('');
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const bump = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => setRefreshTick((t) => t + 1), 1500);
+    };
+    let ch = supabase.channel('performance-live');
+    for (const table of ['orders', 'payments', 'expenses']) {
+      ch = ch.on('postgres_changes', { event: '*', schema: 'public', table }, bump);
+    }
+    ch.subscribe();
+    const poll = setInterval(() => {
+      if (document.visibilityState === 'visible') setRefreshTick((t) => t + 1);
+    }, 60_000);
+    return () => {
+      if (timer) clearTimeout(timer);
+      clearInterval(poll);
+      supabase.removeChannel(ch);
+    };
+  }, [supabase]);
+
+  useEffect(() => {
+    if (!restaurantTz) return; // wait for the restaurant's timezone
+    let cancelled = false;
+    const rangeKey = `${period}|${customRange?.from ?? ''}|${customRange?.to ?? ''}|${restaurantTz}`;
+    const quiet = lastRangeKey.current === rangeKey;
+    lastRangeKey.current = rangeKey;
+    if (!quiet) {
+      setLoading(true);
+      setError(null);
+    }
+    const { from, to, prevFrom, prevTo } = resolveRange(period, customRange, restaurantTz);
+
+    async function fetchDays(from: Date, to: Date) {
+      const { data, error: err } = await supabase.rpc('sales_by_day', { p_from: dateIn(from, restaurantTz!), p_to: lastDayIn(to, restaurantTz!) });
+      if (err) throw err;
+      return (data as { business_date: string; net_sales_cents: number; orders_count: number }[]) ?? [];
+    }
+    async function sumDays(from: Date, to: Date): Promise<DaySum & { rows: { business_date: string; net_sales_cents: number }[] }> {
+      const rows = await fetchDays(from, to);
+      return {
+        net_sales_cents: rows.reduce((s, r) => s + r.net_sales_cents, 0),
+        orders_count: rows.reduce((s, r) => s + r.orders_count, 0),
+        rows: rows.map((r) => ({ business_date: r.business_date, net_sales_cents: r.net_sales_cents })),
+      };
+    }
+
+    (async () => {
+      try {
+        const [curr, prev] = await Promise.all([sumDays(from, to), sumDays(prevFrom, prevTo)]);
+        if (cancelled) return;
+        setSales(curr);
+        setPrevSales(prev);
+        setDailyRows(curr.rows);
+
+        const profitRes = await supabase.rpc('period_profitability', { p_from: from.toISOString(), p_to: to.toISOString() });
+        if (profitRes.error) {
+          setCanSeeProfit(false);
+          setProfit(null);
+        } else {
+          setCanSeeProfit(true);
+          const row = (profitRes.data as Profitability[] | null)?.[0] ?? null;
+          setProfit(row);
+          const prevProfitRes = await supabase.rpc('period_profitability', {
+            p_from: prevFrom.toISOString(),
+            p_to: prevTo.toISOString(),
+          });
+          setPrevProfit((prevProfitRes.data as Profitability[] | null)?.[0] ?? null);
+        }
+
+        const [catRes, payRes, itemRes, fbRes, taxRes] = await Promise.all([
+          supabase.rpc('revenue_by_category', { p_from: from.toISOString(), p_to: to.toISOString() }),
+          supabase.rpc('payment_mix', { p_from: from.toISOString(), p_to: to.toISOString() }),
+          supabase.rpc('item_profitability', { p_from: from.toISOString(), p_to: to.toISOString() }),
+          supabase.rpc('feedback_summary', { p_from: from.toISOString(), p_to: to.toISOString() }),
+          supabase.rpc('period_tax', { p_from: from.toISOString(), p_to: to.toISOString() }),
+        ]);
+        if (cancelled) return;
+        setTaxInfo(taxRes.error ? null : ((taxRes.data as { tax_cents: number; sales_incl_tax_cents: number }[] | null)?.[0] ?? null));
+        if (catRes.error) throw catRes.error;
+        if (payRes.error) throw payRes.error;
+        // item_profitability requires finance.view_profit/finance.view_cogs/
+        // inventory.view_cost (same cost-visibility gate as period_profitability
+        // above) — degrades the same way that already does (an empty Top
+        // Products list) rather than throwing and blanking the whole panel
+        // for a caller who simply isn't granted cost visibility.
+        if (fbRes.error) throw fbRes.error;
+
+        setCategoryMix(
+          ((catRes.data as { category_name: string; revenue_cents: number }[]) ?? []).map((r) => ({
+            name: r.category_name,
+            value: r.revenue_cents / 100,
+          })),
+        );
+        setPaymentMixData(
+          ((payRes.data as { method: string; revenue_cents: number }[]) ?? []).map((r) => ({
+            name: r.method,
+            value: r.revenue_cents / 100,
+          })),
+        );
+        setTopItems(itemRes.error ? [] : ((itemRes.data as ItemRow[]) ?? []).slice(0, 8));
+        setFeedback((fbRes.data as FeedbackRow[] | null)?.[0] ?? null);
+
+        // Deals: sales for everyone who can see performance; cost/margin
+        // only when deal_profitability allows it (degrades to sales only).
+        const [dealSalesRes, dealProfitRes] = await Promise.all([
+          supabase.rpc('deal_sales', { p_from: from.toISOString(), p_to: to.toISOString() }),
+          supabase.rpc('deal_profitability', { p_from: from.toISOString(), p_to: to.toISOString() }),
+        ]);
+        if (cancelled) return;
+        const profitById = new Map(
+          ((dealProfitRes.error ? [] : dealProfitRes.data) as { deal_id: string; cogs_cents: number; cogs_known: boolean; contribution_cents: number; contribution_margin_pct: number | null }[] ?? []).map(
+            (d) => [d.deal_id, d],
+          ),
+        );
+        setDealRows(
+          ((dealSalesRes.error ? [] : dealSalesRes.data) as { deal_id: string; name: string; orders_count: number; qty_sold: number; revenue_cents: number }[] ?? []).map(
+            (d) => {
+              const p = profitById.get(d.deal_id);
+              return {
+                ...d,
+                cogs_cents: p?.cogs_known ? p.cogs_cents : null,
+                contribution_cents: p?.cogs_known ? p.contribution_cents : null,
+                contribution_margin_pct: p?.cogs_known ? p.contribution_margin_pct : null,
+              };
+            },
+          ),
+        );
+        if (!cancelled) {
+          setError(null);
+          setUpdatedAt(new Date());
+        }
+      } catch (e) {
+        // Supabase RPC errors are plain {message, code, ...} objects, not
+        // Error instances — String(e) on one of those prints "[object
+        // Object]" rather than anything useful.
+        if (!cancelled) {
+          const message =
+            e instanceof Error
+              ? e.message
+              : typeof e === 'object' && e !== null && 'message' in e
+                ? String((e as { message: unknown }).message)
+                : String(e);
+          // "forbidden" is sales_by_day/revenue_by_category/payment_mix/
+          // feedback_summary's own raw Postgres exception (raise exception
+          // 'forbidden' — all require orders.view) — translate it instead
+          // of showing that literal word, since portalCapabilities.ts's
+          // gate is what's SUPPOSED to keep this from being reachable
+          // without orders.view, and a raw RPC error name is never a
+          // useful message for whoever ends up seeing it anyway.
+          setError(
+            message === 'forbidden'
+              ? "You don't have permission to view sales figures for this period."
+              : message,
+          );
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [period, customRange, supabase, refreshTick, restaurantTz]);
+
+  // Today's attendance is always "today", independent of the period picker
+  // (spec §13's own framing) — fetched once.
+  useEffect(() => {
+    let cancelled = false;
+    supabase.rpc('attendance_roster', {}).then(({ data, error: err }) => {
+      if (cancelled || err) return;
+      setAttendance((data as AttendanceRow[]) ?? []);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [supabase, refreshTick]);
+
+  const aov = sales && sales.orders_count > 0 ? Math.round(sales.net_sales_cents / sales.orders_count) : 0;
+  const prevAov = prevSales && prevSales.orders_count > 0 ? Math.round(prevSales.net_sales_cents / prevSales.orders_count) : 0;
+
+  const topItemsSorted = useMemo(
+    () => topItems.slice().sort((a, b) => b[topSort] - a[topSort]),
+    [topItems, topSort],
+  );
+  const topChartData = topItemsSorted.map((i) => ({
+    name: i.name.length > 16 ? `${i.name.slice(0, 15)}…` : i.name,
+    fullName: i.name,
+    value: topSort === 'revenue_cents' ? i.revenue_cents / 100 : i.qty_sold,
+  }));
+
+  async function handleGenerateReport() {
+    // Expense records aren't otherwise fetched by this panel (only their
+    // period_profitability total is) — pulled fresh here, only when
+    // actually generating a report, rather than on every page load.
+    let expenseRecords: { category: string; description: string | null; amount_cents: number; expense_date: string }[] | undefined;
+    if (canSeeProfit && profit) {
+      // Every expense up to the period end — same rule as period_profitability.
+      const { to } = resolveRange(period, customRange, tz);
+      const { data } = await supabase
+        .from('expenses')
+        .select('category, description, amount_cents, expense_date')
+        .in('status', ['approved', 'paid'])
+        .lte('expense_date', lastDayIn(to, tz));
+      expenseRecords = data ?? [];
+    }
+
+    // Restaurant Performance & Owner Activity Intelligence sections (spec
+    // §28) — reused from the exact same generate_report action/buildReportData
+    // the AI chat's own "generate my report" command already produces,
+    // rather than a second, client-side reimplementation of purchasing/
+    // payables/management-activity aggregation. This panel keeps its own
+    // existing state (kpis/profitDetail/topProducts/categoryMix/paymentMix/
+    // feedback/attendance) for everything it already renders on screen —
+    // only these four new sections come from the server call below.
+    let purchasing: ReportPurchasing | undefined;
+    let supplierPayable: ReportSupplierPayable | undefined;
+    let managementActivity: ReportManagementActivity | undefined;
+    let attentionItems: ReportAttentionItem[] | undefined;
+    let deals: ReportDeal[] | undefined;
+    let promotions: ReportPromotion[] | undefined;
+    let inventoryReconciliation: ReportInventory | undefined;
+    let aiInsights: ReportAiInsights | undefined;
+    let auditId: string | null = null;
+    // Brand Kit accent color — same "action can't know this, the /confirm
+    // route patches it in" gap as logoUrl already has (routes/ai.ts), so
+    // this PDF's accent matches the restaurant's own theme instead of the
+    // platform default. This panel builds its own ReportData object below
+    // rather than forwarding body.result verbatim (see SectionReportButtons
+    // for the domain-report path that does), so it has to be pulled out
+    // here explicitly or it silently gets dropped.
+    let primaryColor: string | null | undefined;
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`${API}/api/ai/report-pdf`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${session?.access_token ?? ''}` },
+        body: JSON.stringify({ slug, ...(customRange ? { from: customRange.from, to: customRange.to } : { period }) }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok && body.result) {
+        purchasing = body.result.purchasing ?? undefined;
+        supplierPayable = body.result.supplierPayable ?? undefined;
+        managementActivity = body.result.managementActivity ?? undefined;
+        attentionItems = body.result.attentionItems ?? undefined;
+        deals = body.result.deals ?? undefined;
+        promotions = body.result.promotions ?? undefined;
+        inventoryReconciliation = body.result.inventoryReconciliation ?? undefined;
+        aiInsights = body.result.aiInsights ?? undefined;
+        primaryColor = body.result.primaryColor ?? null;
+        auditId = body.auditId ?? null;
+      }
+    } catch {
+      // Non-fatal — the PDF still generates with every section this panel
+      // already had locally, just without the intelligence sections.
+    }
+
+    await saveAndStoreReportPdf({
+      restaurantName,
+      logoUrl,
+      primaryColor,
+      periodLabel,
+      kpis: {
+        net_sales_cents: sales?.net_sales_cents ?? 0,
+        orders_count: sales?.orders_count ?? 0,
+        aov_cents: aov,
+        gross_profit_cents: canSeeProfit && profit ? profit.gross_profit_cents : null,
+        food_cost_pct: canSeeProfit && profit ? profit.food_cost_pct : null,
+        avg_rating: feedback?.avg_overall ?? null,
+      },
+      profitDetail: canSeeProfit && profit ? profit : null,
+      dailySales: dailyRows,
+      topProducts: topItemsSorted.map((i) => ({
+        name: i.name,
+        qty_sold: i.qty_sold,
+        revenue_cents: i.revenue_cents,
+        cogs_cents: i.cogs_cents,
+        contribution_cents: i.contribution_cents,
+        contribution_margin_pct: i.contribution_margin_pct,
+      })),
+      expenseRecords,
+      categoryMix: categoryMix.map((c) => ({ name: c.name, revenue_cents: Math.round(c.value * 100) })),
+      paymentMix: paymentMixData.map((c) => ({ name: c.name, revenue_cents: Math.round(c.value * 100) })),
+      feedback,
+      attendance: attendance ? attendance.map((a) => ({ full_name: a.full_name, status: a.status })) : null,
+      purchasing,
+      supplierPayable,
+      managementActivity,
+      attentionItems,
+      // The server's deal section when it came back; otherwise the deals
+      // this panel already loaded, so the PDF never silently drops them.
+      deals:
+        deals ??
+        dealRows.map((d) => ({
+          name: d.name,
+          qty_sold: d.qty_sold,
+          revenue_cents: d.revenue_cents,
+          cogs_cents: d.cogs_cents,
+          contribution_cents: d.contribution_cents,
+          contribution_margin_pct: d.contribution_margin_pct,
+        })),
+      promotions,
+      inventoryReconciliation,
+      aiInsights,
+      aiSummary: aiSummary ?? null,
+    }, undefined, { supabase, auditId, domain: 'complete' });
+  }
+
+  const [exporting, setExporting] = useState(false);
+  // Detailed multi-sheet .xlsx for independent verification/reconciliation
+  // — a different audience than the PDF (an accountant/analyst, not a
+  // glance-and-go summary), generated server-side (buildExcelWorkbook,
+  // gated by reports.export) and streamed straight to a download rather
+  // than assembled here, so this button carries no duplicate calculation
+  // logic of its own.
+  async function handleExportExcel() {
+    setExporting(true);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const qs = new URLSearchParams({
+        slug,
+        ...(customRange ? { from: customRange.from, to: customRange.to } : { period }),
+        ...(selectedSheets && selectedSheets.size > 0 ? { sheets: Array.from(selectedSheets).join(',') } : {}),
+      });
+      const res = await fetch(`${API}/api/ai/export/excel?${qs.toString()}`, {
+        headers: { Authorization: `Bearer ${session?.access_token ?? ''}` },
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setError(body.message ?? 'Could not generate the Excel export.');
+        return;
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${slug}-export-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      setError('Network error while exporting.');
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const attCounts = useMemo(() => {
+    const rows = attendance ?? [];
+    const c = (s: string) => rows.filter((r) => r.status === s).length;
+    return {
+      present: c('present') + c('early_departure') + c('incomplete'),
+      late: c('late'),
+      absent: c('absent'),
+      leave: c('leave'),
+      total: rows.length,
+    };
+  }, [attendance]);
+  const attendancePct = attCounts.total > 0 ? Math.round(((attCounts.present + attCounts.late) / attCounts.total) * 100) : null;
+
+  return (
+    <section className="space-y-6">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="font-bold">Restaurant performance</h2>
+          <p className="text-muted text-[0.6875rem] mt-0.5 flex items-center gap-1.5">
+            {(() => {
+              const r = resolveRange(period, customRange, tz);
+              return rangeCaption(r.from, r.to, tz);
+            })()}
+            <span className="inline-flex items-center gap-1">
+              · <span className="h-1.5 w-1.5 rounded-full bg-ok" /> Live
+              {updatedAt && ` · updated ${updatedAt.toLocaleTimeString('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' })}`}
+            </span>
+          </p>
+        </div>
+        <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2 sm:gap-3">
+          <div className="flex max-w-full gap-1 overflow-x-auto no-scrollbar rounded-lg border border-border bg-main p-1">
+            {PERIODS.map((p) => (
+              <button
+                key={p.key}
+                onClick={() => {
+                  onCustomRangeChange(null);
+                  onPeriodChange(p.key);
+                }}
+                className={`shrink-0 whitespace-nowrap px-2.5 py-1 rounded text-[0.6875rem] font-semibold transition-colors ${
+                  !customRange && period === p.key ? 'bg-primary text-primary-fg' : 'text-muted hover:text-body'
+                }`}
+              >
+                {p.label}
+              </button>
+            ))}
+            <button
+              onClick={() => {
+                setCustomDraft(customRange ?? { from: '', to: '' });
+                setCustomOpen((v) => !v);
+              }}
+              className={`shrink-0 whitespace-nowrap px-2.5 py-1 rounded text-[0.6875rem] font-semibold transition-colors ${
+                customRange ? 'bg-primary text-primary-fg' : 'text-muted hover:text-body'
+              }`}
+            >
+              Custom
+            </button>
+          </div>
+          <button
+            onClick={handleGenerateReport}
+            disabled={loading}
+            className="rounded-lg bg-primary text-primary-fg px-3 py-1.5 text-[0.6875rem] font-semibold disabled:opacity-50"
+          >
+            Generate Report
+          </button>
+          <div className="flex rounded-lg border border-border overflow-hidden">
+            <button
+              onClick={handleExportExcel}
+              disabled={loading || exporting}
+              className="bg-main px-3 py-1.5 text-[0.6875rem] font-semibold text-body hover:border-primary disabled:opacity-50"
+            >
+              {exporting ? 'Exporting…' : selectedSheets ? `Export Excel (${selectedSheets.size})` : 'Export Excel'}
+            </button>
+            <button
+              onClick={() => setSheetPickerOpen((v) => !v)}
+              title="Choose which sheets to export"
+              className={`px-2 py-1.5 text-[0.6875rem] border-s border-border ${sheetPickerOpen || selectedSheets ? 'bg-primary/10 text-primary' : 'bg-main text-muted hover:text-body'}`}
+            >
+              ▾
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {sheetPickerOpen && (
+        <div className="rounded-lg border border-border bg-main p-3">
+          <div className="flex items-center justify-between mb-2">
+            <span className="text-[0.6875rem] font-semibold text-muted">
+              Export sheets — Executive Summary &amp; Profit Summary always included
+            </span>
+            <button onClick={() => setSelectedSheets(null)} className="text-[0.6875rem] text-primary hover:underline">
+              Select all
+            </button>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+            {EXCEL_OPTIONAL_SHEETS.map((name) => {
+              const checked = selectedSheets ? selectedSheets.has(name) : true;
+              return (
+                <label key={name} className="flex items-center gap-1.5 text-[0.6875rem] text-body">
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={(e) => {
+                      setSelectedSheets((cur) => {
+                        const base = cur ? new Set(cur) : new Set(EXCEL_OPTIONAL_SHEETS);
+                        if (e.target.checked) base.add(name);
+                        else base.delete(name);
+                        return base.size === EXCEL_OPTIONAL_SHEETS.length ? null : base;
+                      });
+                    }}
+                  />
+                  {name}
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {customOpen && (
+        <div className="flex flex-wrap items-end gap-2 rounded-lg border border-border bg-main p-3">
+          <label className="text-[0.6875rem] text-muted flex flex-col gap-1">
+            From
+            <input
+              type="date"
+              value={customDraft.from}
+              max={customDraft.to || undefined}
+              onChange={(e) => setCustomDraft((d) => ({ ...d, from: e.target.value }))}
+              className="rounded border border-border bg-surface px-2 py-1 text-xs"
+            />
+          </label>
+          <label className="text-[0.6875rem] text-muted flex flex-col gap-1">
+            To
+            <input
+              type="date"
+              value={customDraft.to}
+              min={customDraft.from || undefined}
+              onChange={(e) => setCustomDraft((d) => ({ ...d, to: e.target.value }))}
+              className="rounded border border-border bg-surface px-2 py-1 text-xs"
+            />
+          </label>
+          <button
+            onClick={() => {
+              if (!customDraft.from || !customDraft.to) return;
+              onCustomRangeChange(customDraft);
+              setCustomOpen(false);
+            }}
+            disabled={!customDraft.from || !customDraft.to}
+            className="rounded-lg bg-primary text-primary-fg px-3 py-1.5 text-[0.6875rem] font-semibold disabled:opacity-50"
+          >
+            Apply
+          </button>
+          {customRange && (
+            <button
+              onClick={() => {
+                onCustomRangeChange(null);
+                setCustomDraft({ from: '', to: '' });
+                setCustomOpen(false);
+              }}
+              className="rounded-lg border border-border px-3 py-1.5 text-[0.6875rem] font-semibold text-muted hover:text-body"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+      )}
+
+      {error && <p className="text-danger text-xs">{error}</p>}
+      {!loading && !error && sales && sales.orders_count === 0 && (
+        <p className="rounded-lg border border-border bg-main px-3 py-2 text-xs text-muted">
+          No completed orders between {(() => {
+            const r = resolveRange(period, customRange, tz);
+            return rangeCaption(r.from, r.to, tz);
+          })()}. Net profit still subtracts every expense recorded up to the end of this period.
+        </p>
+      )}
+
+      {loading ? (
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <div key={i} className="rounded-lg border border-border bg-surface p-4 h-20 animate-pulse" />
+          ))}
+        </div>
+      ) : (
+        <>
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <Kpi
+              label="Net sales (before tax)"
+              value={formatCents(sales?.net_sales_cents ?? 0)}
+              delta={
+                <>
+                  {sales && prevSales && <Delta curr={sales.net_sales_cents} prev={prevSales.net_sales_cents} />}
+                  {taxInfo && (
+                    <span className="block text-[0.6875rem] text-muted">
+                      + {formatCents(taxInfo.tax_cents)} tax = <span className="font-semibold text-body">{formatCents(taxInfo.sales_incl_tax_cents)}</span> with tax
+                    </span>
+                  )}
+                </>
+              }
+            />
+            <Kpi label="Orders" value={String(sales?.orders_count ?? 0)} delta={sales && prevSales && <Delta curr={sales.orders_count} prev={prevSales.orders_count} />} />
+            <Kpi label="AOV" value={formatCents(aov)} delta={prevAov > 0 && <Delta curr={aov} prev={prevAov} />} />
+            <Kpi
+              label="Customer rating"
+              value={feedback?.avg_overall != null ? `★ ${feedback.avg_overall.toFixed(1)}` : '—'}
+              delta={feedback ? <span className="text-muted text-[0.6875rem]">{feedback.responses} response{feedback.responses === 1 ? '' : 's'}</span> : undefined}
+            />
+          </div>
+
+          {/* Profit row (spec: Net Profit belongs on the dashboard's own
+             KPIs, not only /finance and AI chat — period_profitability
+             already computes it, this just stops dropping the field). */}
+          {canSeeProfit && profit && (
+            <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <Kpi
+                label="Gross profit"
+                value={formatCents(profit.gross_profit_cents)}
+                delta={prevProfit && <Delta curr={profit.gross_profit_cents} prev={prevProfit.gross_profit_cents} />}
+                onClick={() => setDrilldownLevel('gross_profit')}
+              />
+              <Kpi
+                label="Net profit"
+                value={formatCents(profit.net_profit_cents)}
+                tone={profit.net_profit_cents >= 0 ? 'ok' : 'danger'}
+                delta={prevProfit && <Delta curr={profit.net_profit_cents} prev={prevProfit.net_profit_cents} />}
+                onClick={() => setDrilldownLevel('net_profit')}
+              />
+              <Kpi label="Gross margin" value={profit.gross_margin_pct != null ? `${profit.gross_margin_pct}%` : 'N/A'} />
+              <Kpi label="Net margin" value={profit.net_profit_margin_pct != null ? `${profit.net_profit_margin_pct}%` : 'N/A'} />
+            </div>
+          )}
+          {canSeeProfit && profit && (
+            <div className="rounded-lg border border-border bg-surface p-4 text-[0.6875rem] text-muted flex flex-wrap gap-x-6 gap-y-1">
+              <span>Gross sales <span className="font-semibold text-body">{formatCents(profit.gross_sales_cents)}</span></span>
+              <span>Discounts <span className="font-semibold text-body">-{formatCents(profit.discount_cents)}</span></span>
+              <span>Refunds <span className="font-semibold text-body">-{formatCents(profit.refunded_cents)}</span></span>
+              <span>COGS (theoretical) <span className="font-semibold text-body">-{formatCents(profit.theoretical_cogs_cents)}</span></span>
+              <span>Expenses (all to date) <span className="font-semibold text-body">-{formatCents(profit.expenses_cents)}</span></span>
+              {taxInfo && (
+                <span>
+                  Tax collected <span className="font-semibold text-body">{formatCents(taxInfo.tax_cents)}</span> (owed to the tax authority, not
+                  profit)
+                </span>
+              )}
+              {profit.cogs_lines_missing > 0 && (
+                <span className="text-warn font-semibold">
+                  ⚠ {profit.cogs_lines_missing}/{profit.cogs_lines_total} sold line(s) missing a recipe — COGS understates the true figure
+                </span>
+              )}
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div className="rounded-lg border border-border bg-surface p-5">
+              <h3 className="font-bold text-sm mb-3">Revenue mix — by category</h3>
+              {categoryMix.length === 0 ? (
+                <p className="text-muted text-xs">No à la carte sales in this period.</p>
+              ) : (
+                <div className="h-52">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie data={categoryMix} dataKey="value" nameKey="name" innerRadius={45} outerRadius={75} paddingAngle={2} isAnimationActive>
+                        {categoryMix.map((_, i) => (
+                          <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
+                        ))}
+                      </Pie>
+                      <Tooltip content={<PieTooltip />} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+            </div>
+
+            <div className="rounded-lg border border-border bg-surface p-5">
+              <h3 className="font-bold text-sm mb-3">Payment mix</h3>
+              {paymentMixData.length === 0 ? (
+                <p className="text-muted text-xs">No paid orders in this period.</p>
+              ) : (
+                <div className="h-52">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie data={paymentMixData} dataKey="value" nameKey="name" innerRadius={45} outerRadius={75} paddingAngle={2} isAnimationActive>
+                        {paymentMixData.map((_, i) => (
+                          <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
+                        ))}
+                      </Pie>
+                      <Tooltip content={<PieTooltip />} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-border bg-surface p-5">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="font-bold text-sm">Top products</h3>
+              <div className="flex gap-1 rounded border border-border p-0.5">
+                {(['revenue_cents', 'qty_sold'] as const).map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => setTopSort(s)}
+                    className={`px-2 py-0.5 rounded text-[0.625rem] font-semibold ${topSort === s ? 'bg-primary text-primary-fg' : 'text-muted'}`}
+                  >
+                    {s === 'revenue_cents' ? 'Revenue' : 'Units'}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {topChartData.length === 0 ? (
+              <p className="text-muted text-xs">No à la carte sales in this period.</p>
+            ) : (
+              <div className="h-56">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={topChartData} layout="vertical" margin={{ left: 8, right: 16 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="rgb(var(--border-color))" horizontal={false} />
+                    <XAxis type="number" tick={{ fontSize: 11, fill: 'rgb(var(--text-muted))' }} />
+                    <YAxis type="category" dataKey="name" width={100} tick={{ fontSize: 11, fill: 'rgb(var(--text-muted))' }} />
+                    <Tooltip
+                      formatter={(v: number) => (topSort === 'revenue_cents' ? formatCents(v * 100) : v)}
+                      labelFormatter={(_, p) => (p?.[0]?.payload as { fullName?: string })?.fullName ?? ''}
+                    />
+                    <Bar dataKey="value" fill="rgb(var(--primary))" radius={[0, 3, 3, 0]} isAnimationActive />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-lg border border-border bg-surface p-5">
+            <div className="flex items-baseline justify-between mb-3">
+              <h3 className="font-bold text-sm">Deals &amp; combos</h3>
+              {dealRows.length > 0 && (
+                <span className="text-[0.6875rem] text-muted">
+                  {formatCents(dealRows.reduce((s, d) => s + d.revenue_cents, 0))} from{' '}
+                  {dealRows.reduce((s, d) => s + d.qty_sold, 0)} sold
+                </span>
+              )}
+            </div>
+            {dealRows.length === 0 ? (
+              <p className="text-muted text-xs">No deals sold in this period.</p>
+            ) : (
+              <div className="overflow-x-auto" tabIndex={0} role="group" aria-label="Table — scroll to see more">
+                <table className="w-full text-start text-xs">
+                  <thead className="text-muted border-b border-border">
+                    <tr>
+                      <th className="py-2 pe-3 font-semibold">Deal</th>
+                      <th className="py-2 px-3 font-semibold text-end">Sold</th>
+                      <th className="py-2 px-3 font-semibold text-end">Orders</th>
+                      <th className="py-2 px-3 font-semibold text-end">Revenue</th>
+                      {canSeeProfit && <th className="py-2 px-3 font-semibold text-end">Contribution</th>}
+                      {canSeeProfit && <th className="py-2 ps-3 font-semibold text-end">Margin</th>}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {dealRows.map((d) => (
+                      <tr key={d.deal_id} className="border-b border-border/50 last:border-0">
+                        <td className="py-2 pe-3 font-semibold">{d.name}</td>
+                        <td className="py-2 px-3 text-end tabular-nums">{d.qty_sold}</td>
+                        <td className="py-2 px-3 text-end tabular-nums text-muted">{d.orders_count}</td>
+                        <td className="py-2 px-3 text-end tabular-nums font-bold">{formatCents(d.revenue_cents)}</td>
+                        {canSeeProfit && (
+                          <td className="py-2 px-3 text-end tabular-nums">
+                            {d.contribution_cents != null ? formatCents(d.contribution_cents) : <span className="text-muted">no recipe cost</span>}
+                          </td>
+                        )}
+                        {canSeeProfit && (
+                          <td className="py-2 ps-3 text-end tabular-nums text-muted">
+                            {d.contribution_margin_pct != null ? `${d.contribution_margin_pct}%` : '—'}
+                          </td>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <div className="rounded-lg border border-border bg-surface p-5">
+              <h3 className="font-bold text-sm mb-3">Staff attendance — today</h3>
+              {!attendance ? (
+                <p className="text-muted text-xs">Loading…</p>
+              ) : attendance.length === 0 ? (
+                <p className="text-muted text-xs">No active staff.</p>
+              ) : (
+                <>
+                  <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs mb-3">
+                    <span className="text-ok font-bold">{attCounts.present} present</span>
+                    <span className="text-warn font-bold">{attCounts.late} late</span>
+                    <span className="text-danger font-bold">{attCounts.absent} absent</span>
+                    <span className="text-muted font-bold">{attCounts.leave} leave</span>
+                    {attendancePct != null && <span className="ms-auto font-bold text-body">{attendancePct}%</span>}
+                  </div>
+                  <div className="space-y-1.5 max-h-56 overflow-y-auto">
+                    {attendance.map((a) => (
+                      <div key={a.membership_id} className="flex items-center gap-2 text-xs">
+                        <span className={`w-2 h-2 rounded-full shrink-0 ${ATTENDANCE_DOT[a.status] ?? 'bg-border'}`} />
+                        <span className="flex-1 truncate">{a.full_name ?? '—'}</span>
+                        <span className="text-muted capitalize">{a.status.replace('_', ' ')}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="rounded-lg border border-border bg-surface p-5">
+              <h3 className="font-bold text-sm mb-3">Customer experience</h3>
+              {!feedback || feedback.responses === 0 ? (
+                <p className="text-muted text-xs">No feedback submitted in this period.</p>
+              ) : (
+                <div className="space-y-2 text-xs">
+                  {(
+                    [
+                      ['Food', feedback.avg_food],
+                      ['Service', feedback.avg_service],
+                      ['Cleanliness', feedback.avg_cleanliness],
+                      ['Speed', feedback.avg_speed],
+                      ['Ambiance', feedback.avg_ambiance],
+                      ['Overall', feedback.avg_overall],
+                    ] as [string, number | null][]
+                  ).map(([label, val]) => (
+                    <div key={label} className="flex items-center justify-between">
+                      <span className={label === 'Overall' ? 'font-bold' : 'text-muted'}>{label}</span>
+                      <span className={`font-mono ${label === 'Overall' ? 'font-bold' : ''}`}>
+                        {val != null ? `★ ${val.toFixed(1)}` : '—'}
+                      </span>
+                    </div>
+                  ))}
+                  <p className="text-muted text-[0.6875rem] pt-1">{feedback.responses} response{feedback.responses === 1 ? '' : 's'} this period.</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {drilldownLevel && profit && (
+        <ProfitDrilldownModal
+          profit={profit}
+          from={resolveRange(period, customRange, tz).from}
+          to={resolveRange(period, customRange, tz).to}
+          timeZone={tz}
+          periodLabel={periodLabel}
+          initialLevel={drilldownLevel}
+          onClose={() => setDrilldownLevel(null)}
+        />
+      )}
+    </section>
+  );
+}

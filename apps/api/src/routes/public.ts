@@ -1,0 +1,400 @@
+import express, { type Request, type Response, type NextFunction } from 'express';
+import { z } from 'zod';
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { supabaseAdmin } from '../supabase';
+import { isAllowedOrigin, env } from '../env';
+import { getActivePlans } from '../lib/plans';
+import { billingConfigured } from '../stripe';
+import { getAllSiteSections } from '../lib/siteContent';
+import { getPublishedFaqItems } from '../lib/faqItems';
+
+export const publicRouter = express.Router();
+
+/** GET /api/public/plans — active plans for the marketing pricing page,
+ *  get-started plan picker, and the tenant Billing page. Unauthenticated;
+ *  public.plans is the one source both apps read for plan/pricing data. */
+publicRouter.get('/plans', async (_req: Request, res: Response) => {
+  const plans = await getActivePlans();
+  res.json({ plans, billing_configured: billingConfigured });
+});
+
+/** GET /api/public/site-content — the marketing site's editable content
+ *  blocks (public.site_sections). Unauthenticated, ALL rows (active and
+ *  inactive) — the caller needs to see an inactive row to hide that
+ *  section rather than rendering its default, see lib/cms/content.ts. */
+publicRouter.get('/site-content', async (_req: Request, res: Response) => {
+  try {
+    const sections = await getAllSiteSections();
+    res.json({ sections });
+  } catch (err) {
+    res.status(500).json({ error: 'query_failed', message: String((err as Error).message ?? err) });
+  }
+});
+
+/** GET /api/public/faq-items — published FAQ entries (public.faq_items),
+ *  grouped/sorted client-side by lib/cms/content.ts's getFaqItems(). */
+publicRouter.get('/faq-items', async (_req: Request, res: Response) => {
+  try {
+    const items = await getPublishedFaqItems();
+    res.json({ items });
+  } catch (err) {
+    res.status(500).json({ error: 'query_failed', message: String((err as Error).message ?? err) });
+  }
+});
+
+// place_order() charges the restaurant's own tax setting (tenant migration
+// 0078) and ignores this argument; it is still passed because the function
+// signature requires it.
+const TAX_RATE_BPS = 0;
+
+// Storefront is served cross-origin from the web app in dev.
+publicRouter.use((req: Request, res: Response, next: NextFunction) => {
+  const origin = req.headers.origin;
+  if (isAllowedOrigin(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Vary', 'Origin');
+  }
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
+
+// slug -> ANON client for that restaurant's dedicated project. Public endpoints
+// (menu read, place_order, promo preview) run with the anon key only: menu rows
+// are guest-readable by RLS and the mutating calls are SECURITY DEFINER RPCs
+// granted to anon. The platform never needs the tenant's admin key here.
+const clientCache = new Map<string, SupabaseClient>();
+
+export async function tenantClientForSlug(slug: string): Promise<SupabaseClient | null> {
+  const cached = clientCache.get(slug);
+  if (cached) return cached;
+
+  const { data } = await supabaseAdmin
+    .from('tenant_projects')
+    .select('project_url, anon_key, tenants!inner(slug, status)')
+    .eq('tenants.slug', slug)
+    .maybeSingle();
+
+  const row = data as
+    | { project_url: string; anon_key: string; tenants: { status: string } }
+    | null;
+  if (!row || row.tenants.status !== 'active' || !row.anon_key) return null;
+
+  const client = createClient(row.project_url, row.anon_key, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+  clientCache.set(slug, client);
+  return client;
+}
+
+publicRouter.get('/menu/:slug', async (req: Request, res: Response) => {
+  const slug = req.params.slug ?? '';
+  const tenant = slug ? await tenantClientForSlug(slug) : null;
+  if (!tenant) return res.status(404).json({ error: 'restaurant_not_found' });
+
+  // Multi-branch: ?b=<code> from a table's QR code picks that branch's availability, prices and
+  // switched-off dishes. No code (or before migration 0098) = the main branch, as before.
+  const branchCode = typeof req.query.b === 'string' && /^[A-Za-z0-9-]{2,12}$/.test(req.query.b) ? req.query.b.toUpperCase() : null;
+  let branchId: string | null = null;
+  if (branchCode) {
+    const { data: b } = await tenant.from('branches').select('id').eq('code', branchCode).eq('status', 'active').maybeSingle();
+    branchId = (b as { id: string } | null)?.id ?? null;
+  }
+  const { data: overrideRows } = branchId
+    ? await tenant.from('branch_menu_overrides').select('menu_item_id, variant_id, price_cents, is_available').eq('branch_id', branchId)
+    : { data: [] };
+  type Override = { menu_item_id: string; variant_id: string | null; price_cents: number | null; is_available: boolean | null };
+  const overrides = new Map(((overrideRows ?? []) as Override[]).map((o) => [`${o.menu_item_id}:${o.variant_id ?? ''}`, o]));
+
+  const [{ data: categories }, { data: rawItems }, { data: deals }, { data: brandKitRows }, { data: availabilityRows }, liveDeals] = await Promise.all([
+    tenant.from('menu_categories').select('id, name, sort_order').order('sort_order'),
+    tenant
+      .from('menu_items')
+      .select(
+        'id, name, description, price_cents, category_id, image_url, menu_variants(id, name, price_cents, sku, is_available, track_availability, available_qty, sort_order), modifier_groups(id, name, kind, min_select, max_select, sort_order, modifier_options(id, name, price_cents, is_available, sort_order))',
+      )
+      .eq('is_available', true)
+      .order('name'),
+    tenant
+      .from('deals')
+      .select(
+        'id, name, description, image_url, price_cents, sort_order, deal_components(qty, menu_item_id, variant_id, menu_items(name, price_cents, menu_variants(price_cents, sort_order)), menu_variants(name, price_cents)), deal_option_groups(id, name, min_select, max_select, sort_order, deal_option_items(id, menu_item_id, variant_id, qty, price_adjustment_cents, is_default, sort_order, menu_items(name, is_available), menu_variants(name, is_available, track_availability, available_qty)))',
+      )
+      .eq('is_available', true)
+      .order('sort_order'),
+    tenant.rpc('get_brand_kit'),
+    // Recipe-driven availability engine (tenant-migrations/0052) — the ONE
+    // authoritative "can we actually make this right now" signal, computed
+    // server-side from live inventory. Never recalculated here: this route
+    // only reads product_availability and reduces it to the plain boolean
+    // a customer sees (spec §26) — no bottleneck/reason ever leaves this
+    // route, and manual is_available/track_availability toggles above stay
+    // the only thing that removes an item/variant from the payload
+    // entirely; the engine only adds an "Unavailable" flag on top.
+    tenant.from('product_availability').select('menu_item_id, variant_id, status').setHeader('x-branch-ids', branchId ?? ''),
+    // Deals sellable right now on the customer menu (status, dates, days,
+    // time window, channel) — the same rule place_order enforces
+    // (tenant-migrations/0064). A tenant without it just skips the filter.
+    tenant.rpc('live_deal_ids', { p_sales_channel: 'customer_portal' }),
+  ]);
+  const liveDealIds = liveDeals.error ? null : new Set((liveDeals.data as string[] | null) ?? []);
+  // The branch's own prices, and dishes or sizes it has switched off.
+  const items = ((rawItems ?? []) as Array<Record<string, unknown>>)
+    .filter((it) => overrides.get(`${it.id}:`)?.is_available !== false)
+    .map((it) => {
+      const whole = overrides.get(`${it.id}:`);
+      return {
+        ...it,
+        price_cents: whole?.price_cents ?? it.price_cents,
+        menu_variants: ((it.menu_variants as Array<Record<string, unknown>>) ?? [])
+          .filter((v) => overrides.get(`${it.id}:${v.id}`)?.is_available !== false)
+          .map((v) => ({ ...v, price_cents: overrides.get(`${it.id}:${v.id}`)?.price_cents ?? whole?.price_cents ?? v.price_cents })),
+      };
+    });
+  const brandKit = Array.isArray(brandKitRows) ? (brandKitRows[0] ?? null) : (brandKitRows ?? null);
+
+  type AvailRow = { menu_item_id: string; variant_id: string | null; status: string };
+  const availRows = (availabilityRows ?? []) as AvailRow[];
+  const rowsForItem = (itemId: string) => availRows.filter((r) => r.menu_item_id === itemId);
+  // Untracked (no recipe/required-modifier signal at all) => true, same
+  // "absence of a row means fall back to the manual system" rule the
+  // engine itself documents. Tracked and every row unavailable => false.
+  const computedAvailable = (rows: AvailRow[]) => rows.length === 0 || !rows.every((r) => r.status === 'unavailable');
+
+  // Drop items/variants hidden or sold out via the pre-existing MANUAL
+  // toggles only — that stays an explicit Owner action to remove something
+  // from the storefront entirely. Everything that survives that filter
+  // gets a computed_available flag layered on top from the engine so it
+  // stays visible with a plain "Unavailable" label instead of vanishing
+  // (spec §26) — this is also what fixes a required modifier group whose
+  // options are all exhausted: the item now shows Unavailable up front
+  // instead of only failing at checkout.
+  const cleaned = (items ?? [])
+    .map((it: Record<string, unknown>) => {
+      const itemRows = rowsForItem(it.id as string);
+      return {
+        ...it,
+        computed_available: computedAvailable(itemRows),
+        menu_variants: ((it.menu_variants as Array<Record<string, unknown>>) ?? [])
+          .filter((v) => v.is_available && (!v.track_availability || (v.available_qty as number) > 0))
+          .map(
+            (v): Record<string, unknown> => ({
+              ...v,
+              // A variant without its own recipe runs on the item's base
+              // recipe row (variant_id null) — same resolution rule as the
+              // engine and place_order().
+              computed_available: computedAvailable(
+                itemRows.some((r) => r.variant_id === v.id)
+                  ? itemRows.filter((r) => r.variant_id === v.id)
+                  : itemRows.filter((r) => r.variant_id === null),
+              ),
+            }),
+          )
+          .sort((a, b) => (a.sort_order as number) - (b.sort_order as number)),
+        modifier_groups: ((it.modifier_groups as Array<Record<string, unknown>>) ?? [])
+          .map(
+            (g): Record<string, unknown> => ({
+              ...g,
+              modifier_options: ((g.modifier_options as Array<Record<string, unknown>>) ?? [])
+                .filter((o) => o.is_available)
+                .sort((a, b) => (a.sort_order as number) - (b.sort_order as number)),
+            }),
+          )
+          .filter((g) => (g.modifier_options as unknown[]).length > 0)
+          .sort((a, b) => (a.sort_order as number) - (b.sort_order as number)),
+      };
+    })
+    .filter((it) => (it.menu_variants as unknown[]).length > 0);
+
+  // Supabase embeds a to-one relation as an object (or an array of one on
+  // some join shapes) — normalize to a single object/null either way.
+  const one = <T>(x: T | T[] | null | undefined): T | null =>
+    Array.isArray(x) ? (x[0] ?? null) : (x ?? null);
+
+  // Deals: drop Build-Your-Own option items whose underlying menu item/
+  // variant is no longer available (mirrors the modifier-option cleaning
+  // above), then drop any group left with zero selectable options — a
+  // required group with nothing to pick would strand the customer.
+  // A dish (or size) this branch switched off is not sold inside a deal either (0103): drop
+  // a deal whose fixed parts include one, and drop such choices from its option groups.
+  const switchedOff = (itemId: unknown, variantId: unknown) =>
+    (overrides.get(`${itemId}:${variantId ?? ''}`) ?? overrides.get(`${itemId}:`))?.is_available === false;
+  const cleanedDeals = (deals ?? [])
+    .filter((d: Record<string, unknown>) => !liveDealIds || liveDealIds.has(d.id as string))
+    .filter((d: Record<string, unknown>) =>
+      !((d.deal_components as Array<Record<string, unknown>>) ?? []).some((c) => switchedOff(c.menu_item_id, c.variant_id)))
+    .map((d: Record<string, unknown>) => ({
+    ...d,
+    deal_option_groups: ((d.deal_option_groups as Array<Record<string, unknown>>) ?? [])
+      .map((g): Record<string, unknown> => ({
+        ...g,
+        deal_option_items: ((g.deal_option_items as Array<Record<string, unknown>>) ?? [])
+          .filter((oi) => {
+            if (switchedOff(oi.menu_item_id, oi.variant_id)) return false;
+            const variant = one(oi.menu_variants as Record<string, unknown> | Record<string, unknown>[] | null);
+            const item = one(oi.menu_items as Record<string, unknown> | Record<string, unknown>[] | null);
+            if (oi.variant_id) {
+              return (
+                !!variant &&
+                variant.is_available &&
+                (!variant.track_availability || (variant.available_qty as number) > 0)
+              );
+            }
+            return !!item && item.is_available;
+          })
+          // Keep just the display name from each embed — the storefront
+          // needs "Chicken Burger · Large" the same way deal_components does
+          // above; availability flags already did their job in the filter.
+          .map((oi): Record<string, unknown> => ({
+            ...oi,
+            menu_items: (() => {
+              const it = one(oi.menu_items as Record<string, unknown> | Record<string, unknown>[] | null);
+              return it ? { name: it.name } : null;
+            })(),
+            menu_variants: (() => {
+              const v = one(oi.menu_variants as Record<string, unknown> | Record<string, unknown>[] | null);
+              return v ? { name: v.name } : null;
+            })(),
+          }))
+          .sort((a, b) => (a.sort_order as number) - (b.sort_order as number)),
+      }))
+      .filter((g) => (g.deal_option_items as unknown[]).length > 0)
+      .sort((a, b) => (a.sort_order as number) - (b.sort_order as number)),
+  }));
+
+  res.json({ categories: categories ?? [], items: cleaned, deals: cleanedDeals, brandKit });
+});
+
+// Storefront promo-code preview: validate a code against a subtotal without
+// placing anything. place_order still re-checks on submit — this is display only.
+publicRouter.get('/promo/:slug', async (req: Request, res: Response) => {
+  const slug = req.params.slug ?? '';
+  const code = String(req.query.code ?? '').trim();
+  const subtotal = Number.parseInt(String(req.query.subtotal ?? ''), 10);
+  if (!code || !Number.isFinite(subtotal) || subtotal < 0) {
+    return res.status(422).json({ error: 'invalid_request' });
+  }
+  const tenant = await tenantClientForSlug(slug);
+  if (!tenant) return res.status(404).json({ error: 'restaurant_not_found' });
+
+  // promo_preview distinguishes "genuinely invalid" from "valid but this
+  // endpoint can't compute a dollar figure" (a BOGO code — it needs the
+  // real cart contents, which only place_order sees) — a BOGO code should
+  // never show as "invalid" just because nothing's previewable yet.
+  const { data, error } = await tenant.rpc('promo_preview', {
+    p_code: code,
+    p_subtotal_cents: subtotal,
+  });
+  if (error) return res.status(400).json({ error: 'promo_check_failed' });
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row) return res.json({ valid: false, discount_cents: 0 });
+  res.json({ valid: true, kind: row.kind, discount_cents: row.discount_cents ?? 0 });
+});
+
+const orderSchema = z.object({
+  slug: z.string().min(1),
+  table: z.string().trim().max(40).optional(),
+  // Branch code from the table's QR code (multi-branch). Omitted = the main branch.
+  branch: z.string().trim().regex(/^[A-Za-z0-9-]{2,12}$/).optional(),
+  guest_name: z.string().trim().max(80).optional(),
+  channel: z.enum(['dine_in', 'takeaway', 'delivery']).default('dine_in'),
+  promo_code: z.string().trim().min(1).max(40).optional(),
+  customer_note: z.string().trim().max(500).optional(),
+  lines: z
+    .array(
+      z.object({
+        menu_item_id: z.string().uuid().optional(),
+        variant_id: z.string().uuid().optional(),
+        deal_id: z.string().uuid().optional(),
+        qty: z.number().int().positive().max(99),
+        note: z.string().trim().max(500).optional(),
+        // Option IDs only — place_order() re-prices and re-validates every
+        // one of them server-side. Never trust a client-supplied price/name.
+        modifier_option_ids: z.array(z.string().uuid()).max(20).optional(),
+        // Build-Your-Own-Combo selections (deal_option_items IDs) — same
+        // re-price/re-validate-server-side contract as modifier_option_ids.
+        deal_option_ids: z.array(z.string().uuid()).max(20).optional(),
+      }),
+    )
+    .min(1)
+    .max(50)
+    .refine((ls) => ls.every((l) => l.menu_item_id || l.variant_id || l.deal_id), {
+      message: 'each line needs menu_item_id, variant_id or deal_id',
+    }),
+});
+
+publicRouter.post('/orders', express.json(), async (req: Request, res: Response) => {
+  const parsed = orderSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res
+      .status(422)
+      .json({ error: 'invalid_request', details: parsed.error.flatten().fieldErrors });
+  }
+  const { slug, table, branch, guest_name, channel, promo_code, customer_note, lines } = parsed.data;
+
+  const tenant = await tenantClientForSlug(slug);
+  if (!tenant) return res.status(404).json({ error: 'restaurant_not_found' });
+
+  // The branch the guest is ordering from: guests may read active branches by code; the
+  // database also refuses an order for an inactive branch.
+  let branchId: string | null = null;
+  if (branch) {
+    const { data: b } = await tenant.from('branches').select('id').eq('code', branch.toUpperCase()).eq('status', 'active').maybeSingle();
+    if (!b) return res.status(422).json({ error: 'branch_not_found', message: 'This branch is not taking orders right now.' });
+    branchId = (b as { id: string }).id;
+  }
+
+  // place_order re-validates the code against the live promotion server-side and
+  // computes the discount itself — the client can't dictate a price. Notes are
+  // stored as untrusted plain text.
+  const { data, error } = await tenant.rpc('place_order', {
+    p_channel: channel,
+    p_table_label: table ?? null,
+    p_customer_name: guest_name ?? null,
+    p_tax_rate_bps: TAX_RATE_BPS,
+    p_lines: lines,
+    p_promo_code: promo_code ?? null,
+    p_customer_note: customer_note ?? null,
+  }).setHeader('x-branch-ids', branchId ?? '');
+  if (error) {
+    return res.status(400).json({ error: 'order_failed', message: error.message });
+  }
+
+  const row = Array.isArray(data) ? data[0] : data;
+  res.status(201).json({
+    order_id: row.order_id,
+    order_number: row.order_number,
+    subtotal_cents: row.subtotal_cents,
+    discount_cents: row.discount_cents,
+    total_cents: row.total_cents,
+    promo_applied: (row.discount_cents ?? 0) > 0,
+  });
+});
+
+const contactSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  email: z.string().trim().email(),
+  restaurant: z.string().trim().max(160).optional(),
+  message: z.string().trim().min(1).max(4000),
+});
+
+publicRouter.post('/contact', express.json(), async (req: Request, res: Response) => {
+  const parsed = contactSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res
+      .status(422)
+      .json({ error: 'invalid_request', details: parsed.error.flatten().fieldErrors });
+  }
+  const { error } = await supabaseAdmin.from('contact_messages').insert({
+    name: parsed.data.name,
+    email: parsed.data.email,
+    restaurant: parsed.data.restaurant ?? null,
+    message: parsed.data.message,
+  });
+  if (error) return res.status(500).json({ error: 'save_failed' });
+  res.status(201).json({ ok: true });
+});

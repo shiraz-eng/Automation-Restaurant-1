@@ -1,0 +1,170 @@
+import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import { supabaseAdmin } from '../supabase';
+import { mgmtClient } from '../mgmt';
+import { getFreshConnection } from './supabaseOAuth';
+
+/**
+ * An ephemeral service-role client for one tenant's project.
+ *
+ * We deliberately do NOT persist the service_role key or db password for
+ * tenants provisioned through "Connect your Supabase". Routine app traffic runs
+ * as anon / staff-JWT with RLS. The few operations that genuinely need admin
+ * rights (creating the owner account, staff invites, schema migrations)
+ * re-derive a service_role key on demand from the stored OAuth refresh token,
+ * use it, and drop it.
+ *
+ * Legacy tenants (provisioned into the platform org) still have a stored
+ * service_key; those are used directly.
+ */
+// Tables whose rows belong to one branch (tenant-migrations/0098). The service key skips row
+// security, so a scoped (owner viewing one branch) client adds the branch filter to direct
+// reads of these itself; RPC reports are already narrowed by the x-branch-ids header (0099).
+const BRANCH_TABLES = new Set([
+  'orders', 'payments', 'table_sessions', 'restaurant_tables', 'reservations', 'stock_ledger',
+  'food_stock_log', 'low_stock_events', 'purchase_orders', 'supplier_invoices', 'daily_closings',
+  'expenses', 'cash_counts', 'cash_movements', 'financial_events', 'shifts', 'attendance',
+]);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** fetch for a scoped service client: reads of branch tables only return the given branches. */
+export function branchFilteringFetch(branchIds: string[], base: typeof fetch = fetch): typeof fetch {
+  const ids = branchIds.filter((x) => UUID_RE.test(x));
+  return (input, init) => {
+    const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    if (ids.length && (method === 'GET' || method === 'HEAD')) {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      const m = url.pathname.match(/\/rest\/v1\/([a-z_]+)$/);
+      if (m && BRANCH_TABLES.has(m[1]!) && !url.searchParams.has('branch_id')) {
+        url.searchParams.append('branch_id', `in.(${ids.join(',')})`);
+        return base(input instanceof Request ? new Request(url, input) : url.toString(), init);
+      }
+      // Suppliers (0105): the shared ones plus the selected branches' own.
+      if (m && m[1] === 'suppliers' && !url.searchParams.has('branch_id') && !url.searchParams.has('or')) {
+        url.searchParams.append('or', `(branch_id.is.null,branch_id.in.(${ids.join(',')}))`);
+        return base(input instanceof Request ? new Request(url, input) : url.toString(), init);
+      }
+    }
+    return base(input, init);
+  };
+}
+
+type TenantClient = {
+  admin: SupabaseClient;
+  projectUrl: string;
+  /** The same admin access, narrowed to these branches (x-branch-ids — multi-branch, 0099):
+   *  for a request made on behalf of a login limited to some branches, or viewing one. */
+  scoped: (branchIds: string[]) => SupabaseClient;
+  /** A client acting AS the signed-in login (its JWT): every row-level rule, branch walls
+   *  included, applies — used for logins limited to some branches. */
+  asUser: (accessToken: string, branchIds: string[] | null) => SupabaseClient;
+};
+
+// Warm-instance cache: every API request used to re-read the control plane
+// (and, for connected tenants, refresh the owner's OAuth token and re-fetch
+// the project's API keys). A short cache takes that off the hot path.
+const CLIENT_TTL_MS = 10 * 60_000;
+const clientCache = new Map<string, { client: TenantClient; at: number }>();
+const slugCache = new Map<string, { tenantId: string; at: number }>();
+
+/** A control-plane read, retried — it intermittently times out (522), and a
+ *  transient failure must never look like "this restaurant doesn't exist". */
+async function controlPlaneRead<T>(read: () => PromiseLike<{ data: T | null; error: { message: string } | null }>): Promise<T | null> {
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const { data, error } = await read();
+    if (!error) return data;
+    lastErr = error;
+    await new Promise((r) => setTimeout(r, 400 * attempt));
+  }
+  throw new Error(`control plane unavailable: ${(lastErr as { message?: string })?.message ?? lastErr}`);
+}
+
+export async function tenantServiceClient(tenantId: string): Promise<TenantClient | null> {
+  const cached = clientCache.get(tenantId);
+  if (cached && Date.now() - cached.at < CLIENT_TTL_MS) return cached.client;
+
+  const proj = await controlPlaneRead<{ project_ref: string; project_url: string; service_key: string | null; anon_key: string | null }>(() =>
+    supabaseAdmin
+      .from('tenant_projects')
+      .select('project_ref, project_url, service_key, anon_key')
+      .eq('tenant_id', tenantId)
+      .maybeSingle(),
+  );
+  if (!proj) return null;
+
+  let serviceKey = proj.service_key as string | null;
+  if (!serviceKey) {
+    // Connect flow: mint the key from the owner's OAuth grant, then keep
+    // it (as provisioning already does for platform-org tenants). Minting
+    // on every request made every API feature depend on a single-use OAuth
+    // refresh token — one failed save of a rotated token broke the
+    // restaurant for good ("No such refresh token found").
+    const conn = await getFreshConnection(tenantId);
+    const keys = await mgmtClient(conn.access_token).getApiKeys(proj.project_ref);
+    serviceKey = keys.service_role;
+    await supabaseAdmin.from('tenant_projects').update({ service_key: serviceKey }).eq('tenant_id', tenantId);
+  }
+  const key = serviceKey;
+  const client: TenantClient = {
+    admin: createClient(proj.project_url, key, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    }),
+    projectUrl: proj.project_url,
+    scoped: (branchIds) =>
+      createClient(proj.project_url, key, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: { headers: { 'x-branch-ids': branchIds.join(',') }, fetch: branchFilteringFetch(branchIds) },
+      }),
+    asUser: (accessToken, branchIds) =>
+      createClient(proj.project_url, proj.anon_key ?? key, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            ...(branchIds && branchIds.length ? { 'x-branch-ids': branchIds.join(',') } : {}),
+          },
+        },
+      }),
+  };
+  clientCache.set(tenantId, { client, at: Date.now() });
+  return client;
+}
+
+/** Resolves a restaurant's admin client, telling "no such restaurant" apart
+ *  from "couldn't reach it right now" (control plane down, OAuth failure). */
+/**
+ * The restaurant part of a /r/<slug> segment. The web app runs extra logins of one
+ * restaurant side by side in "session slots" — /r/<slug>~<slot> (apps/web lib/sessionSlot.ts);
+ * a slot is never a different restaurant.
+ */
+export function baseSlug(slug: string): string {
+  return (String(slug ?? '').split('~')[0] ?? '').trim();
+}
+
+export async function resolveTenantClient(
+  rawSlug: string,
+): Promise<{ ok: true; client: TenantClient; tenantId: string } | { ok: false; reason: 'not_found' | 'unavailable'; detail?: string }> {
+  const slug = baseSlug(rawSlug);
+  try {
+    let tenantId = slugCache.get(slug);
+    if (!tenantId || Date.now() - tenantId.at > CLIENT_TTL_MS) {
+      const t = await controlPlaneRead<{ id: string }>(() => supabaseAdmin.from('tenants').select('id').eq('slug', slug).maybeSingle());
+      if (!t) return { ok: false, reason: 'not_found' };
+      tenantId = { tenantId: (t as { id: string }).id, at: Date.now() };
+      slugCache.set(slug, tenantId);
+    }
+    const client = await tenantServiceClient(tenantId.tenantId);
+    if (!client) return { ok: false, reason: 'not_found', detail: 'restaurant has no database yet (setup not finished)' };
+    return { ok: true, client, tenantId: tenantId.tenantId };
+  } catch (err) {
+    console.error(`[tenant] resolving ${slug} failed:`, err);
+    return { ok: false, reason: 'unavailable', detail: String((err as Error).message ?? err) };
+  }
+}
+
+/** Same, resolved by slug. Returns null when the restaurant can't be
+ *  resolved for any reason (callers treat that as not found). */
+export async function tenantServiceClientBySlug(slug: string): Promise<TenantClient | null> {
+  const r = await resolveTenantClient(slug);
+  return r.ok ? r.client : null;
+}

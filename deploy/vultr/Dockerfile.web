@@ -1,0 +1,29 @@
+# Automation Restaurant web app (apps/web) for a Vultr VM: Next.js standalone
+# output (next.config.mjs turns it on outside Vercel).
+# NEXT_PUBLIC_* values are built into the browser bundle, so they are build
+# arguments; they are public by design (the control-plane anon key is meant
+# for browsers). Server-only values (GEMINI_*) come from web.env at runtime.
+FROM node:22-bookworm-slim AS build
+WORKDIR /repo
+COPY . .
+ARG NEXT_PUBLIC_CONTROL_PLANE_URL
+ARG NEXT_PUBLIC_CONTROL_PLANE_ANON_KEY
+ARG NEXT_PUBLIC_API_URL
+ARG NEXT_PUBLIC_SITE_URL
+ENV NEXT_PUBLIC_CONTROL_PLANE_URL=$NEXT_PUBLIC_CONTROL_PLANE_URL \
+    NEXT_PUBLIC_CONTROL_PLANE_ANON_KEY=$NEXT_PUBLIC_CONTROL_PLANE_ANON_KEY \
+    NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL \
+    NEXT_PUBLIC_SITE_URL=$NEXT_PUBLIC_SITE_URL \
+    NEXT_TELEMETRY_DISABLED=1
+RUN npm install --no-audit --no-fund \
+ && npm run build:shared \
+ && npm run build -w @automation-restaurant/web
+
+FROM node:22-bookworm-slim
+WORKDIR /app
+ENV NODE_ENV=production PORT=3000 HOSTNAME=0.0.0.0 NEXT_TELEMETRY_DISABLED=1
+COPY --from=build /repo/apps/web/.next/standalone ./
+COPY --from=build /repo/apps/web/.next/static ./apps/web/.next/static
+COPY --from=build /repo/apps/web/public ./apps/web/public
+EXPOSE 3000
+CMD ["node", "apps/web/server.js"]

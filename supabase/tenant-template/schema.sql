@@ -1,0 +1,13978 @@
+-- ============================================================================
+-- TENANT TEMPLATE schema — executed once into every newly provisioned
+-- Supabase project. Each project belongs to exactly ONE restaurant, so there
+-- are no tenant_id columns and no tenant-scoped RLS: isolation is the project
+-- boundary. RLS here only enforces staff roles within the restaurant.
+--
+-- Applied by apps/api via the Management API query endpoint.
+-- ============================================================================
+
+
+-- Functions are created before some tables they read (e.g. app.membership_
+-- effective_permissions reads portal_staff, defined much later). Like
+-- pg_dump, skip body validation while building; bodies are still checked
+-- when first called. Without this, provisioning a NEW restaurant failed.
+set check_function_bodies = off;
+create extension if not exists pgcrypto;
+create schema if not exists app;
+grant usage on schema app to anon, authenticated, service_role;
+
+create or replace function app.current_member_role()
+returns text language sql stable as $$
+  select nullif(current_setting('request.jwt.claims', true), '')::jsonb #>> '{app_metadata,role}'
+$$;
+
+create or replace function app.is_staff()
+returns boolean language sql stable as $$
+  select app.current_member_role() is not null
+$$;
+
+create or replace function app.can_write()
+returns boolean language sql stable as $$
+  select app.current_member_role() in ('owner', 'manager')
+$$;
+
+-- ── Permission system (Phase 1) ───────────────────────────────────────────
+-- Every portal / staff JWT carries app_metadata.permissions: a text[] of keys
+-- like 'orders.view', 'payments.accept', 'stock.update'. '*' means all.
+-- Authorization decisions use app.has_perm(), never a portal/role name.
+-- is_staff()/can_write() are kept for backward compatibility during migration.
+
+create or replace function app.jwt_permissions()
+returns text[] language sql stable as $$
+  select coalesce(
+    array(
+      select jsonb_array_elements_text(
+        nullif(current_setting('request.jwt.claims', true), '')::jsonb #> '{app_metadata,permissions}'
+      )
+    ),
+    '{}'::text[]
+  )
+$$;
+
+-- The top-level 'role' claim (service_role/authenticated/anon) — NOT
+-- app_metadata.role (that's app.current_member_role()). This PostgREST
+-- setup never populates the per-claim 'request.jwt.claim.role' GUC that
+-- has_perm() used to read here (it was always '' <> 'service_role', so
+-- that clause never once fired — harmless for RLS itself, since the
+-- service_role Postgres role bypasses row security independently of
+-- has_perm(), but it silently broke every EXPLICIT has_perm()/service_role
+-- check inside a SECURITY DEFINER function body, e.g. set_member_access's
+-- and set_portal_staff's (0044) "v_all" anti-escalation short-circuit).
+-- The aggregate 'request.jwt.claims' GUC IS populated and carries role at
+-- its top level, so read it from there instead (0044).
+create or replace function app.jwt_role()
+returns text language sql stable as $$
+  select nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
+$$;
+
+create or replace function app.has_perm(p_perm text)
+returns boolean language sql stable as $$
+  select
+    -- service_role bypasses RLS entirely; this covers authenticated portals.
+    app.jwt_role() = 'service_role'
+    or '*' = any(app.jwt_permissions())
+    or p_perm = any(app.jwt_permissions())
+    -- transitional: an owner/manager with no explicit permissions still writes.
+    or (app.jwt_permissions() = '{}'::text[] and app.can_write())
+$$;
+
+-- Current user's auth id (for actor columns in SECURITY DEFINER RPCs).
+create or replace function app.jwt_sub() returns uuid language sql stable as $$
+  select nullif(nullif(current_setting('request.jwt.claims', true), '')::jsonb #>> '{sub}', '')::uuid
+$$;
+
+-- RPC-level audit writer (the app.audit_row trigger only covers table DML).
+create or replace function app.log_action(
+  p_action text, p_entity text, p_entity_id text,
+  p_before jsonb default null, p_after jsonb default null
+) returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_claims jsonb := nullif(current_setting('request.jwt.claims', true), '')::jsonb;
+begin
+  insert into public.audit_logs
+    (actor_id, actor_email, actor_role, action, entity, entity_id, before, after)
+  values
+    (app.jwt_sub(), v_claims #>> '{email}', app.current_member_role(),
+     p_action, p_entity, p_entity_id, p_before, p_after);
+end $fn$;
+
+-- Reference catalogue of permission keys (documentation + future admin UI).
+-- Not enforced by FK — JWT arrays are free-form — but the app validates against it.
+-- In public so the portal UI can read it through PostgREST.
+-- type: read/write/approval/export — what kind of action this permission
+-- grants, independent of which application area it's in. risk_level:
+-- normal/high — high marks anything destructive, financially sensitive,
+-- or authorization-escalating (delete/void/reopen/credentials/role and
+-- permission management, etc). Both drive Portal Management's selected-
+-- permission summary and risk badges — never hardcoded client-side.
+create table if not exists public.permission_catalog (
+  key        text primary key,
+  grp        text not null,
+  label      text not null,
+  type       text not null default 'write' check (type in ('read', 'write', 'approval', 'export')),
+  risk_level text not null default 'normal' check (risk_level in ('normal', 'high'))
+);
+insert into public.permission_catalog (key, grp, label, type, risk_level) values
+  ('orders.view','Orders','View orders','read','normal'),
+  ('orders.create','Orders','Create orders','write','normal'),
+  ('orders.update','Orders','Update orders','write','normal'),
+  ('orders.cancel','Orders','Cancel orders','write','normal'),
+  ('payments.view','Payments','View payments','read','normal'),
+  ('payments.accept','Payments','Accept payment','write','normal'),
+  ('payments.refund','Payments','Refund payment','write','normal'),
+  ('payments.approve_refund','Payments','Approve a refund above the configured threshold','approval','high'),
+  ('kitchen.view','Kitchen','View kitchen queue','read','normal'),
+  ('kitchen.update_status','Kitchen','Update order/prep status','write','normal'),
+  ('menu.view','Menu','View menu','read','normal'),
+  ('menu.create','Menu','Create menu items','write','normal'),
+  ('menu.update','Menu','Update menu items','write','normal'),
+  ('menu.delete','Menu','Delete menu items','write','high'),
+  ('stock.view','Stock','View food availability','read','normal'),
+  ('stock.update','Stock','Update food availability','write','normal'),
+  ('attendance.view','Attendance','View attendance','read','normal'),
+  ('attendance.mark','Attendance','Mark attendance','write','normal'),
+  ('staff.view','Staff','View staff','read','normal'),
+  ('staff.create','Staff','Create staff','write','normal'),
+  ('staff.update','Staff','Update staff','write','normal'),
+  ('staff.delete','Staff','Delete staff','write','high'),
+  ('reviews.view','Reviews','View customer reviews','read','normal'),
+  ('reviews.analytics','Reviews','View review analytics','read','normal'),
+  ('reviews.respond','Reviews','Respond to reviews','write','normal'),
+  ('reviews.moderate','Reviews','Moderate reviews','write','normal'),
+  ('reports.view','Reports','View reports','read','normal'),
+  ('settings.view','Settings','View settings','read','normal'),
+  ('settings.update','Settings','Update settings','write','high'),
+  ('portals.view','Portal Management','View portals','read','high'),
+  ('portals.create','Portal Management','Create portals','write','high'),
+  ('portals.update','Portal Management','Update portals','write','high'),
+  ('portals.disable','Portal Management','Enable/disable portals','write','high'),
+  ('portals.credentials','Portal Management','Manage portal credentials','approval','high')
+on conflict (key) do update set grp = excluded.grp, label = excluded.label, type = excluded.type, risk_level = excluded.risk_level;
+
+-- Operations / Attendance / AI key set (P3). Kept in one place so the Portal
+-- Management UI can offer every grantable permission.
+insert into public.permission_catalog (key, grp, label, type, risk_level) values
+  ('orders.reopen','Orders','Reopen orders','write','normal'),
+  ('orders.apply_discount','Orders','Apply discount','write','normal'),
+  ('orders.override_price','Orders','Override item price','write','high'),
+  ('payments.void','Payments','Void payment','write','high'),
+  ('payments.adjust','Payments','Adjust payment','write','high'),
+  ('payments.reconcile','Payments','Reconcile payments','write','normal'),
+  ('receipts.view','Payments','View receipts','read','normal'),
+  ('receipts.print','Payments','Print receipts','export','normal'),
+  ('variants.view','Menu','View variants','read','normal'),
+  ('variants.create','Menu','Create variants','write','normal'),
+  ('variants.update','Menu','Update variants','write','normal'),
+  ('variants.archive','Menu','Archive variants','write','normal'),
+  ('deals.view','Deals','View deals','read','normal'),
+  ('deals.create','Deals','Create deals','write','normal'),
+  ('deals.update','Deals','Update deals','write','normal'),
+  ('deals.archive','Deals','Archive deals','write','normal'),
+  ('customers.view','Customers','View customers','read','normal'),
+  ('customers.create','Customers','Create customers','write','normal'),
+  ('customers.update','Customers','Update customers','write','normal'),
+  ('tables.view','Tables','View tables','read','normal'),
+  ('tables.create','Tables','Create tables','write','normal'),
+  ('tables.update','Tables','Update tables','write','normal'),
+  ('availability.view','Availability','View food availability','read','normal'),
+  ('availability.update','Availability','Update food availability','write','normal'),
+  ('roles.view','Roles','View roles','read','high'),
+  ('roles.create','Roles','Create roles','write','high'),
+  ('roles.update','Roles','Update roles','write','high'),
+  ('roles.delete','Roles','Delete roles','write','high'),
+  ('permissions.view','Permissions','View permission assignments','read','high'),
+  ('permissions.assign','Permissions','Assign permissions','approval','high'),
+  ('purchases.view','Purchases','View purchases','read','normal'),
+  ('purchases.create','Purchases','Create purchases','write','normal'),
+  ('purchases.update','Purchases','Update purchases','write','normal'),
+  ('purchases.delete','Purchases','Delete purchases','write','high'),
+  ('supplier.view','Suppliers','View suppliers','read','normal'),
+  ('supplier.create','Suppliers','Create suppliers','write','normal'),
+  ('supplier.update','Suppliers','Update suppliers','write','normal'),
+  ('supplier.manage','Suppliers','Manage suppliers','write','normal'),
+  ('stock.adjust','Stock','Adjust stock','write','normal'),
+  ('stock.history','Stock','View stock history','read','normal'),
+  ('stock.count','Stock','Perform stock counts','write','normal'),
+  ('purchases.receive','Purchases','Receive purchase deliveries','write','normal'),
+  ('purchases.approve','Purchases','Approve purchase orders','approval','high'),
+  ('invoices.view','Invoices','View supplier invoices','read','normal'),
+  ('invoices.create','Invoices','Create/upload supplier invoices','write','normal'),
+  ('invoices.match','Invoices','Run/approve invoice matching','approval','normal'),
+  ('payables.view','Payables','View accounts payable','read','normal'),
+  ('payables.record_payment','Payables','Record supplier payments','write','high'),
+  ('payables.manage','Payables','Resolve payment holds, credit notes','write','high'),
+  ('inventory.manage_waste','Inventory','Record ingredient waste','write','normal'),
+  ('inventory.manage_recipes','Inventory','Manage recipes','write','normal'),
+  ('inventory.view_cost','Inventory','View ingredient & recipe cost','read','normal'),
+  ('inventory.manage','Inventory','Manage inventory items','write','normal'),
+  ('inventory.manage_purchases','Inventory','Manage purchase automation','write','normal'),
+  ('finance.view','Finance','View finance','read','normal'),
+  ('finance.create_expense','Finance','Create expense','write','normal'),
+  ('finance.update_expense','Finance','Update expense','write','normal'),
+  ('finance.delete_expense','Finance','Delete expense','write','high'),
+  ('finance.view_cogs','Finance','View COGS','read','normal'),
+  ('finance.view_profit','Finance','View profit','read','normal'),
+  ('finance.manage_costs','Finance','Manage product costs','write','normal'),
+  ('finance.manage_recipes','Finance','Manage recipes','write','normal'),
+  ('finance.manage_purchases','Finance','Manage purchase costs','write','normal'),
+  ('finance.reconcile','Finance','Reconcile cash','write','normal'),
+  ('finance.close_day','Finance','Close business day','write','normal'),
+  ('finance.reopen_day','Finance','Reopen business day','write','high'),
+  ('reports.generate','Reports','Generate reports','write','normal'),
+  ('reports.export','Reports','Export reports','export','normal'),
+  ('analytics.view','Analytics','View analytics','read','normal'),
+  ('analytics.export','Analytics','Export analytics','export','normal'),
+  ('attendance.view_dashboard','Attendance','View attendance dashboard','read','normal'),
+  ('attendance.view_reports','Attendance','View attendance reports','read','normal'),
+  ('attendance.view_employee_reports','Attendance','View employee attendance reports','read','normal'),
+  ('attendance.view_own','Attendance','View own attendance','read','normal'),
+  ('attendance.check_in','Attendance','Check in','write','normal'),
+  ('attendance.check_out','Attendance','Check out','write','normal'),
+  ('attendance.view_history','Attendance','View attendance history','read','normal'),
+  ('attendance.request_correction','Attendance','Request attendance correction','write','normal'),
+  ('attendance.correct','Attendance','Correct attendance','write','normal'),
+  ('attendance.approve_correction','Attendance','Approve attendance correction','approval','normal'),
+  ('attendance.export','Attendance','Export attendance','export','normal'),
+  ('kitchen.manage_availability','Kitchen','Manage food availability','write','normal'),
+  ('kitchen.record_waste','Kitchen','Record kitchen waste','write','normal'),
+  ('notifications.view','Notifications','View notifications','read','normal'),
+  ('notifications.manage','Notifications','Manage notifications','write','normal'),
+  ('ai.view','AI','Use the AI assistant','read','normal'),
+  ('ai.execute_read','AI','AI read actions','read','normal'),
+  ('ai.execute_write','AI','AI write actions','write','high'),
+  ('ai.approve_sensitive_action','AI','Approve sensitive AI actions','approval','high'),
+  ('social.view','Social','View connected social accounts & posts','read','normal'),
+  ('social.manage','Social','Connect/disconnect social accounts','write','normal'),
+  ('social.propose_post','Social','Draft a social media post','write','normal'),
+  ('social.approve_post','Social','Approve & publish a social media post','approval','normal')
+on conflict (key) do update set grp = excluded.grp, label = excluded.label, type = excluded.type, risk_level = excluded.risk_level;
+
+alter table public.permission_catalog enable row level security;
+create policy staff_read on public.permission_catalog for select using (app.is_staff());
+
+-- ── Enums ──────────────────────────────────────────────────────────────────
+create type app.member_role         as enum ('owner', 'manager', 'cashier', 'chef', 'waiter', 'host', 'hr', 'accountant', 'delivery');
+create type app.member_status       as enum ('pending', 'active', 'disabled');
+create type app.order_channel       as enum ('dine_in', 'takeaway', 'delivery');
+create type app.order_status        as enum ('pending', 'in_kitchen', 'ready', 'served', 'paid', 'void');
+create type app.line_status         as enum ('queued', 'preparing', 'ready', 'served');
+create type app.stock_reason        as enum ('order_deduction', 'restock', 'adjustment', 'spoilage', 'stock_take');
+create type app.reservation_status  as enum ('pending', 'confirmed', 'arrived', 'seated', 'completed', 'cancelled', 'no_show');
+create type app.modifier_kind       as enum ('required_single', 'optional_single', 'multi');
+
+-- ── Staff ──────────────────────────────────────────────────────────────────
+create table public.memberships (
+  id                uuid primary key default gen_random_uuid(),
+  user_id           uuid references auth.users(id) on delete set null,
+  email             text not null unique,
+  full_name         text,
+  role              app.member_role not null default 'waiter',
+  extra_permissions text[] not null default '{}',   -- granted on top of the role preset
+  status            app.member_status not null default 'pending',
+  -- Default expected clock-in time, set at staff creation/edit — used by
+  -- app.recompute_attendance() to compute late_minutes when no explicit
+  -- shifts row exists for that day (tenant-migrations/0053).
+  shift_start_time  time,
+  created_at        timestamptz not null default now()
+);
+create index memberships_user_id_idx on public.memberships(user_id);
+
+-- The caller's own membership id, bypassing RLS (used in RLS self-read paths).
+create or replace function app.my_membership_id() returns uuid
+language sql stable security definer set search_path = public, app as $fn$
+  select id from public.memberships where user_id = app.jwt_sub()
+$fn$;
+
+-- ── Roles (P3) ─────────────────────────────────────────────────────────────
+-- Named permission presets. A membership's effective permission set is
+-- app.compose_permissions(role, extra_permissions) — role preset ∪ extras,
+-- collapsed to {'*'} for all-access. Back-filled onto each staff Auth user's
+-- app_metadata.permissions (see supabase/tenant-migrations/0007_roles.sql).
+create table public.roles (
+  id          uuid primary key default gen_random_uuid(),
+  key         text not null unique,
+  name        text not null,
+  permissions text[] not null default '{}',
+  is_system   boolean not null default false,
+  created_at  timestamptz not null default now()
+);
+
+do $$
+declare base text[] := array[
+  'orders.view','kitchen.view','menu.view','stock.view','tables.view',
+  'reviews.view','notifications.view','attendance.view_own',
+  'attendance.check_in','attendance.check_out'
+];
+begin
+  insert into public.roles (key, name, permissions, is_system) values
+    ('owner','Owner', array['*'], true),
+    -- Default Manager: operational/business access, NOT ownership-level.
+    -- Deliberately excludes payments.refund/approve_refund/adjust/reconcile,
+    -- finance.view, and the Recipes & Food Cost cost-visibility keys
+    -- (inventory.manage_recipes/inventory.view_cost) — an Owner grants
+    -- these per-manager from Roles & Access Control (or per-member via
+    -- Staff's extra grants) when a specific manager needs them; they are
+    -- never automatic just from holding the 'manager' role. portals.view
+    -- (Kiosk Portal management) is owner-only regardless of grant — left
+    -- out of the default for the same reason.
+    ('manager','Manager', base || array[
+      'orders.create','orders.update','orders.cancel','orders.reopen',
+      'orders.apply_discount','orders.override_price',
+      'payments.view','payments.accept','payments.void','receipts.view','receipts.print',
+      'kitchen.update_status','kitchen.manage_availability','kitchen.record_waste',
+      'menu.create','menu.update','menu.archive',
+      'variants.view','variants.create','variants.update','variants.archive',
+      'deals.view','deals.create','deals.update','deals.archive',
+      'availability.view','availability.update',
+      'stock.update','stock.adjust','stock.history','stock.count',
+      'inventory.manage_waste',
+      'tables.create','tables.update',
+      'customers.view','customers.create','customers.update',
+      'supplier.view','supplier.create','supplier.update','supplier.manage',
+      'purchases.view','purchases.create','purchases.update','purchases.receive','purchases.approve',
+      'invoices.view','invoices.create','invoices.match','payables.view',
+      'staff.view','staff.create','staff.update','staff.disable','roles.view',
+      'attendance.view','attendance.mark','attendance.view_dashboard',
+      'attendance.view_reports','attendance.view_employee_reports',
+      'attendance.view_history','attendance.correct','attendance.approve_correction',
+      'reports.view','reports.generate','reports.export',
+      'analytics.view','settings.view',
+      'notifications.manage','ai.view','ai.execute_read',
+      'social.view','social.manage','social.propose_post','social.approve_post'
+    ], true),
+    ('cashier','Cashier', base || array[
+      'orders.create','orders.update','orders.apply_discount',
+      'payments.view','payments.accept','receipts.view','receipts.print',
+      'tables.update','customers.view','customers.create'
+    ], true),
+    ('chef','Kitchen', base || array[
+      'orders.update','kitchen.update_status','kitchen.manage_availability',
+      'kitchen.record_waste','availability.view','availability.update','stock.history'
+    ], true),
+    ('waiter','Waiter', base || array[
+      'orders.create','orders.update','customers.view','customers.create','tables.update'
+    ], true),
+    ('host','Host', base || array[
+      'tables.create','tables.update','customers.view','customers.create','customers.update'
+    ], true),
+    ('hr','HR', base || array[
+      'staff.view','staff.create','staff.update','staff.disable','roles.view',
+      'attendance.view','attendance.mark','attendance.view_dashboard',
+      'attendance.view_reports','attendance.view_employee_reports',
+      'attendance.view_history','attendance.correct','attendance.approve_correction',
+      'attendance.export'
+    ], true),
+    ('accountant','Accountant', base || array[
+      'finance.view','finance.create_expense','finance.update_expense',
+      'finance.delete_expense','finance.view_cogs','finance.view_profit',
+      'finance.manage_costs','finance.manage_recipes','finance.manage_purchases',
+      'finance.reconcile','finance.close_day','finance.reopen_day',
+      'payments.view','payments.reconcile','purchases.view','purchases.approve','supplier.view',
+      'invoices.view','invoices.create','invoices.match',
+      'payables.view','payables.record_payment','payables.manage',
+      'reports.view','reports.generate','reports.export',
+      'analytics.view','analytics.export'
+    ], true),
+    ('delivery','Delivery', base || array['orders.update','customers.view'], true)
+  on conflict (key) do update
+    set name = excluded.name, permissions = excluded.permissions, is_system = true;
+end $$;
+
+create or replace function app.role_permissions(p_role text)
+returns text[] language sql stable as $$
+  select coalesce((select permissions from public.roles where key = p_role), '{}'::text[])
+$$;
+
+create or replace function app.compose_permissions(p_role text, p_extra text[])
+returns text[] language sql stable as $$
+  select case
+    when app.role_permissions(p_role) @> array['*'] then array['*']
+    else (
+      select coalesce(array_agg(distinct k order by k), '{}'::text[])
+      from unnest(app.role_permissions(p_role) || coalesce(p_extra, '{}'::text[])) as k
+    )
+  end
+$$;
+
+-- A membership's full effective permissions: role preset ∪ extra_permissions
+-- ∪ the permissions of every portal it's linked to via portal_staff (0044).
+-- '*' anywhere collapses the result to {'*'}. public.portals/portal_staff
+-- are defined later in this file — fine for a plain SQL function, whose body
+-- is only resolved at call time, not at CREATE FUNCTION time.
+create or replace function app.membership_effective_permissions(
+  p_role text, p_extra text[], p_membership_id uuid
+) returns text[] language sql stable as $$
+  with role_perms as (
+    select app.compose_permissions(p_role, p_extra) as perms
+  ),
+  portal_perms as (
+    select coalesce(array_agg(distinct perm), '{}'::text[]) as perms
+    from public.portal_staff ps
+    join public.portals p on p.id = ps.portal_id
+    cross join lateral unnest(p.permissions) as perm
+    where ps.membership_id = p_membership_id and p.status = 'active'
+  )
+  select case
+    when (select perms from role_perms) @> array['*'] then array['*']
+    when (select perms from portal_perms) @> array['*'] then array['*']
+    else (
+      select coalesce(array_agg(distinct k order by k), '{}'::text[])
+      from unnest((select perms from role_perms) || (select perms from portal_perms)) as k
+    )
+  end
+$$;
+
+-- Assign a role + optional extra grants. A caller can never grant a permission
+-- they do not themselves hold (spec §37). The actor's permissions come from the
+-- JWT — never a parameter — and this is service_role-only: the
+-- /api/staff/access route is the single caller (it re-checks in JS too).
+create or replace function public.set_member_access(
+  p_membership_id uuid, p_role text, p_extra text[] default '{}'
+) returns text[]
+language plpgsql security definer set search_path = public, app as $$
+declare
+  v_effective text[];
+  v_key text;
+  v_actor text[] := app.jwt_permissions();
+  -- service_role = the /api/staff/access route, which already ran the JS
+  -- anti-escalation check with the caller's verified permissions.
+  v_all boolean := ('*' = any(v_actor)) or app.jwt_role() = 'service_role';
+begin
+  if not app.has_perm('permissions.assign') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if not exists (select 1 from public.roles where key = p_role) then
+    raise exception 'unknown_role: %', p_role using errcode = 'foreign_key_violation';
+  end if;
+
+  v_effective := app.membership_effective_permissions(p_role, p_extra, p_membership_id);
+
+  if not v_all then
+    foreach v_key in array v_effective loop
+      if not (v_key = any(v_actor)) then
+        raise exception 'cannot grant a permission you do not hold: %', v_key
+          using errcode = 'insufficient_privilege';
+      end if;
+    end loop;
+  end if;
+
+  update public.memberships
+     set role = p_role::app.member_role, extra_permissions = coalesce(p_extra, '{}'::text[])
+   where id = p_membership_id;
+  if not found then
+    raise exception 'membership_not_found' using errcode = 'no_data_found';
+  end if;
+
+  perform app.log_action('staff.access', 'memberships', p_membership_id::text, null,
+                         jsonb_build_object('role', p_role, 'extra', p_extra));
+  return v_effective;
+end $$;
+revoke all on function public.set_member_access(uuid, text, text[]) from public, authenticated, anon;
+grant execute on function public.set_member_access(uuid, text, text[]) to service_role;
+
+alter table public.roles enable row level security;
+create policy staff_read on public.roles for select using (app.has_perm('roles.view') or app.is_staff());
+-- No can_write() fallback: editing a role's OWN permission array is
+-- exactly the self-escalation vector (Manager Portal spec §9) — writing
+-- public.roles now requires the caller to explicitly hold roles.update,
+-- never just "being a manager". protect_owner_only_permissions below is
+-- the second, independent backstop even for a caller who does hold it.
+create policy mgr_write on public.roles for all using (app.has_perm('roles.update')) with check (app.has_perm('roles.update'));
+
+create or replace function app.protect_system_roles() returns trigger
+language plpgsql as $$
+begin
+  if tg_op = 'DELETE' and old.is_system then
+    raise exception 'system roles cannot be deleted';
+  elsif tg_op = 'UPDATE' and old.is_system and new.key <> old.key then
+    raise exception 'a system role key cannot be changed';
+  end if;
+  return coalesce(new, old);
+end $$;
+create trigger protect_system_roles before update or delete on public.roles
+  for each row execute function app.protect_system_roles();
+
+-- '*' (unconditional full access — the same marker owner's own row uses)
+-- may only ever live on the 'owner' row. This is the server-side
+-- backstop for "Owner-only capabilities cannot be granted through
+-- Manager portal configuration": it holds even for a caller who legitimately
+-- holds roles.update, and even against a direct table write that bypasses
+-- routes/staff.ts's own anti-escalation check entirely. Centralized here
+-- rather than duplicated in the Roles UI's own validation.
+create or replace function app.protect_owner_only_permissions() returns trigger
+language plpgsql as $$
+begin
+  if new.key <> 'owner' and '*' = any(new.permissions) then
+    raise exception 'only the owner role may hold unrestricted (*) access' using errcode = 'insufficient_privilege';
+  end if;
+  return new;
+end $$;
+create trigger protect_owner_only_permissions before insert or update on public.roles
+  for each row execute function app.protect_owner_only_permissions();
+
+-- ── Menu ───────────────────────────────────────────────────────────────────
+create table public.menu_categories (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  sort_order int not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create table public.menu_items (
+  id uuid primary key default gen_random_uuid(),
+  category_id uuid references public.menu_categories(id) on delete set null,
+  name text not null,
+  description text,
+  image_url text,
+  price_cents integer not null default 0 check (price_cents >= 0),  -- base / fallback; real price is on the variant
+  is_available boolean not null default true,
+  station text,  -- free-text kitchen prep station (Fryer/Grill/...); null = unassigned (0050)
+  created_at timestamptz not null default now()
+);
+
+-- ── Menu variants (Phase 4) ──────────────────────────────────────────────
+-- Every item has >= 1 variant. Price, SKU and (optionally) an availability
+-- counter live on the variant. Orders record the exact variant purchased.
+create table public.menu_variants (
+  id                 uuid primary key default gen_random_uuid(),
+  menu_item_id       uuid not null references public.menu_items(id) on delete cascade,
+  name               text not null default 'Regular',
+  price_cents        integer not null check (price_cents >= 0),
+  sku                text,
+  sort_order         int not null default 0,
+  is_available       boolean not null default true,
+  track_availability boolean not null default false,
+  available_qty      int not null default 0,
+  created_at         timestamptz not null default now()
+);
+create index menu_variants_item_idx on public.menu_variants(menu_item_id, sort_order);
+
+-- ── Modifiers / add-ons (P10) ────────────────────────────────────────────
+-- A group of choices attached to an item — "Choose Size" (required, exactly
+-- one), "Toppings" (optional, up to 3), "Add-ons" (optional, any number).
+-- Distinct from a variant: a variant is a different purchasable product
+-- configuration (own price/SKU/stock); a modifier is a customization or
+-- optional addition layered on top of whichever variant was chosen.
+create table public.modifier_groups (
+  id           uuid primary key default gen_random_uuid(),
+  menu_item_id uuid not null references public.menu_items(id) on delete cascade,
+  name         text not null,
+  kind         app.modifier_kind not null default 'multi',
+  min_select   int not null default 0,
+  max_select   int,                              -- null = unlimited (kind = 'multi' only)
+  sort_order   int not null default 0,
+  created_at   timestamptz not null default now(),
+  check (kind <> 'required_single' or min_select >= 1),
+  check (max_select is null or max_select >= min_select)
+);
+create index modifier_groups_item_idx on public.modifier_groups(menu_item_id, sort_order);
+
+create table public.modifier_options (
+  id           uuid primary key default gen_random_uuid(),
+  group_id     uuid not null references public.modifier_groups(id) on delete cascade,
+  name         text not null,
+  price_cents  int not null default 0 check (price_cents >= 0),
+  is_available boolean not null default true,
+  sort_order   int not null default 0
+);
+create index modifier_options_group_idx on public.modifier_options(group_id, sort_order);
+
+-- ── Deals & combos (P7) ─────────────────────────────────────────────────
+create table public.deals (
+  id                 uuid primary key default gen_random_uuid(),
+  name               text not null,
+  description        text,
+  image_url          text,
+  price_cents        int not null check (price_cents >= 0),
+  is_available       boolean not null default true,
+  track_availability boolean not null default false,
+  available_qty      int not null default 0,
+  starts_at          timestamptz,
+  ends_at            timestamptz,
+  sort_order         int not null default 0,
+  created_at         timestamptz not null default now()
+);
+
+create table public.deal_components (
+  id           uuid primary key default gen_random_uuid(),
+  deal_id      uuid not null references public.deals(id) on delete cascade,
+  menu_item_id uuid references public.menu_items(id) on delete restrict,
+  variant_id   uuid references public.menu_variants(id) on delete set null,
+  qty          int not null default 1 check (qty > 0),
+  sort_order   int not null default 0
+);
+create index deal_components_deal_idx on public.deal_components(deal_id, sort_order);
+
+-- Build-Your-Own-Combo (spec §8-10): a group of selectable options on top of
+-- the deal's fixed components/price ("Choose 1 Main", "Choose 1 Drink").
+-- Selecting a premium item can upcharge the deal price; the base fixed
+-- price already covers a normal/default selection, matching how a
+-- modifier group works for a plain item — this reuses that exact mental
+-- model rather than inventing a second one.
+create table public.deal_option_groups (
+  id         uuid primary key default gen_random_uuid(),
+  deal_id    uuid not null references public.deals(id) on delete cascade,
+  name       text not null,
+  min_select int not null default 1 check (min_select >= 0),
+  max_select int check (max_select is null or max_select >= min_select),
+  sort_order int not null default 0
+);
+create index deal_option_groups_deal_idx on public.deal_option_groups(deal_id, sort_order);
+
+create table public.deal_option_items (
+  id                     uuid primary key default gen_random_uuid(),
+  group_id               uuid not null references public.deal_option_groups(id) on delete cascade,
+  menu_item_id           uuid references public.menu_items(id) on delete cascade,
+  variant_id             uuid references public.menu_variants(id) on delete cascade,
+  qty                    int not null default 1 check (qty > 0),
+  -- Upcharges only (never negative) — order_lines.unit_price_cents/
+  -- line_total_cents are check(>= 0) everywhere else in this schema, and
+  -- the spec's own worked examples are all "+PKR 150" premium upcharges;
+  -- a per-option discount is a deferred nuance, not this pass's scope.
+  price_adjustment_cents int not null default 0 check (price_adjustment_cents >= 0),
+  is_default             boolean not null default false,
+  sort_order             int not null default 0
+);
+create index deal_option_items_group_idx on public.deal_option_items(group_id, sort_order);
+
+alter table public.deal_option_groups enable row level security;
+alter table public.deal_option_items enable row level security;
+create policy staff_read on public.deal_option_groups for select using (app.has_perm('deals.view') or app.is_staff());
+create policy mgr_write  on public.deal_option_groups for all using (app.has_perm('deals.update') or app.can_write()) with check (app.has_perm('deals.update') or app.can_write());
+create policy guest_read on public.deal_option_groups for select using (true);
+create policy staff_read on public.deal_option_items for select using (app.has_perm('deals.view') or app.is_staff());
+create policy mgr_write  on public.deal_option_items for all using (app.has_perm('deals.update') or app.can_write()) with check (app.has_perm('deals.update') or app.can_write());
+create policy guest_read on public.deal_option_items for select using (true);
+
+alter table public.deals enable row level security;
+alter table public.deal_components enable row level security;
+create policy staff_read on public.deals for select using (app.has_perm('deals.view') or app.is_staff());
+create policy mgr_write  on public.deals for all using (app.has_perm('deals.update') or app.can_write()) with check (app.has_perm('deals.update') or app.can_write());
+create policy guest_read on public.deals for select using (
+  is_available and (starts_at is null or starts_at <= now()) and (ends_at is null or ends_at >= now())
+);
+create policy staff_read on public.deal_components for select using (app.has_perm('deals.view') or app.is_staff());
+create policy mgr_write  on public.deal_components for all using (app.has_perm('deals.update') or app.can_write()) with check (app.has_perm('deals.update') or app.can_write());
+create policy guest_read on public.deal_components for select using (true);
+alter publication supabase_realtime add table public.deals;
+
+-- stock_qty and every recipe/consumption quantity are always in this item's
+-- BASE unit (e.g. grams for a weight item, ml for volume, piece for count) —
+-- the smallest unit the kitchen actually measures in. Purchasing can happen
+-- in a bigger purchase_unit_label (e.g. "KG bag"); purchase_unit_to_base is
+-- how many base units one purchase unit converts to, so "10 KG for Rs.5,000"
+-- and "150g per burger" resolve on the same footing (spec §6-7) without a
+-- general-purpose unit-conversion table. cost_cents_per_base_unit is a
+-- weighted average across receipts (spec §8) — the one costing method used
+-- everywhere ingredient cost is read, including historical recipe-cost
+-- snapshots on order_lines.
+create table public.inventory_items (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  sku text unique,
+  unit text not null default 'unit',                       -- display label for the base unit (g, ml, piece, ...)
+  unit_kind text not null default 'count' check (unit_kind in ('weight', 'volume', 'count')),
+  purchase_unit_label text,                                 -- e.g. "KG bag", null = purchased in the base unit directly
+  purchase_unit_to_base numeric(14,4) not null default 1 check (purchase_unit_to_base > 0),
+  cost_cents_per_base_unit numeric(14,4) not null default 0 check (cost_cents_per_base_unit >= 0),
+  stock_qty numeric(14,3) not null default 0,
+  min_threshold numeric(14,3) not null default 0,
+  supplier_name text,
+  created_at timestamptz not null default now()
+);
+
+-- A recipe row applies to a specific variant when variant_id is set (spec
+-- §11 — Large can need more chicken than Regular); when null it's the
+-- item's base recipe, used for any variant that has no override of its own.
+-- place_order() picks the variant-specific set if one exists, else falls
+-- back to the base set — never both.
+create table public.recipe_components (
+  id uuid primary key default gen_random_uuid(),
+  menu_item_id uuid not null references public.menu_items(id) on delete cascade,
+  variant_id uuid references public.menu_variants(id) on delete cascade,
+  inventory_item_id uuid not null references public.inventory_items(id) on delete restrict,
+  qty_per_unit numeric(14,3) not null check (qty_per_unit > 0),
+  unique (menu_item_id, variant_id, inventory_item_id)
+);
+
+-- A modifier option can carry its own ingredient consumption on top of the
+-- item/variant's base recipe (spec §12 — Extra Cheese consumes one more
+-- cheese slice; Extra Patty consumes another 150g of chicken).
+create table public.modifier_recipe_components (
+  id                  uuid primary key default gen_random_uuid(),
+  modifier_option_id  uuid not null references public.modifier_options(id) on delete cascade,
+  inventory_item_id   uuid not null references public.inventory_items(id) on delete restrict,
+  qty_base            numeric(14,3) not null check (qty_base > 0),
+  unique (modifier_option_id, inventory_item_id)
+);
+
+-- ── Recipe Management ────────────────────────────────────────────────────
+-- Recipes are the authoritative, NAMED, VERSIONED definition of what a menu
+-- item (or a semi-finished/prep component) consumes. They sit ABOVE
+-- recipe_components, not beside it: recipe_components stays exactly what
+-- place_order() already reads (untouched — the order/consumption/COGS
+-- pipeline built earlier keeps working exactly as before), and activating
+-- a recipe version SYNCS its resolved ingredient list into
+-- recipe_components for the (menu_item_id, variant_id) it targets. That
+-- avoids a second, divergent consumption system while adding real naming,
+-- status and version history recipe_components alone can't express.
+--
+-- Ingredient quantities (recipe_ingredients.qty_base) are always in the
+-- target's own BASE unit — the exact same convention inventory_items and
+-- recipe_components already use (spec §6-7's "150g per burger" resolves
+-- against inventory_items.unit directly). There is deliberately no second
+-- unit-conversion system: a recipe line never offers a choice of unit to
+-- convert FROM, so an incompatible conversion (spec §9 — "150 ml against a
+-- kg-based item") has no way to be expressed in the first place, rather
+-- than being entered and then rejected.
+create type app.recipe_type as enum ('menu_item', 'variant', 'semi_finished', 'preparation');
+create type app.recipe_status as enum ('draft', 'active', 'archived');
+
+-- The recipe's stable identity: its name, what it's for, and — for a
+-- menu_item/variant recipe — which product it defines. current_version_id
+-- is maintained by activate_recipe_version(); status mirrors whichever
+-- version is current (draft until something is activated, archived once
+-- the whole recipe is retired).
+create table public.recipes (
+  id                  uuid primary key default gen_random_uuid(),
+  name                text not null,
+  description         text,
+  notes               text,
+  recipe_type         app.recipe_type not null default 'menu_item',
+  menu_item_id        uuid references public.menu_items(id) on delete cascade,
+  variant_id          uuid references public.menu_variants(id) on delete cascade,
+  status              app.recipe_status not null default 'draft',
+  current_version_id  uuid,
+  instructions        text,
+  created_by          uuid,
+  created_at          timestamptz not null default now(),
+  -- A menu_item/variant recipe must point at a product; a semi_finished/
+  -- preparation recipe (a batch other recipes consume FROM) must not.
+  check ((recipe_type in ('menu_item','variant')) = (menu_item_id is not null)),
+  check (recipe_type = 'variant' or variant_id is null)
+);
+create index recipes_menu_item_idx on public.recipes(menu_item_id, variant_id);
+-- At most one non-archived recipe per product — matches recipe_components'
+-- own (menu_item_id, variant_id) uniqueness, so there is never ambiguity
+-- about which recipe a product's consumption comes from.
+create unique index recipes_one_live_per_product_idx on public.recipes(menu_item_id, coalesce(variant_id, '00000000-0000-0000-0000-000000000000'))
+  where status <> 'archived' and recipe_type in ('menu_item', 'variant');
+
+-- One row per version ever created for a recipe (spec §16's historical
+-- ledger). Only one version per recipe is ever 'active'; activate_recipe_
+-- version() enforces that by archiving whichever one currently holds it.
+-- effective_from/effective_to record exactly when each version was live,
+-- for cost-history and "what recipe made this order" questions.
+create table public.recipe_versions (
+  id              uuid primary key default gen_random_uuid(),
+  recipe_id       uuid not null references public.recipes(id) on delete cascade,
+  version         int not null check (version > 0),
+  status          app.recipe_status not null default 'draft',
+  yield_qty       numeric(14,3) not null default 1 check (yield_qty > 0),
+  yield_unit      text,  -- display label; null = "1 serving" for a menu_item/variant recipe
+  effective_from  timestamptz,
+  effective_to    timestamptz,
+  created_by      uuid,
+  created_at      timestamptz not null default now(),
+  unique (recipe_id, version)
+);
+create index recipe_versions_recipe_idx on public.recipe_versions(recipe_id, version desc);
+alter table public.recipes add constraint recipes_current_version_fk
+  foreign key (current_version_id) references public.recipe_versions(id) on delete set null;
+
+-- One ingredient line in a recipe version — either a raw inventory item or
+-- a sub-recipe (a semi_finished/preparation recipe this line draws its
+-- yield from), never both (spec §12-13).
+create table public.recipe_ingredients (
+  id                  uuid primary key default gen_random_uuid(),
+  recipe_version_id   uuid not null references public.recipe_versions(id) on delete cascade,
+  inventory_item_id   uuid references public.inventory_items(id) on delete restrict,
+  sub_recipe_id       uuid references public.recipes(id) on delete restrict,
+  qty_base            numeric(14,3) not null check (qty_base > 0),
+  sort_order          int not null default 0,
+  check ((inventory_item_id is null) <> (sub_recipe_id is null))
+);
+create index recipe_ingredients_version_idx on public.recipe_ingredients(recipe_version_id, sort_order);
+-- No duplicate ingredient rows within one version (spec §28).
+create unique index recipe_ingredients_unique_item_idx on public.recipe_ingredients(recipe_version_id, inventory_item_id) where inventory_item_id is not null;
+create unique index recipe_ingredients_unique_sub_idx on public.recipe_ingredients(recipe_version_id, sub_recipe_id) where sub_recipe_id is not null;
+
+-- Append-only recipe cost history (spec §24, §26): one row whenever a
+-- version's computed cost differs from the last logged value for it —
+-- written at activation and by the periodic snapshot sweep (server-side,
+-- mirrors the low-stock sweep), so an ingredient price change ALONE, with
+-- no recipe edit at all, still shows up as a tracked cost change.
+create table public.recipe_cost_log (
+  id                  uuid primary key default gen_random_uuid(),
+  recipe_version_id   uuid not null references public.recipe_versions(id) on delete cascade,
+  cost_cents          int not null,
+  recorded_at         timestamptz not null default now()
+);
+create index recipe_cost_log_version_idx on public.recipe_cost_log(recipe_version_id, recorded_at desc);
+
+-- Explodes a recipe version down to raw inventory quantities, resolving
+-- any sub-recipe ingredient through ITS active version and yield (spec
+-- §12-13 semi-finished/preparation support) — this is what
+-- activate_recipe_version() writes into recipe_components. p_visited
+-- guards against a circular chain looping forever; activate_recipe_
+-- version() already refuses to activate anything that would create one,
+-- so this is defense in depth, not the primary guard.
+create or replace function public.resolve_recipe_ingredients(p_recipe_version_id uuid, p_multiplier numeric default 1, p_visited uuid[] default '{}')
+returns table (inventory_item_id uuid, qty_base numeric)
+language plpgsql stable security definer set search_path = public, app as $fn$
+declare
+  v_line record;
+  v_sub_active uuid;
+  v_sub_yield numeric;
+begin
+  if p_recipe_version_id = any(p_visited) then
+    return;
+  end if;
+  for v_line in
+    select ri.qty_base as q, ri.inventory_item_id as ii, ri.sub_recipe_id as sr
+      from public.recipe_ingredients ri
+     where ri.recipe_version_id = p_recipe_version_id
+  loop
+    if v_line.ii is not null then
+      inventory_item_id := v_line.ii;
+      qty_base := v_line.q * p_multiplier;
+      return next;
+    else
+      select r.current_version_id into v_sub_active from public.recipes r where r.id = v_line.sr;
+      if v_sub_active is not null then
+        select rv.yield_qty into v_sub_yield from public.recipe_versions rv where rv.id = v_sub_active;
+        return query select * from public.resolve_recipe_ingredients(
+          v_sub_active,
+          p_multiplier * v_line.q / greatest(coalesce(v_sub_yield, 1), 0.0001),
+          p_visited || p_recipe_version_id
+        );
+      end if;
+    end if;
+  end loop;
+end;
+$fn$;
+
+-- Total cost to produce one full batch (yield_qty units) of a recipe
+-- version — divide by yield_qty for cost-per-yield-unit (cost per serving
+-- for a menu_item/variant recipe, since those always yield 1).
+create or replace function public.recipe_version_total_cost(p_recipe_version_id uuid)
+returns int language sql stable security definer set search_path = public, app as $fn$
+  select coalesce(sum(round(x.qty_base * coalesce(i.cost_cents_per_base_unit, 0))), 0)::int
+    from public.resolve_recipe_ingredients(p_recipe_version_id) x
+    join public.inventory_items i on i.id = x.inventory_item_id;
+$fn$;
+grant execute on function public.recipe_version_total_cost(uuid) to authenticated, service_role;
+
+create or replace function public.recipe_version_cost_per_yield_unit(p_recipe_version_id uuid)
+returns int language sql stable security definer set search_path = public, app as $fn$
+  select round(public.recipe_version_total_cost(p_recipe_version_id) / greatest(rv.yield_qty, 0.0001))::int
+    from public.recipe_versions rv where rv.id = p_recipe_version_id;
+$fn$;
+grant execute on function public.recipe_version_cost_per_yield_unit(uuid) to authenticated, service_role;
+
+-- Create a new recipe as a draft, with its first version and ingredient
+-- list, in one transaction (spec §52 "select item -> add ingredients ->
+-- system calculates cost -> review -> save").
+create or replace function public.create_recipe(
+  p_name text, p_description text, p_notes text, p_recipe_type app.recipe_type,
+  p_menu_item_id uuid, p_variant_id uuid, p_instructions text,
+  p_yield_qty numeric, p_yield_unit text, p_ingredients jsonb
+) returns table (recipe_id uuid, recipe_version_id uuid, cost_cents int)
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_recipe_id uuid; v_version_id uuid; v_ing jsonb; v_cost int;
+begin
+  -- Recipes & Food Cost is an opt-in domain for Manager (Owner's Portal
+  -- & Access Control grants it per-manager) — no can_write() fallback.
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_name), '') = '' then
+    raise exception 'recipe_name_required' using errcode = 'check_violation';
+  end if;
+  if p_ingredients is null or jsonb_typeof(p_ingredients) <> 'array' or jsonb_array_length(p_ingredients) = 0 then
+    raise exception 'recipe_needs_ingredients' using errcode = 'check_violation';
+  end if;
+  if p_recipe_type in ('menu_item', 'variant') and p_menu_item_id is null then
+    raise exception 'recipe_needs_menu_item' using errcode = 'check_violation';
+  end if;
+
+  insert into public.recipes (name, description, notes, recipe_type, menu_item_id, variant_id, instructions, status, created_by)
+  values (trim(p_name), nullif(trim(coalesce(p_description, '')), ''), nullif(trim(coalesce(p_notes, '')), ''),
+          p_recipe_type, p_menu_item_id, p_variant_id, nullif(trim(coalesce(p_instructions, '')), ''), 'draft', app.jwt_sub())
+  returning id into v_recipe_id;
+
+  insert into public.recipe_versions (recipe_id, version, status, yield_qty, yield_unit, created_by)
+  values (v_recipe_id, 1, 'draft', greatest(coalesce(p_yield_qty, 1), 0.0001), nullif(trim(coalesce(p_yield_unit, '')), ''), app.jwt_sub())
+  returning id into v_version_id;
+
+  for v_ing in select * from jsonb_array_elements(p_ingredients) loop
+    insert into public.recipe_ingredients (recipe_version_id, inventory_item_id, sub_recipe_id, qty_base, sort_order)
+    values (
+      v_version_id,
+      nullif(v_ing->>'inventory_item_id', '')::uuid,
+      nullif(v_ing->>'sub_recipe_id', '')::uuid,
+      (v_ing->>'qty_base')::numeric,
+      coalesce((v_ing->>'sort_order')::int, 0)
+    );
+  end loop;
+
+  v_cost := public.recipe_version_total_cost(v_version_id);
+  perform app.log_action('recipe.created', 'recipes', v_recipe_id::text, null,
+    jsonb_build_object('name', p_name, 'version_id', v_version_id, 'cost_cents', v_cost));
+
+  return query select v_recipe_id, v_version_id, v_cost;
+end;
+$fn$;
+revoke all on function public.create_recipe(text, text, text, app.recipe_type, uuid, uuid, text, numeric, text, jsonb) from public;
+grant execute on function public.create_recipe(text, text, text, app.recipe_type, uuid, uuid, text, numeric, text, jsonb) to authenticated, service_role;
+
+-- Create a new DRAFT version of an existing recipe, carrying forward the
+-- previous version's yield unless overridden (spec §16 — editing a recipe
+-- never overwrites history, it creates the next version).
+create or replace function public.create_recipe_version(
+  p_recipe_id uuid, p_ingredients jsonb, p_yield_qty numeric default null, p_yield_unit text default null
+) returns table (recipe_version_id uuid, cost_cents int)
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_next_version int; v_version_id uuid; v_ing jsonb; v_cost int;
+  v_prev_yield_qty numeric; v_prev_yield_unit text;
+begin
+  -- Recipes & Food Cost is an opt-in domain for Manager (Owner's Portal
+  -- & Access Control grants it per-manager) — no can_write() fallback.
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if not exists (select 1 from public.recipes where id = p_recipe_id) then
+    raise exception 'recipe_not_found' using errcode = 'no_data_found';
+  end if;
+  if p_ingredients is null or jsonb_typeof(p_ingredients) <> 'array' or jsonb_array_length(p_ingredients) = 0 then
+    raise exception 'recipe_needs_ingredients' using errcode = 'check_violation';
+  end if;
+
+  select coalesce(max(version), 0) + 1 into v_next_version from public.recipe_versions where recipe_id = p_recipe_id;
+  select yield_qty, yield_unit into v_prev_yield_qty, v_prev_yield_unit
+    from public.recipe_versions where recipe_id = p_recipe_id order by version desc limit 1;
+
+  insert into public.recipe_versions (recipe_id, version, status, yield_qty, yield_unit, created_by)
+  values (p_recipe_id, v_next_version, 'draft',
+          greatest(coalesce(p_yield_qty, v_prev_yield_qty, 1), 0.0001),
+          coalesce(nullif(trim(coalesce(p_yield_unit, '')), ''), v_prev_yield_unit), app.jwt_sub())
+  returning id into v_version_id;
+
+  for v_ing in select * from jsonb_array_elements(p_ingredients) loop
+    insert into public.recipe_ingredients (recipe_version_id, inventory_item_id, sub_recipe_id, qty_base, sort_order)
+    values (
+      v_version_id,
+      nullif(v_ing->>'inventory_item_id', '')::uuid,
+      nullif(v_ing->>'sub_recipe_id', '')::uuid,
+      (v_ing->>'qty_base')::numeric,
+      coalesce((v_ing->>'sort_order')::int, 0)
+    );
+  end loop;
+
+  v_cost := public.recipe_version_total_cost(v_version_id);
+  perform app.log_action('recipe.version_created', 'recipes', p_recipe_id::text, null,
+    jsonb_build_object('version', v_next_version, 'version_id', v_version_id, 'cost_cents', v_cost));
+
+  return query select v_version_id, v_cost;
+end;
+$fn$;
+revoke all on function public.create_recipe_version(uuid, jsonb, numeric, text) from public;
+grant execute on function public.create_recipe_version(uuid, jsonb, numeric, text) to authenticated, service_role;
+
+-- Make a draft version the live one (spec §17-18). Validates ingredients
+-- exist and the recipe has a product to attach to, rejects a version whose
+-- sub-recipe chain would become circular (spec §29), archives whichever
+-- version currently holds 'active', and — for a menu_item/variant recipe —
+-- syncs the resolved (sub-recipes exploded to raw quantities) ingredient
+-- list into recipe_components, which is ALL place_order() ever reads. This
+-- is the one place a recipe change becomes live production consumption.
+create or replace function public.activate_recipe_version(p_recipe_version_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_recipe_id uuid; v_recipe public.recipes; v_prev_active uuid; v_cost int;
+begin
+  -- Recipes & Food Cost is an opt-in domain for Manager (Owner's Portal
+  -- & Access Control grants it per-manager) — no can_write() fallback.
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+
+  select recipe_id into v_recipe_id from public.recipe_versions where id = p_recipe_version_id;
+  if v_recipe_id is null then raise exception 'recipe_version_not_found' using errcode = 'no_data_found'; end if;
+  select * into v_recipe from public.recipes where id = v_recipe_id;
+
+  if not exists (select 1 from public.recipe_ingredients where recipe_version_id = p_recipe_version_id) then
+    raise exception 'recipe_needs_ingredients' using errcode = 'check_violation';
+  end if;
+  if v_recipe.recipe_type in ('menu_item', 'variant') and v_recipe.menu_item_id is null then
+    raise exception 'recipe_needs_menu_item' using errcode = 'check_violation';
+  end if;
+
+  -- Circular-dependency guard: walk the sub-recipe graph this version
+  -- would introduce (through OTHER recipes' currently-active versions —
+  -- a draft elsewhere doesn't count until it too is activated, at which
+  -- point this same check runs for it) and refuse if it ever leads back
+  -- to this recipe.
+  if exists (
+    with recursive dep(recipe_id) as (
+      select ri.sub_recipe_id from public.recipe_ingredients ri
+       where ri.recipe_version_id = p_recipe_version_id and ri.sub_recipe_id is not null
+      union
+      select ri2.sub_recipe_id
+        from dep
+        join public.recipes r2 on r2.id = dep.recipe_id
+        join public.recipe_ingredients ri2
+          on ri2.recipe_version_id = coalesce(r2.current_version_id, '00000000-0000-0000-0000-000000000000'::uuid)
+         and ri2.sub_recipe_id is not null
+    )
+    select 1 from dep where recipe_id = v_recipe_id
+  ) then
+    raise exception 'circular_recipe_dependency' using errcode = 'check_violation';
+  end if;
+
+  select id into v_prev_active from public.recipe_versions where recipe_id = v_recipe_id and status = 'active';
+  if v_prev_active is not null then
+    update public.recipe_versions set status = 'archived', effective_to = now() where id = v_prev_active;
+  end if;
+  update public.recipe_versions set status = 'active', effective_from = now(), effective_to = null where id = p_recipe_version_id;
+  update public.recipes set status = 'active', current_version_id = p_recipe_version_id where id = v_recipe_id;
+
+  if v_recipe.recipe_type in ('menu_item', 'variant') then
+    delete from public.recipe_components
+     where menu_item_id = v_recipe.menu_item_id and variant_id is not distinct from v_recipe.variant_id;
+    insert into public.recipe_components (menu_item_id, variant_id, inventory_item_id, qty_per_unit)
+    select v_recipe.menu_item_id, v_recipe.variant_id, x.inventory_item_id, sum(x.qty_base)
+      from public.resolve_recipe_ingredients(p_recipe_version_id) x
+     group by x.inventory_item_id;
+  end if;
+
+  v_cost := public.recipe_version_total_cost(p_recipe_version_id);
+  insert into public.recipe_cost_log (recipe_version_id, cost_cents) values (p_recipe_version_id, v_cost);
+
+  perform app.log_action('recipe.activated', 'recipes', v_recipe_id::text,
+    jsonb_build_object('previous_version_id', v_prev_active),
+    jsonb_build_object('active_version_id', p_recipe_version_id, 'cost_cents', v_cost));
+end;
+$fn$;
+revoke all on function public.activate_recipe_version(uuid) from public;
+grant execute on function public.activate_recipe_version(uuid) to authenticated, service_role;
+
+-- Retire a recipe entirely (spec §17): removes it from what place_order()
+-- can consume (deletes its recipe_components rows for menu_item/variant
+-- recipes) but never touches order_lines.recipe_cost_cents snapshots or
+-- recipe_versions history — those stay exactly as they were.
+create or replace function public.archive_recipe(p_recipe_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_recipe public.recipes;
+begin
+  -- Recipes & Food Cost is an opt-in domain for Manager (Owner's Portal
+  -- & Access Control grants it per-manager) — no can_write() fallback.
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v_recipe from public.recipes where id = p_recipe_id;
+  if v_recipe.id is null then raise exception 'recipe_not_found' using errcode = 'no_data_found'; end if;
+
+  update public.recipes set status = 'archived' where id = p_recipe_id;
+  update public.recipe_versions set status = 'archived', effective_to = coalesce(effective_to, now())
+   where recipe_id = p_recipe_id and status = 'active';
+
+  if v_recipe.recipe_type in ('menu_item', 'variant') then
+    delete from public.recipe_components
+     where menu_item_id = v_recipe.menu_item_id and variant_id is not distinct from v_recipe.variant_id;
+  end if;
+
+  perform app.log_action('recipe.archived', 'recipes', p_recipe_id::text, null, null);
+end;
+$fn$;
+revoke all on function public.archive_recipe(uuid) from public;
+grant execute on function public.archive_recipe(uuid) to authenticated, service_role;
+
+-- 0067: permanently delete a recipe (refused while used as a sub-recipe).
+create or replace function public.delete_recipe(p_recipe_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_recipe public.recipes; v_users text;
+begin
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v_recipe from public.recipes where id = p_recipe_id;
+  if v_recipe.id is null then raise exception 'recipe_not_found' using errcode = 'no_data_found'; end if;
+
+  select string_agg(distinct r.name, ', ' order by r.name) into v_users
+    from public.recipe_ingredients ri
+    join public.recipe_versions rv on rv.id = ri.recipe_version_id
+    join public.recipes r on r.id = rv.recipe_id
+   where ri.sub_recipe_id = p_recipe_id and r.id <> p_recipe_id;
+  if v_users is not null then
+    raise exception 'This recipe is used as a sub-recipe in: %. Remove it from those recipes first.', v_users
+      using errcode = 'foreign_key_violation';
+  end if;
+
+  -- An active menu recipe is what the dish consumes from stock; removing
+  -- those rows also recalculates food availability (recipe_components trigger).
+  if v_recipe.status = 'active' and v_recipe.recipe_type in ('menu_item', 'variant') then
+    delete from public.recipe_components
+     where menu_item_id = v_recipe.menu_item_id and variant_id is not distinct from v_recipe.variant_id;
+  end if;
+
+  perform app.log_action('recipe.deleted', 'recipes', p_recipe_id::text,
+                         jsonb_build_object('name', v_recipe.name, 'status', v_recipe.status, 'recipe_type', v_recipe.recipe_type),
+                         null);
+  delete from public.recipes where id = p_recipe_id;
+end;
+$fn$;
+revoke all on function public.delete_recipe(uuid) from public;
+grant execute on function public.delete_recipe(uuid) to authenticated, service_role;
+
+-- Periodic sweep (spec §24, §35 — cost-change detection independent of any
+-- recipe edit, e.g. a supplier price change alone): logs a new
+-- recipe_cost_log row for every active recipe version whose computed cost
+-- has moved since it was last logged. Called by the server's scheduled
+-- sweep (mirrors the low-stock sweep) — service_role only, not a
+-- staff-facing RPC.
+create or replace function public.snapshot_recipe_cost_changes()
+returns table (recipe_id uuid, recipe_version_id uuid, previous_cost_cents int, new_cost_cents int)
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_rv record; v_new_cost int; v_last_cost int;
+begin
+  -- source_recipe_id (not recipe_id) — the OUT param recipe_id shares this
+  -- function's scope, and a bare/ambiguously-named column reference here
+  -- resolves against the OUT param instead of the query, same footgun
+  -- fixed elsewhere in this file: always alias distinctly, never bare.
+  for v_rv in select rv.id as version_id, rv.recipe_id as source_recipe_id from public.recipe_versions rv where rv.status = 'active' loop
+    v_new_cost := public.recipe_version_total_cost(v_rv.version_id);
+    select rcl.cost_cents into v_last_cost from public.recipe_cost_log rcl
+     where rcl.recipe_version_id = v_rv.version_id order by rcl.recorded_at desc limit 1;
+    if v_last_cost is null or v_last_cost <> v_new_cost then
+      insert into public.recipe_cost_log (recipe_version_id, cost_cents) values (v_rv.version_id, v_new_cost);
+      recipe_id := v_rv.source_recipe_id;
+      recipe_version_id := v_rv.version_id;
+      previous_cost_cents := v_last_cost;
+      new_cost_cents := v_new_cost;
+      return next;
+    end if;
+  end loop;
+end;
+$fn$;
+revoke all on function public.snapshot_recipe_cost_changes() from public;
+grant execute on function public.snapshot_recipe_cost_changes() to service_role;
+
+-- The most recent meaningful cost move (>= p_min_pct, or any move off a
+-- previously-zero cost) for every active recipe, comparing its two most
+-- recent recipe_cost_log entries — powers AI Management's "recipe cost
+-- alert" (spec §35) and the AI assistant's "why did my recipe cost
+-- change" questions, both reading the SAME evidence, never a separate
+-- calculation.
+create or replace function public.recipe_recent_cost_changes(p_min_pct numeric default 5)
+returns table (
+  recipe_id uuid, name text, recipe_version_id uuid,
+  previous_cost_cents int, new_cost_cents int, change_cents int, change_pct numeric
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not app.has_perm('inventory.view_cost') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    with ranked as (
+      select rcl.recipe_version_id as rv_id, rcl.cost_cents as c,
+             row_number() over (partition by rcl.recipe_version_id order by rcl.recorded_at desc) as rn
+        from public.recipe_cost_log rcl
+        join public.recipe_versions rv on rv.id = rcl.recipe_version_id and rv.status = 'active'
+    ),
+    paired as (
+      select a.rv_id as rvid, b.c as prev_cost, a.c as curr_cost
+        from ranked a
+        join ranked b on b.rv_id = a.rv_id and b.rn = 2
+       where a.rn = 1
+    )
+    select r.id, r.name, p.rvid, p.prev_cost, p.curr_cost, p.curr_cost - p.prev_cost,
+           case when p.prev_cost > 0
+                then round((p.curr_cost - p.prev_cost)::numeric / p.prev_cost * 1000) / 10
+                else null end
+      from paired p
+      join public.recipe_versions rv on rv.id = p.rvid
+      join public.recipes r on r.id = rv.recipe_id
+     where p.prev_cost is distinct from p.curr_cost
+       and (
+         p.prev_cost = 0
+         or abs(p.curr_cost - p.prev_cost)::numeric / greatest(p.prev_cost, 1) * 100 >= p_min_pct
+       )
+     order by abs(p.curr_cost - p.prev_cost) desc;
+end;
+$fn$;
+revoke all on function public.recipe_recent_cost_changes(numeric) from public;
+grant execute on function public.recipe_recent_cost_changes(numeric) to authenticated, service_role;
+
+alter table public.recipes enable row level security;
+create policy staff_read on public.recipes for select using (app.has_perm('menu.view') or app.is_staff());
+create policy mgr_write on public.recipes for all
+  using (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes'))
+  with check (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes'));
+
+alter table public.recipe_versions enable row level security;
+create policy staff_read on public.recipe_versions for select using (app.has_perm('menu.view') or app.is_staff());
+create policy mgr_write on public.recipe_versions for all
+  using (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes'))
+  with check (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes'));
+
+alter table public.recipe_ingredients enable row level security;
+create policy staff_read on public.recipe_ingredients for select using (app.has_perm('menu.view') or app.is_staff());
+create policy mgr_write on public.recipe_ingredients for all
+  using (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes'))
+  with check (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes'));
+
+-- Cost figures only, unlike the tables above — gated on inventory.view_cost
+-- (not menu.view) so kitchen-only roles see recipes/instructions but not
+-- the cost trend, matching how InventoryManager already hides dollar
+-- columns from roles without inventory.view_cost.
+alter table public.recipe_cost_log enable row level security;
+-- Cost history is dollar data — same narrow finance-style exception,
+-- no can_write() fallback, so it respects a manager's actual
+-- inventory.view_cost grant rather than their role name.
+create policy staff_read on public.recipe_cost_log for select using (app.has_perm('inventory.view_cost'));
+
+-- ── Orders ─────────────────────────────────────────────────────────────────
+create table public.order_counter (
+  id boolean primary key default true check (id),   -- single row
+  next_number bigint not null default 1
+);
+insert into public.order_counter default values;
+
+-- A table's live tab: every order placed for that table while a session is open
+-- is grouped under it, so staff see one combined bill.
+create table public.table_sessions (
+  id          uuid primary key default gen_random_uuid(),
+  table_label text not null,
+  status      text not null default 'open' check (status in ('open', 'closed')),
+  opened_at   timestamptz not null default now(),
+  closed_at   timestamptz
+);
+create index table_sessions_open_idx on public.table_sessions(table_label) where status = 'open';
+
+create table public.orders (
+  id uuid primary key default gen_random_uuid(),
+  order_number bigint not null unique,
+  session_id uuid references public.table_sessions(id) on delete set null,
+  channel app.order_channel not null default 'dine_in',
+  table_label text,
+  customer_name text,
+  customer_note text,                               -- guest instructions, untrusted text
+  status app.order_status not null default 'pending',
+  subtotal_cents integer not null default 0 check (subtotal_cents >= 0),
+  tax_cents integer not null default 0 check (tax_cents >= 0),
+  tax_rate_bps integer not null default 0,          -- effective rate, for later recalculation
+  total_cents integer not null default 0 check (total_cents >= 0),
+  refunded_cents integer not null default 0 check (refunded_cents >= 0),
+  payment_method text,
+  paid_at timestamptz,
+  pickup_counter_portal_id uuid,                    -- which checkout counter Kitchen assigned this order to
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index orders_created_idx on public.orders(created_at desc);
+create index orders_status_idx on public.orders(status);
+
+create table public.order_lines (
+  id uuid primary key default gen_random_uuid(),
+  order_id uuid not null references public.orders(id) on delete cascade,
+  menu_item_id uuid references public.menu_items(id) on delete set null,
+  variant_id uuid references public.menu_variants(id) on delete set null,
+  name_snapshot text not null,
+  variant_name_snapshot text,
+  unit_price_cents integer not null check (unit_price_cents >= 0),
+  qty integer not null check (qty > 0),
+  line_total_cents integer not null check (line_total_cents >= 0),
+  modifiers jsonb not null default '[]'::jsonb,
+  customer_note text,                               -- per-item guest instruction, untrusted
+  deal_id uuid references public.deals(id) on delete set null,   -- set on a deal's header + component lines
+  kds_status app.line_status not null default 'queued',
+  -- Ingredient cost consumed for this line, computed from each inventory
+  -- item's cost_cents_per_base_unit AT THE MOMENT the order was placed and
+  -- never recalculated — historical food-cost integrity (spec §10, §51):
+  -- if ingredient costs or the recipe change later, old orders keep the
+  -- cost that actually applied. Null when the line has no recipe (e.g. a
+  -- deal header row, or an item with no ingredients configured).
+  recipe_cost_cents int,
+  created_at timestamptz not null default now()
+);
+create index order_lines_order_idx on public.order_lines(order_id);
+create index order_lines_kds_idx on public.order_lines(kds_status);
+
+-- Keeps order_lines.kds_status in sync with orders.status on EVERY write
+-- path (the kitchen_* RPCs below update both explicitly already; this
+-- trigger is what also covers a direct orders.status write, e.g. from the
+-- Orders page, which is independently permissioned from kitchen.update_status
+-- — see tenant-migrations/0051 for the full rationale).
+--
+-- Deliberately no 'in_kitchen' branch: place_order() itself finalizes
+-- EVERY new order at status='in_kitchen' as its own last step — 'pending'
+-- never exists outside that one transaction. A cascade on transitions TO
+-- 'in_kitchen' would fire on every order's creation, not a genuine
+-- "kitchen started this" action, wrongly advancing every line straight to
+-- preparing before anyone touched it. kitchen_start_order() already does
+-- its own queued->preparing cascade explicitly; this trigger only needs
+-- 'ready'/'served', the two transitions that genuinely happen once, after
+-- an order is already active.
+create function app.sync_order_lines_status()
+returns trigger
+language plpgsql
+security definer set search_path = public, app
+as $$
+begin
+  if new.status is distinct from old.status then
+    if new.status = 'ready' then
+      update public.order_lines set kds_status = 'ready'
+       where order_id = new.id and kds_status not in ('ready', 'served');
+    elsif new.status = 'served' then
+      update public.order_lines set kds_status = 'served'
+       where order_id = new.id and kds_status <> 'served';
+    end if;
+  end if;
+  return new;
+end;
+$$;
+create trigger sync_order_lines_status
+  after update of status on public.orders
+  for each row
+  execute function app.sync_order_lines_status();
+
+create table public.stock_ledger (
+  id uuid primary key default gen_random_uuid(),
+  inventory_item_id uuid not null references public.inventory_items(id) on delete restrict,
+  delta_qty numeric(14,3) not null,
+  reason app.stock_reason not null,
+  order_id uuid references public.orders(id) on delete set null,
+  note text,
+  -- Cost basis this movement was valued at, in cents per base unit: the
+  -- actual receipt price for a purchase, the weighted-average cost at that
+  -- moment for consumption/waste/adjustment. Nullable (older rows predate
+  -- this column). This is what lets Actual COGS/purchases/waste value be
+  -- read straight off the ledger instead of reconstructing historical stock
+  -- balances (spec §8, §30 — theoretical vs actual COGS).
+  unit_cost_cents_base numeric(14,4),
+  created_at timestamptz not null default now()
+);
+create index stock_ledger_item_idx on public.stock_ledger(inventory_item_id, created_at desc);
+
+create table public.outbox (
+  id bigint generated always as identity primary key,
+  topic text not null,
+  payload jsonb not null,
+  created_at timestamptz not null default now(),
+  processed_at timestamptz,
+  attempts int not null default 0,
+  last_error text
+);
+create index outbox_unprocessed_idx on public.outbox(created_at) where processed_at is null;
+
+create table public.restaurant_tables (
+  id         uuid primary key default gen_random_uuid(),
+  label      text not null unique,
+  seats      int not null default 2 check (seats > 0),
+  sort_order int not null default 0,
+  created_at timestamptz not null default now()
+);
+
+create table public.reservations (
+  id uuid primary key default gen_random_uuid(),
+  customer_name text not null,
+  phone text,
+  email text,
+  party_size int not null check (party_size > 0),
+  reserved_at timestamptz not null,
+  duration_min int not null default 90 check (duration_min > 0),
+  table_label text,
+  occasion text,
+  notes text,
+  status app.reservation_status not null default 'pending',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index reservations_time_idx on public.reservations(reserved_at);
+
+-- ── RLS: permission-gated, with a legacy fallback (P3) ────────────────────
+-- Every policy is  (app.has_perm(key))  OR  (the pre-P3 is_staff/can_write
+-- check). A JWT with no explicit app_metadata.permissions array behaves exactly
+-- as before; a JWT that carries one (portal users; back-filled staff) is gated
+-- strictly to its keys ('*' = all).
+do $$
+declare r record;
+begin
+  for r in select * from (values
+    ('memberships',       'staff.view',  'staff.update'),
+    ('menu_categories',   'menu.view',   'menu.update'),
+    ('menu_items',        'menu.view',   'menu.update'),
+    ('menu_variants',     'menu.view',   'menu.update'),
+    ('modifier_groups',   'menu.view',   'menu.update'),
+    ('modifier_options',  'menu.view',   'menu.update'),
+    ('inventory_items',   'stock.view',  'stock.update'),
+    ('recipe_components', 'menu.view',   'menu.update'),
+    ('modifier_recipe_components', 'menu.view', 'menu.update'),
+    ('reservations',      'tables.view', 'tables.update'),
+    ('restaurant_tables', 'tables.view', 'tables.update')
+  ) as t(tbl, rk, wk) loop
+    execute format('alter table public.%I enable row level security;', r.tbl);
+    execute format(
+      'create policy staff_read on public.%I for select using (app.has_perm(%L) or app.is_staff());',
+      r.tbl, r.rk);
+    execute format(
+      'create policy mgr_write on public.%I for all using (app.has_perm(%L) or app.can_write()) with check (app.has_perm(%L) or app.can_write());',
+      r.tbl, r.wk, r.wk);
+  end loop;
+end $$;
+
+-- Storefront menu: readable by anon so the guest QR page and the public
+-- /menu API work without any privileged key. Categories are harmless; items
+-- are limited to those on sale.
+create policy guest_read on public.menu_categories for select using (true);
+create policy guest_read on public.menu_items for select using (is_available);
+create policy guest_read on public.menu_variants for select using (is_available);
+create policy guest_read on public.modifier_groups for select using (true);
+create policy guest_read on public.modifier_options for select using (true);
+
+-- Menu image storage: public bucket (served to anonymous storefront guests,
+-- same trust level as the rest of the guest-readable menu), staff-only writes.
+insert into storage.buckets (id, name, public)
+values ('menu-images', 'menu-images', true)
+on conflict (id) do nothing;
+create policy "menu-images public read" on storage.objects for select
+  using (bucket_id = 'menu-images');
+create policy "menu-images staff write" on storage.objects for all
+  using (bucket_id = 'menu-images' and (app.has_perm('menu.update') or app.can_write()))
+  with check (bucket_id = 'menu-images' and (app.has_perm('menu.update') or app.can_write()));
+
+-- Receipt/branding logo storage (0045): public read (shown on a printed/PDF
+-- receipt handed to a guest), write gated to settings.update — no
+-- can_write() fallback, matching business_settings' own write policy below
+-- (Policies is an ownerOnly page in the web app besides).
+insert into storage.buckets (id, name, public)
+values ('branding', 'branding', true)
+on conflict (id) do nothing;
+create policy "branding public read" on storage.objects for select
+  using (bucket_id = 'branding');
+create policy "branding settings write" on storage.objects for all
+  using (bucket_id = 'branding' and app.has_perm('settings.update'))
+  with check (bucket_id = 'branding' and app.has_perm('settings.update'));
+
+-- ── AI Menu Import ───────────────────────────────────────────────────────
+-- A document-derived menu draft: file (PDF text today) -> LLM structuring
+-- -> validation -> diff against the LIVE menu -> owner review -> selective
+-- apply. Applying writes to the SAME menu_categories/menu_items/
+-- menu_variants/modifier_groups/modifier_options tables the manual Menu
+-- page uses — there is no AI-only menu store. extracted_json/diff_json are
+-- kept after the draft is applied or rejected, for review and audit.
+create type app.menu_import_status as enum ('draft', 'ready_for_review', 'applied', 'rejected', 'failed');
+
+create table public.menu_import_drafts (
+  id              uuid primary key default gen_random_uuid(),
+  source_filename text not null,
+  storage_path    text not null,
+  extracted_json  jsonb not null,
+  diff_json       jsonb not null,
+  status          app.menu_import_status not null default 'ready_for_review',
+  error           text,
+  created_by      uuid,
+  created_at      timestamptz not null default now(),
+  applied_at      timestamptz,
+  applied_by      uuid
+);
+alter table public.menu_import_drafts enable row level security;
+create policy staff_read on public.menu_import_drafts for select using (app.has_perm('menu.view') or app.is_staff());
+create policy mgr_write on public.menu_import_drafts for all
+  using (app.has_perm('menu.create') or app.has_perm('menu.update') or app.can_write())
+  with check (app.has_perm('menu.create') or app.has_perm('menu.update') or app.can_write());
+
+-- Private, staff-only storage for uploaded source documents (unlike
+-- menu-images, these are internal source material, never customer-facing).
+insert into storage.buckets (id, name, public)
+values ('menu-imports', 'menu-imports', false)
+on conflict (id) do nothing;
+create policy "menu-imports staff read" on storage.objects for select
+  using (bucket_id = 'menu-imports' and (app.has_perm('menu.view') or app.is_staff()));
+create policy "menu-imports staff write" on storage.objects for all
+  using (bucket_id = 'menu-imports' and (app.has_perm('menu.create') or app.has_perm('menu.update') or app.can_write()))
+  with check (bucket_id = 'menu-imports' and (app.has_perm('menu.create') or app.has_perm('menu.update') or app.can_write()));
+
+-- ── AI Inventory Import ───────────────────────────────────────────────────
+-- The SAME document-to-draft pattern as AI Menu Import (spec: "AI should
+-- not be designed as menu-import AI. It should become a general
+-- restaurant-management action engine"), proven a second time: file (PDF
+-- or CSV text) -> LLM structuring (aiDocumentEngine.ts, shared with menu
+-- import) -> validation -> diff against LIVE inventory_items -> owner
+-- review -> selective apply. Applying writes to the SAME inventory_items
+-- table the manual Inventory page uses. Uses the generically-named
+-- 'ai-imports' bucket (not 'menu-imports') since this is the first of
+-- presumably several non-menu domains to land here.
+create type app.inventory_import_status as enum ('draft', 'ready_for_review', 'applied', 'rejected', 'failed');
+
+create table public.inventory_import_drafts (
+  id              uuid primary key default gen_random_uuid(),
+  source_filename text not null,
+  storage_path    text not null,
+  extracted_json  jsonb not null,
+  diff_json       jsonb not null,
+  status          app.inventory_import_status not null default 'ready_for_review',
+  error           text,
+  created_by      uuid,
+  created_at      timestamptz not null default now(),
+  applied_at      timestamptz,
+  applied_by      uuid
+);
+alter table public.inventory_import_drafts enable row level security;
+create policy staff_read on public.inventory_import_drafts for select using (app.has_perm('stock.view') or app.is_staff());
+create policy mgr_write on public.inventory_import_drafts for all
+  using (app.has_perm('stock.update') or app.can_write())
+  with check (app.has_perm('stock.update') or app.can_write());
+
+insert into storage.buckets (id, name, public)
+values ('ai-imports', 'ai-imports', false)
+on conflict (id) do nothing;
+-- Shared by every AI import domain (inventory, recipes, tables,
+-- suppliers, ...) — broadened as each one lands rather than kept
+-- inventory-only, since the whole point of this bucket's generic name is
+-- that one upload surface serves all of them.
+create policy "ai-imports staff read" on storage.objects for select
+  using (bucket_id = 'ai-imports' and (
+    app.has_perm('stock.view') or app.has_perm('menu.view') or
+    app.has_perm('supplier.view') or app.has_perm('tables.view') or
+    app.has_perm('purchases.view') or app.has_perm('staff.view') or
+    app.is_staff()
+  ));
+create policy "ai-imports staff write" on storage.objects for all
+  using (bucket_id = 'ai-imports' and (
+    app.has_perm('stock.update') or app.has_perm('inventory.manage_recipes') or
+    app.has_perm('finance.manage_recipes') or app.has_perm('tables.update') or
+    app.has_perm('supplier.manage') or app.has_perm('purchases.update') or
+    app.has_perm('staff.create') or app.can_write()
+  ))
+  with check (bucket_id = 'ai-imports' and (
+    app.has_perm('stock.update') or app.has_perm('inventory.manage_recipes') or
+    app.has_perm('finance.manage_recipes') or app.has_perm('tables.update') or
+    app.has_perm('supplier.manage') or app.has_perm('purchases.update') or
+    app.has_perm('staff.create') or app.can_write()
+  ));
+
+-- ── AI Recipe Import ──────────────────────────────────────────────────────
+-- Third domain on the shared engine (menu, then inventory, now recipes).
+-- Creates recipes ONLY through create_recipe() — never a raw table insert
+-- — so it always lands as a draft, subject to the same validation and
+-- permission checks as the manual Recipes page and the AI chat's
+-- draft_recipe action. Never edits an existing recipe.
+create type app.recipe_import_status as enum ('draft', 'ready_for_review', 'applied', 'rejected', 'failed');
+create table public.recipe_import_drafts (
+  id              uuid primary key default gen_random_uuid(),
+  source_filename text not null,
+  storage_path    text not null,
+  extracted_json  jsonb not null,
+  diff_json       jsonb not null,
+  status          app.recipe_import_status not null default 'ready_for_review',
+  error           text,
+  created_by      uuid,
+  created_at      timestamptz not null default now(),
+  applied_at      timestamptz,
+  applied_by      uuid
+);
+alter table public.recipe_import_drafts enable row level security;
+create policy staff_read on public.recipe_import_drafts for select
+  using (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes'));
+create policy mgr_write on public.recipe_import_drafts for all
+  using (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes'))
+  with check (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes'));
+
+-- ── AI Table Import ───────────────────────────────────────────────────────
+-- Create-only — a table label that already exists is left alone rather
+-- than having its seat count silently overwritten from a document.
+create type app.table_import_status as enum ('draft', 'ready_for_review', 'applied', 'rejected', 'failed');
+create table public.table_import_drafts (
+  id              uuid primary key default gen_random_uuid(),
+  source_filename text not null,
+  storage_path    text not null,
+  extracted_json  jsonb not null,
+  diff_json       jsonb not null,
+  status          app.table_import_status not null default 'ready_for_review',
+  error           text,
+  created_by      uuid,
+  created_at      timestamptz not null default now(),
+  applied_at      timestamptz,
+  applied_by      uuid
+);
+alter table public.table_import_drafts enable row level security;
+create policy staff_read on public.table_import_drafts for select using (app.has_perm('tables.view') or app.is_staff());
+create policy mgr_write on public.table_import_drafts for all
+  using (app.has_perm('tables.update') or app.can_write())
+  with check (app.has_perm('tables.update') or app.can_write());
+
+-- ── AI Supplier Import ────────────────────────────────────────────────────
+-- Create-only — contact/payment details on an existing supplier (matched
+-- by name) are never silently overwritten from a document; that's exactly
+-- the kind of field a wrong overwrite could misdirect a real order or
+-- payment to.
+create type app.supplier_import_status as enum ('draft', 'ready_for_review', 'applied', 'rejected', 'failed');
+create table public.supplier_import_drafts (
+  id              uuid primary key default gen_random_uuid(),
+  source_filename text not null,
+  storage_path    text not null,
+  extracted_json  jsonb not null,
+  diff_json       jsonb not null,
+  status          app.supplier_import_status not null default 'ready_for_review',
+  error           text,
+  created_by      uuid,
+  created_at      timestamptz not null default now(),
+  applied_at      timestamptz,
+  applied_by      uuid
+);
+alter table public.supplier_import_drafts enable row level security;
+create policy staff_read on public.supplier_import_drafts for select using (app.has_perm('supplier.view') or app.is_staff());
+create policy mgr_write on public.supplier_import_drafts for all
+  using (app.has_perm('supplier.manage') or app.can_write())
+  with check (app.has_perm('supplier.manage') or app.can_write());
+
+-- ── AI Supplier Price Import ──────────────────────────────────────────────
+-- Price CHANGES on an existing (supplier, item) catalog entry go through
+-- set_supplier_item_price() at apply time (logged to
+-- supplier_price_history like every other price change); a brand new
+-- pairing is a plain insert, matching the manual Inventory page's own
+-- supplier_items insert. Never creates a supplier or an inventory item —
+-- both must already exist.
+create type app.supplier_price_import_status as enum ('draft', 'ready_for_review', 'applied', 'rejected', 'failed');
+create table public.supplier_price_import_drafts (
+  id              uuid primary key default gen_random_uuid(),
+  source_filename text not null,
+  storage_path    text not null,
+  extracted_json  jsonb not null,
+  diff_json       jsonb not null,
+  status          app.supplier_price_import_status not null default 'ready_for_review',
+  error           text,
+  created_by      uuid,
+  created_at      timestamptz not null default now(),
+  applied_at      timestamptz,
+  applied_by      uuid
+);
+alter table public.supplier_price_import_drafts enable row level security;
+create policy staff_read on public.supplier_price_import_drafts for select using (app.has_perm('supplier.view') or app.is_staff());
+create policy mgr_write on public.supplier_price_import_drafts for all
+  using (app.has_perm('supplier.manage') or app.can_write())
+  with check (app.has_perm('supplier.manage') or app.can_write());
+
+-- ── AI Purchase Order Import ──────────────────────────────────────────────
+-- Creates each order ONLY with prices already on file in that supplier's
+-- own catalog (never invented) — if any line in an order doesn't resolve,
+-- the WHOLE order is blocked, matching the AI chat's draft_purchase_order
+-- rule. Every created order lands as a 'draft'; approving/sending stays a
+-- separate, human-only step in Purchasing.
+create type app.po_import_status as enum ('draft', 'ready_for_review', 'applied', 'rejected', 'failed');
+create table public.po_import_drafts (
+  id              uuid primary key default gen_random_uuid(),
+  source_filename text not null,
+  storage_path    text not null,
+  extracted_json  jsonb not null,
+  diff_json       jsonb not null,
+  status          app.po_import_status not null default 'ready_for_review',
+  error           text,
+  created_by      uuid,
+  created_at      timestamptz not null default now(),
+  applied_at      timestamptz,
+  applied_by      uuid
+);
+alter table public.po_import_drafts enable row level security;
+create policy staff_read on public.po_import_drafts for select using (app.has_perm('purchases.view') or app.is_staff());
+create policy mgr_write on public.po_import_drafts for all
+  using (app.has_perm('purchases.update') or app.can_write())
+  with check (app.has_perm('purchases.update') or app.can_write());
+
+-- ── AI Staff Import ───────────────────────────────────────────────────────
+-- The one import domain that creates real login credentials, so it
+-- carries its own extra safeguards (see apps/api/src/lib/staffImport.ts):
+-- exact role matching against the same fixed creatable-role list
+-- POST /api/staff enforces (never 'owner'), and an anti-escalation check
+-- identical to POST /api/staff/access — a row whose role exceeds the
+-- approving user's OWN permissions is blocked, not silently capped. An
+-- existing account (matched by email) is left alone.
+create type app.staff_import_status as enum ('draft', 'ready_for_review', 'applied', 'rejected', 'failed');
+create table public.staff_import_drafts (
+  id              uuid primary key default gen_random_uuid(),
+  source_filename text not null,
+  storage_path    text not null,
+  extracted_json  jsonb not null,
+  diff_json       jsonb not null,
+  status          app.staff_import_status not null default 'ready_for_review',
+  error           text,
+  created_by      uuid,
+  created_at      timestamptz not null default now(),
+  applied_at      timestamptz,
+  applied_by      uuid
+);
+alter table public.staff_import_drafts enable row level security;
+create policy staff_read on public.staff_import_drafts for select using (app.has_perm('staff.view') or app.is_staff());
+create policy mgr_write on public.staff_import_drafts for all
+  using (app.has_perm('staff.create') or app.can_write())
+  with check (app.has_perm('staff.create') or app.can_write());
+
+-- orders / order_lines: staff read + update (KDS, counter). Inserts via place_order().
+alter table public.orders enable row level security;
+create policy staff_read on public.orders for select using (app.has_perm('orders.view') or app.is_staff());
+create policy staff_update on public.orders for update using (app.has_perm('orders.update') or app.is_staff()) with check (app.has_perm('orders.update') or app.is_staff());
+
+alter table public.order_lines enable row level security;
+create policy staff_read on public.order_lines for select using (app.has_perm('orders.view') or app.is_staff());
+create policy staff_update on public.order_lines for update using (app.has_perm('orders.update') or app.is_staff()) with check (app.has_perm('orders.update') or app.is_staff());
+
+alter table public.stock_ledger enable row level security;
+create policy staff_read on public.stock_ledger for select using (app.has_perm('stock.view') or app.is_staff());
+
+alter table public.order_counter enable row level security; -- functions only
+alter table public.outbox enable row level security;        -- service_role only
+
+alter table public.table_sessions enable row level security;
+create policy staff_read on public.table_sessions for select using (app.has_perm('orders.view') or app.is_staff());
+create policy guest_read on public.table_sessions for select using (true);
+
+-- Guest order tracking: a customer holds the order id (an unguessable uuid) as a
+-- capability, so anon may read that row and subscribe to its changes.
+create policy guest_read on public.orders for select using (true);
+create policy guest_read on public.order_lines for select using (true);
+
+-- Realtime so the customer's tracking page updates with no refresh, and the
+-- kitchen / cashier / waiter boards react live.
+alter publication supabase_realtime add table public.orders;
+alter publication supabase_realtime add table public.order_lines;
+
+-- ── Guest feedback (no account needed) ───────────────────────────────────
+create table public.feedback (
+  id           uuid primary key default gen_random_uuid(),
+  order_id     uuid references public.orders(id) on delete set null,
+  table_label  text,
+  guest_name   text,
+  overall      int not null check (overall between 1 and 5),
+  food         int check (food between 1 and 5),
+  service      int check (service between 1 and 5),
+  cleanliness  int check (cleanliness between 1 and 5),
+  speed        int check (speed between 1 and 5),
+  ambiance     int check (ambiance between 1 and 5),
+  comment      text,
+  created_at   timestamptz not null default now()
+);
+alter table public.feedback enable row level security;
+create policy guest_insert on public.feedback for insert with check (true);
+create policy staff_read on public.feedback for select using (app.has_perm('reviews.view') or app.is_staff());
+
+-- ── Functions ────────────────────────────────────────────────────────────
+-- Generic stock-ledger writer. Never lets stock go negative (spec §44 —
+-- "strict stock" is the explicit, auditable policy chosen here) except
+-- through an insufficient_stock rejection at order time, which is its own
+-- atomic guard elsewhere. Any ledger reason is accepted; the two RPCs below
+-- are thin, permission-scoped, UI-named wrappers over this same writer so a
+-- stock count and a wastage entry are recorded as what they actually are
+-- (spec §17-18), not both as an anonymous "adjustment".
+create or replace function public.adjust_stock(
+  p_inventory_item_id uuid, p_delta numeric, p_reason text, p_note text default null
+) returns numeric
+language plpgsql security definer set search_path = public, app as $$
+declare
+  v_new numeric; v_cost numeric;
+  v_line record; v_open_count int;
+  v_factor numeric; v_old_stock numeric; v_old_cost numeric;
+  v_outstanding_base numeric; v_take_base numeric; v_take_purchase numeric;
+  v_receipt_cost_per_base numeric; v_new_cost numeric; v_remaining_lines int;
+  v_remaining_delta numeric := p_delta;
+begin
+  if not (app.has_perm('stock.adjust') or app.has_perm('inventory.manage')
+          or (app.can_write() and app.current_member_role() is not null)) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+
+  -- Auto-link a manual restock to purchasing when there's exactly one
+  -- unambiguous open PO line for this item ("purchasing should
+  -- automatically update when we stock inventory"). Zero or multiple
+  -- matches fall through to the plain path below unchanged — never guess
+  -- which delivery a restock was for. Same weighted-average costing and
+  -- PO-status logic as receive_purchase_order_line(), just entered from
+  -- the inventory side instead of the purchasing side.
+  if coalesce(nullif(p_reason,''),'adjustment') = 'restock' and p_delta > 0 then
+    select count(*) into v_open_count
+      from public.purchase_order_lines pol
+      join public.purchase_orders po on po.id = pol.purchase_order_id
+     where pol.inventory_item_id = p_inventory_item_id
+       and pol.qty > pol.received_qty
+       and po.status in ('sent', 'partial');
+
+    if v_open_count = 1 then
+      select pol.id, pol.purchase_order_id, pol.qty, pol.received_qty, pol.unit_cost_cents, po.po_number
+        into v_line
+        from public.purchase_order_lines pol
+        join public.purchase_orders po on po.id = pol.purchase_order_id
+       where pol.inventory_item_id = p_inventory_item_id
+         and pol.qty > pol.received_qty
+         and po.status in ('sent', 'partial')
+       limit 1;
+
+      select purchase_unit_to_base, stock_qty, cost_cents_per_base_unit
+        into v_factor, v_old_stock, v_old_cost
+        from public.inventory_items where id = p_inventory_item_id;
+
+      v_outstanding_base := (v_line.qty - v_line.received_qty) * coalesce(v_factor, 1);
+      v_take_base := least(v_remaining_delta, v_outstanding_base);
+
+      if v_take_base > 0 then
+        v_take_purchase := v_take_base / greatest(coalesce(v_factor, 1), 0.0001);
+        v_receipt_cost_per_base := v_line.unit_cost_cents / greatest(coalesce(v_factor, 1), 0.0001);
+        v_new_cost := case when (coalesce(v_old_stock, 0) + v_take_base) > 0
+          then (coalesce(v_old_stock, 0) * coalesce(v_old_cost, 0) + v_take_base * v_receipt_cost_per_base)
+               / (coalesce(v_old_stock, 0) + v_take_base)
+          else coalesce(v_old_cost, 0) end;
+
+        update public.inventory_items
+           set stock_qty = stock_qty + v_take_base, cost_cents_per_base_unit = v_new_cost
+         where id = p_inventory_item_id
+        returning stock_qty into v_new;
+
+        insert into public.stock_ledger (inventory_item_id, delta_qty, reason, note, unit_cost_cents_base)
+        values (p_inventory_item_id, v_take_base, 'restock',
+                'Auto-matched to PO #' || v_line.po_number || coalesce(' — ' || p_note, ''),
+                v_receipt_cost_per_base);
+
+        update public.purchase_order_lines set received_qty = received_qty + v_take_purchase where id = v_line.id;
+
+        select count(*) into v_remaining_lines from public.purchase_order_lines
+         where purchase_order_id = v_line.purchase_order_id and received_qty < qty;
+        update public.purchase_orders
+           set status = case when v_remaining_lines = 0 then 'received'::app.po_status else 'partial'::app.po_status end,
+               received_at = case when v_remaining_lines = 0 then now() else received_at end
+         where id = v_line.purchase_order_id;
+
+        v_remaining_delta := v_remaining_delta - v_take_base;
+        if v_remaining_delta = 0 then return v_new; end if;
+      end if;
+    end if;
+  end if;
+
+  select cost_cents_per_base_unit into v_cost from public.inventory_items where id = p_inventory_item_id;
+  update public.inventory_items set stock_qty = stock_qty + v_remaining_delta
+   where id = p_inventory_item_id returning stock_qty into v_new;
+  if not found then raise exception 'inventory_item_not_found' using errcode = 'foreign_key_violation'; end if;
+  if v_new < 0 then raise exception 'would_go_negative' using errcode = 'check_violation'; end if;
+  insert into public.stock_ledger (inventory_item_id, delta_qty, reason, note, unit_cost_cents_base)
+  values (p_inventory_item_id, v_remaining_delta, coalesce(nullif(p_reason,''),'adjustment')::app.stock_reason, p_note, v_cost);
+  return v_new;
+end $$;
+revoke all on function public.adjust_stock(uuid, numeric, text, text) from public;
+grant execute on function public.adjust_stock(uuid, numeric, text, text) to authenticated, service_role;
+
+-- Wastage: always reason='spoilage', always requires a note (spec §17 —
+-- "record: item, quantity, reason ... notes").
+create or replace function public.record_ingredient_waste(
+  p_inventory_item_id uuid, p_qty numeric, p_note text
+) returns numeric
+language plpgsql security definer set search_path = public, app as $$
+declare v_new numeric; v_cost numeric;
+begin
+  if not (app.has_perm('inventory.manage_waste') or app.has_perm('stock.adjust') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_qty, 0) <= 0 then raise exception 'bad_qty' using errcode = 'check_violation'; end if;
+  if coalesce(trim(p_note), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  select cost_cents_per_base_unit into v_cost from public.inventory_items where id = p_inventory_item_id;
+  update public.inventory_items set stock_qty = stock_qty - p_qty
+   where id = p_inventory_item_id and stock_qty >= p_qty
+   returning stock_qty into v_new;
+  if not found then raise exception 'insufficient_stock: %', p_inventory_item_id using errcode = 'check_violation'; end if;
+  insert into public.stock_ledger (inventory_item_id, delta_qty, reason, note, unit_cost_cents_base)
+  values (p_inventory_item_id, -p_qty, 'spoilage', p_note, v_cost);
+  return v_new;
+end $$;
+revoke all on function public.record_ingredient_waste(uuid, numeric, text) from public;
+grant execute on function public.record_ingredient_waste(uuid, numeric, text) to authenticated, service_role;
+
+-- Stock count: staff enters the physical count; this records the variance
+-- as an auditable adjustment against whatever the system currently shows,
+-- never a silent overwrite (spec §19).
+create or replace function public.submit_stock_count(
+  p_inventory_item_id uuid, p_counted_qty numeric, p_note text default null
+) returns jsonb
+language plpgsql security definer set search_path = public, app as $$
+declare v_before numeric; v_delta numeric; v_cost numeric;
+begin
+  if not (app.has_perm('stock.count') or app.has_perm('stock.adjust') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_counted_qty < 0 then raise exception 'bad_qty' using errcode = 'check_violation'; end if;
+  select stock_qty, cost_cents_per_base_unit into v_before, v_cost from public.inventory_items where id = p_inventory_item_id;
+  if not found then raise exception 'inventory_item_not_found' using errcode = 'foreign_key_violation'; end if;
+  v_delta := p_counted_qty - v_before;
+  update public.inventory_items set stock_qty = p_counted_qty where id = p_inventory_item_id;
+  insert into public.stock_ledger (inventory_item_id, delta_qty, reason, note, unit_cost_cents_base)
+  values (p_inventory_item_id, v_delta, 'stock_take', coalesce(nullif(trim(p_note), ''), 'stock count'), v_cost);
+  return jsonb_build_object('before', v_before, 'counted', p_counted_qty, 'variance', v_delta);
+end $$;
+revoke all on function public.submit_stock_count(uuid, numeric, text) from public;
+grant execute on function public.submit_stock_count(uuid, numeric, text) to authenticated, service_role;
+
+-- Declared ahead of place_order() below, which references it in a DECLARE
+-- block; plpgsql validates declared types at CREATE FUNCTION time, so the
+-- type must exist before this point even though the promotions table it
+-- belongs to isn't created until later (place_order only references that
+-- table inside the function body, which postgres binds lazily).
+create type app.promo_kind as enum ('percent', 'fixed', 'bogo');
+
+create or replace function public.place_order(
+  p_channel text, p_table_label text, p_customer_name text,
+  p_tax_rate_bps integer, p_lines jsonb,
+  p_discount_cents int default 0, p_promo_code text default null,
+  p_customer_note text default null
+) returns table (order_id uuid, order_number bigint, subtotal_cents int, discount_cents int, tax_cents int, total_cents int)
+language plpgsql security definer set search_path = public, app as $$
+declare
+  v_order_id uuid; v_no bigint; v_sub int := 0; v_tax int; v_total int;
+  v_line jsonb; v_qty int; v_lt int; v_comp record; v_need numeric; v_upd int;
+  v_session_id uuid; v_disc int := greatest(0, coalesce(p_discount_cents, 0));
+  v_variant_id uuid; v_item_id uuid; v_item_name text; v_variant_name text;
+  v_price int; v_avail boolean; v_track boolean;
+  v_deal_id uuid; v_dc record;
+  v_line_id uuid; v_recipe_cost int; v_cost_per_base numeric;
+  v_promo_id uuid; v_promo_kind app.promo_kind; v_val_bps int; v_val_cents int;
+begin
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) = 0 then
+    raise exception 'no_lines' using errcode = 'check_violation';
+  end if;
+
+  update public.order_counter set next_number = next_number + 1 where id returning next_number - 1 into v_no;
+
+  -- Attach to the table's open session; open one if there isn't a live tab.
+  if coalesce(p_table_label, '') <> '' then
+    select id into v_session_id from public.table_sessions
+     where table_label = p_table_label and status = 'open'
+     order by opened_at desc limit 1;
+    if v_session_id is null then
+      insert into public.table_sessions (table_label) values (p_table_label) returning id into v_session_id;
+    end if;
+  end if;
+
+  insert into public.orders (order_number, session_id, channel, table_label, customer_name, status)
+  values (v_no, v_session_id, coalesce(nullif(p_channel,''),'dine_in')::app.order_channel, p_table_label, p_customer_name, 'pending')
+  returning id into v_order_id;
+
+  for v_line in select value from jsonb_array_elements(p_lines) as t(value) loop
+    v_qty := coalesce((v_line->>'qty')::int, 0);
+    if v_qty <= 0 then raise exception 'bad_qty' using errcode = 'check_violation'; end if;
+
+    v_deal_id := nullif(v_line->>'deal_id', '')::uuid;
+
+    if v_deal_id is not null then
+      -- ── Deal / combo: one priced HEADER line + zero-priced COMPONENT lines ──
+      select d.name, d.price_cents, d.track_availability,
+             (d.is_available
+              and (d.starts_at is null or d.starts_at <= now())
+              and (d.ends_at   is null or d.ends_at   >= now())
+              and (not d.track_availability or d.available_qty >= v_qty))
+        into v_item_name, v_price, v_track, v_avail
+        from public.deals d where d.id = v_deal_id;
+      if not found then raise exception 'deal_not_found: %', v_deal_id using errcode = 'foreign_key_violation'; end if;
+      if not coalesce(v_avail, false) then
+        raise exception 'deal_unavailable: %', v_item_name using errcode = 'check_violation';
+      end if;
+
+      v_lt := v_price * v_qty;
+      v_sub := v_sub + v_lt;
+      insert into public.order_lines
+        (order_id, deal_id, name_snapshot, unit_price_cents, qty, line_total_cents, modifiers, customer_note)
+      values
+        (v_order_id, v_deal_id, v_item_name, v_price, v_qty, v_lt, '[]'::jsonb,
+         nullif(left(coalesce(v_line->>'note', ''), 500), ''));
+      -- Atomic, concurrency-safe: the WHERE re-checks available_qty at the
+      -- moment of the write, not just at the SELECT above, so two orders
+      -- racing for the last unit can't both succeed.
+      update public.deals set available_qty = available_qty - v_qty
+       where id = v_deal_id and track_availability and available_qty >= v_qty;
+      get diagnostics v_upd = row_count;
+      if v_track and v_upd = 0 then
+        raise exception 'deal_unavailable: %', v_item_name using errcode = 'check_violation';
+      end if;
+
+      for v_dc in select menu_item_id, variant_id, qty from public.deal_components where deal_id = v_deal_id loop
+        if v_dc.variant_id is not null then
+          select v.id, v.menu_item_id, i.name, v.name, v.track_availability, (v.is_available and i.is_available)
+            into v_variant_id, v_item_id, v_item_name, v_variant_name, v_track, v_avail
+            from public.menu_variants v join public.menu_items i on i.id = v.menu_item_id
+           where v.id = v_dc.variant_id;
+        else
+          v_item_id := v_dc.menu_item_id;
+          select i.name, i.is_available into v_item_name, v_avail
+            from public.menu_items i where i.id = v_item_id;
+          select v.id, v.name, v.track_availability, (v.is_available and v_avail)
+            into v_variant_id, v_variant_name, v_track, v_avail
+            from public.menu_variants v where v.menu_item_id = v_item_id
+           order by v.sort_order, v.created_at limit 1;
+        end if;
+        if not coalesce(v_avail, false) then
+          raise exception 'deal_item_unavailable: %', coalesce(v_item_name, '?') using errcode = 'check_violation';
+        end if;
+        insert into public.order_lines
+          (order_id, deal_id, menu_item_id, variant_id, name_snapshot, variant_name_snapshot,
+           unit_price_cents, qty, line_total_cents, modifiers)
+        values
+          (v_order_id, v_deal_id, v_item_id, v_variant_id,
+           v_item_name || case when v_variant_name is not null and v_variant_name <> 'Regular' then ' · ' || v_variant_name else '' end,
+           v_variant_name, 0, v_dc.qty * v_qty, 0, '[]'::jsonb)
+        returning id into v_line_id;
+        if v_variant_id is not null then
+          update public.menu_variants set available_qty = available_qty - v_dc.qty * v_qty
+           where id = v_variant_id and track_availability and available_qty >= v_dc.qty * v_qty;
+          get diagnostics v_upd = row_count;
+          if v_track and v_upd = 0 then
+            raise exception 'deal_item_unavailable: %', coalesce(v_item_name, '?') using errcode = 'check_violation';
+          end if;
+        end if;
+        -- Recipe explosion, variant-aware exactly like the plain-order path
+        -- below (spec §11, §13): a variant-specific recipe fully replaces
+        -- the item's base recipe when the component pinned a variant that
+        -- has one of its own.
+        v_recipe_cost := 0;
+        for v_comp in
+          select inventory_item_id, qty_per_unit from public.recipe_components
+           where menu_item_id = v_item_id
+             and variant_id is not distinct from (
+               case when exists(
+                 select 1 from public.recipe_components where menu_item_id = v_item_id and variant_id = v_variant_id
+               ) then v_variant_id else null end)
+        loop
+          v_need := v_comp.qty_per_unit * v_dc.qty * v_qty;
+          select cost_cents_per_base_unit into v_cost_per_base from public.inventory_items where id = v_comp.inventory_item_id;
+          v_recipe_cost := v_recipe_cost + round(v_need * coalesce(v_cost_per_base, 0));
+          update public.inventory_items set stock_qty = stock_qty - v_need
+           where id = v_comp.inventory_item_id and stock_qty >= v_need;
+          get diagnostics v_upd = row_count;
+          if v_upd = 0 then raise exception 'insufficient_stock: %', v_comp.inventory_item_id using errcode = 'check_violation'; end if;
+          insert into public.stock_ledger (inventory_item_id, delta_qty, reason, order_id, unit_cost_cents_base)
+          values (v_comp.inventory_item_id, -v_need, 'order_deduction', v_order_id, v_cost_per_base);
+        end loop;
+        update public.order_lines set recipe_cost_cents = v_recipe_cost where id = v_line_id;
+      end loop;
+
+      -- Build-Your-Own selections (spec §7-10): the client sends only
+      -- deal_option_items IDs, never a price — re-priced/re-validated here
+      -- exactly like item modifiers are, one group at a time (min/max
+      -- enforced), before any of it can affect the total. A deal with no
+      -- option groups (the plain fixed-price case) simply finds nothing to
+      -- loop over here — fully backward compatible.
+      declare
+        v_deal_opt_ids uuid[] := array(
+          select (x)::uuid from jsonb_array_elements_text(coalesce(v_line->'deal_option_ids', '[]'::jsonb)) as x
+        );
+        v_grp record;
+        v_grp_selected int;
+        v_oi record;
+      begin
+        for v_grp in select id, name, min_select, max_select from public.deal_option_groups where deal_id = v_deal_id loop
+          select count(*) into v_grp_selected
+            from public.deal_option_items doi
+           where doi.group_id = v_grp.id and doi.id = any(v_deal_opt_ids);
+          if v_grp_selected < v_grp.min_select then
+            raise exception 'deal_option_required: %', v_grp.name using errcode = 'check_violation';
+          end if;
+          if v_grp.max_select is not null and v_grp_selected > v_grp.max_select then
+            raise exception 'deal_option_too_many: %', v_grp.name using errcode = 'check_violation';
+          end if;
+        end loop;
+
+        for v_oi in
+          select doi.id, doi.menu_item_id, doi.variant_id, doi.qty, doi.price_adjustment_cents
+            from public.deal_option_items doi
+            join public.deal_option_groups dog on dog.id = doi.group_id
+           where dog.deal_id = v_deal_id and doi.id = any(v_deal_opt_ids)
+        loop
+          if v_oi.variant_id is not null then
+            select v.id, v.menu_item_id, i.name, v.name, v.track_availability, (v.is_available and i.is_available)
+              into v_variant_id, v_item_id, v_item_name, v_variant_name, v_track, v_avail
+              from public.menu_variants v join public.menu_items i on i.id = v.menu_item_id
+             where v.id = v_oi.variant_id;
+          else
+            v_item_id := v_oi.menu_item_id;
+            select i.name, i.is_available into v_item_name, v_avail
+              from public.menu_items i where i.id = v_item_id;
+            select v.id, v.name, v.track_availability, (v.is_available and v_avail)
+              into v_variant_id, v_variant_name, v_track, v_avail
+              from public.menu_variants v where v.menu_item_id = v_item_id
+             order by v.sort_order, v.created_at limit 1;
+          end if;
+          if not coalesce(v_avail, false) then
+            raise exception 'deal_item_unavailable: %', coalesce(v_item_name, '?') using errcode = 'check_violation';
+          end if;
+
+          v_lt := v_oi.price_adjustment_cents * v_oi.qty * v_qty;
+          v_sub := v_sub + v_lt;
+          insert into public.order_lines
+            (order_id, deal_id, menu_item_id, variant_id, name_snapshot, variant_name_snapshot,
+             unit_price_cents, qty, line_total_cents, modifiers)
+          values
+            (v_order_id, v_deal_id, v_item_id, v_variant_id,
+             v_item_name || case when v_variant_name is not null and v_variant_name <> 'Regular' then ' · ' || v_variant_name else '' end,
+             v_variant_name, v_oi.price_adjustment_cents, v_oi.qty * v_qty, v_lt, '[]'::jsonb)
+          returning id into v_line_id;
+
+          if v_variant_id is not null then
+            update public.menu_variants set available_qty = available_qty - v_oi.qty * v_qty
+             where id = v_variant_id and track_availability and available_qty >= v_oi.qty * v_qty;
+            get diagnostics v_upd = row_count;
+            if v_track and v_upd = 0 then
+              raise exception 'deal_item_unavailable: %', coalesce(v_item_name, '?') using errcode = 'check_violation';
+            end if;
+          end if;
+
+          v_recipe_cost := 0;
+          for v_comp in
+            select inventory_item_id, qty_per_unit from public.recipe_components
+             where menu_item_id = v_item_id
+               and variant_id is not distinct from (
+                 case when exists(
+                   select 1 from public.recipe_components where menu_item_id = v_item_id and variant_id = v_variant_id
+                 ) then v_variant_id else null end)
+          loop
+            v_need := v_comp.qty_per_unit * v_oi.qty * v_qty;
+            select cost_cents_per_base_unit into v_cost_per_base from public.inventory_items where id = v_comp.inventory_item_id;
+            v_recipe_cost := v_recipe_cost + round(v_need * coalesce(v_cost_per_base, 0));
+            update public.inventory_items set stock_qty = stock_qty - v_need
+             where id = v_comp.inventory_item_id and stock_qty >= v_need;
+            get diagnostics v_upd = row_count;
+            if v_upd = 0 then raise exception 'insufficient_stock: %', v_comp.inventory_item_id using errcode = 'check_violation'; end if;
+            insert into public.stock_ledger (inventory_item_id, delta_qty, reason, order_id, unit_cost_cents_base)
+            values (v_comp.inventory_item_id, -v_need, 'order_deduction', v_order_id, v_cost_per_base);
+          end loop;
+          update public.order_lines set recipe_cost_cents = v_recipe_cost where id = v_line_id;
+        end loop;
+      end;
+
+    else
+    v_variant_id := nullif(v_line->>'variant_id', '')::uuid;
+    if v_variant_id is not null then
+      -- Explicit variant: price + availability come from the variant.
+      select v.id, v.menu_item_id, i.name, v.name, v.price_cents, v.track_availability, (v.is_available and i.is_available)
+        into v_variant_id, v_item_id, v_item_name, v_variant_name, v_price, v_track, v_avail
+        from public.menu_variants v join public.menu_items i on i.id = v.menu_item_id
+       where v.id = v_variant_id;
+      if not found then raise exception 'variant_not_found: %', v_line->>'variant_id' using errcode = 'foreign_key_violation'; end if;
+    else
+      -- Legacy line: item id only. Use its default (first) variant if one exists.
+      v_item_id := (v_line->>'menu_item_id')::uuid;
+      select i.name, i.is_available, i.price_cents into v_item_name, v_avail, v_price
+        from public.menu_items i where i.id = v_item_id;
+      if not found then raise exception 'menu_item_not_found: %', v_line->>'menu_item_id' using errcode = 'foreign_key_violation'; end if;
+      select v.id, v.name, v.price_cents, v.track_availability, (v.is_available and v_avail)
+        into v_variant_id, v_variant_name, v_price, v_track, v_avail
+        from public.menu_variants v where v.menu_item_id = v_item_id
+       order by v.sort_order, v.created_at limit 1;
+    end if;
+
+    if not coalesce(v_avail, false) then
+      raise exception 'item_unavailable: %', coalesce(v_item_name, v_item_id::text) using errcode = 'check_violation';
+    end if;
+
+    -- Modifiers: the client sends only option IDs, never a price or name.
+    -- Every option is re-priced and re-validated here — belongs to this
+    -- item, currently available, and each group's required/min/max is
+    -- satisfied — before it can affect the total. Unknown or stale IDs are
+    -- silently dropped rather than trusted.
+    declare
+      v_mod_ids uuid[] := array(
+        select (x)::uuid from jsonb_array_elements_text(coalesce(v_line->'modifier_option_ids', '[]'::jsonb)) as x
+      );
+      v_mod_total int;
+      v_mod_snapshot jsonb;
+      v_valid_mod_ids uuid[];
+      v_grp record;
+      v_grp_selected int;
+      v_has_variant_recipe boolean;
+    begin
+      select coalesce(sum(mo.price_cents), 0),
+             coalesce(jsonb_agg(jsonb_build_object('id', mo.id, 'name', mo.name, 'price_cents', mo.price_cents)
+                                 order by mo.sort_order), '[]'::jsonb),
+             coalesce(array_agg(mo.id), '{}')
+        into v_mod_total, v_mod_snapshot, v_valid_mod_ids
+        from public.modifier_options mo
+        join public.modifier_groups mg on mg.id = mo.group_id
+       where mo.id = any(v_mod_ids) and mo.is_available and mg.menu_item_id = v_item_id;
+
+      for v_grp in select id, name, kind, min_select, max_select
+                     from public.modifier_groups where menu_item_id = v_item_id loop
+        select count(*) into v_grp_selected
+          from public.modifier_options mo
+         where mo.group_id = v_grp.id and mo.id = any(v_mod_ids) and mo.is_available;
+        if v_grp_selected < v_grp.min_select then
+          raise exception 'modifier_required: %', v_grp.name using errcode = 'check_violation';
+        end if;
+        if v_grp.max_select is not null and v_grp_selected > v_grp.max_select then
+          raise exception 'modifier_too_many: %', v_grp.name using errcode = 'check_violation';
+        end if;
+      end loop;
+
+      v_lt := (v_price + v_mod_total) * v_qty;
+      v_sub := v_sub + v_lt;
+
+      insert into public.order_lines
+        (order_id, menu_item_id, variant_id, name_snapshot, variant_name_snapshot,
+         unit_price_cents, qty, line_total_cents, modifiers, customer_note)
+      values
+        (v_order_id, v_item_id, v_variant_id,
+         v_item_name || case when v_variant_name is not null and v_variant_name <> 'Regular' then ' · ' || v_variant_name else '' end,
+         v_variant_name, v_price + v_mod_total, v_qty, v_lt, v_mod_snapshot,
+         nullif(left(coalesce(v_line->>'note', ''), 500), ''))
+      returning id into v_line_id;
+
+      -- Recipe explosion (spec §9-11): a recipe row scoped to THIS variant
+      -- fully replaces the item's base recipe when one exists; otherwise the
+      -- base recipe (variant_id is null) applies. Never both, never a naive
+      -- "same recipe regardless of size" assumption.
+      v_recipe_cost := 0;
+      select exists(
+        select 1 from public.recipe_components where menu_item_id = v_item_id and variant_id = v_variant_id
+      ) into v_has_variant_recipe;
+      for v_comp in
+        select inventory_item_id, qty_per_unit from public.recipe_components
+         where menu_item_id = v_item_id
+           and variant_id is not distinct from (case when v_has_variant_recipe then v_variant_id else null end)
+      loop
+        v_need := v_comp.qty_per_unit * v_qty;
+        select cost_cents_per_base_unit into v_cost_per_base from public.inventory_items where id = v_comp.inventory_item_id;
+        v_recipe_cost := v_recipe_cost + round(v_need * coalesce(v_cost_per_base, 0));
+        update public.inventory_items set stock_qty = stock_qty - v_need
+         where id = v_comp.inventory_item_id and stock_qty >= v_need;
+        get diagnostics v_upd = row_count;
+        if v_upd = 0 then raise exception 'insufficient_stock: %', v_comp.inventory_item_id using errcode = 'check_violation'; end if;
+        insert into public.stock_ledger (inventory_item_id, delta_qty, reason, order_id, unit_cost_cents_base)
+        values (v_comp.inventory_item_id, -v_need, 'order_deduction', v_order_id, v_cost_per_base);
+      end loop;
+
+      -- Modifier-linked consumption (spec §12): e.g. Extra Cheese consumes
+      -- one more cheese slice, Extra Patty another 150g of chicken — on top
+      -- of, not instead of, the base/variant recipe above.
+      for v_comp in
+        select inventory_item_id, sum(qty_base) as qty_per_unit
+          from public.modifier_recipe_components
+         where modifier_option_id = any(v_valid_mod_ids)
+         group by inventory_item_id
+      loop
+        v_need := v_comp.qty_per_unit * v_qty;
+        select cost_cents_per_base_unit into v_cost_per_base from public.inventory_items where id = v_comp.inventory_item_id;
+        v_recipe_cost := v_recipe_cost + round(v_need * coalesce(v_cost_per_base, 0));
+        update public.inventory_items set stock_qty = stock_qty - v_need
+         where id = v_comp.inventory_item_id and stock_qty >= v_need;
+        get diagnostics v_upd = row_count;
+        if v_upd = 0 then raise exception 'insufficient_stock: %', v_comp.inventory_item_id using errcode = 'check_violation'; end if;
+        insert into public.stock_ledger (inventory_item_id, delta_qty, reason, order_id, unit_cost_cents_base)
+        values (v_comp.inventory_item_id, -v_need, 'order_deduction', v_order_id, v_cost_per_base);
+      end loop;
+
+      update public.order_lines set recipe_cost_cents = v_recipe_cost where id = v_line_id;
+    end;
+
+    -- Variant availability counter — atomic, concurrency-safe (see the deal
+    -- branch above for why: re-checks available_qty at write time, not just
+    -- at the SELECT above, so two orders racing for the last unit can't both win).
+    if v_variant_id is not null then
+      update public.menu_variants
+         set available_qty = available_qty - v_qty
+       where id = v_variant_id and track_availability and available_qty >= v_qty;
+      get diagnostics v_upd = row_count;
+      if v_track and v_upd = 0 then
+        raise exception 'item_unavailable: %', coalesce(v_item_name, v_item_id::text) using errcode = 'check_violation';
+      end if;
+    end if;
+    end if;
+  end loop;
+
+  -- A promo code, if supplied and valid, decides the discount (staff-applied
+  -- p_discount_cents is the fallback for manual till discounts). Resolved
+  -- ONCE here (not via promo_discount(), which only knows percent/fixed
+  -- and can't see this order's own lines) via app.promotion_is_valid_now()
+  -- so this and the storefront's live preview can never disagree about
+  -- whether a code is currently valid. BOGO needs the actual line items
+  -- just inserted above — that's why this runs after the line loop, not
+  -- before it. Redeeming — bumping usage_count and logging
+  -- promotion_redemptions — happens HERE, and the usage_count bump is
+  -- itself the concurrency guard: two orders racing for the last
+  -- redemption of a capped code can't both win, same atomic
+  -- update-with-a-still-true-where-clause pattern as deal/variant
+  -- availability above.
+  if coalesce(p_promo_code, '') <> '' then
+    v_promo_id := null;
+    select p.id, p.kind, p.value_bps, p.value_cents
+      into v_promo_id, v_promo_kind, v_val_bps, v_val_cents
+      from public.promotions p
+     where lower(p.code) = lower(p_promo_code) and app.promotion_is_valid_now(p, v_sub)
+     limit 1;
+    if v_promo_id is not null then
+      v_disc := case
+        when v_promo_kind = 'bogo' then public.bogo_discount_for_order(v_order_id, v_promo_id)
+        when v_promo_kind = 'percent' then (v_sub * coalesce(v_val_bps, 0) / 10000)
+        else least(coalesce(v_val_cents, 0), v_sub)
+      end;
+      if v_disc > 0 then
+        update public.promotions set usage_count = usage_count + 1
+         where id = v_promo_id and (usage_limit_total is null or usage_count < usage_limit_total)
+        returning id into v_promo_id;
+        if v_promo_id is null then
+          v_disc := 0; -- lost the race against the usage cap between validation and now
+        else
+          insert into public.promotion_redemptions (promotion_id, order_id, discount_cents)
+          values (v_promo_id, v_order_id, v_disc);
+        end if;
+      else
+        v_promo_id := null;
+      end if;
+    end if;
+  end if;
+
+  -- Auto-apply (spec: automatic happy-hour/time-based discounts that need
+  -- no code): if nothing above already discounted this order — no code
+  -- entered, or the one entered didn't validate — try the single best
+  -- currently-eligible auto_apply promotion instead. A manual staff
+  -- discount (p_discount_cents, already in v_disc at this point if no
+  -- code path fired) still takes precedence, same as an explicit code.
+  if v_disc = 0 then
+    select ap.id, ap.discount_cents into v_promo_id, v_disc from public.best_auto_promotion(v_sub) ap;
+    if v_promo_id is not null and v_disc > 0 then
+      update public.promotions set usage_count = usage_count + 1
+       where id = v_promo_id and (usage_limit_total is null or usage_count < usage_limit_total)
+      returning id into v_promo_id;
+      if v_promo_id is null then
+        v_disc := 0; -- lost the race against the usage cap between validation and now
+      else
+        insert into public.promotion_redemptions (promotion_id, order_id, discount_cents)
+        values (v_promo_id, v_order_id, v_disc);
+      end if;
+    else
+      v_disc := 0;
+    end if;
+  end if;
+  v_disc := least(greatest(v_disc, 0), v_sub);
+  v_tax := round((v_sub - v_disc)::numeric * coalesce(p_tax_rate_bps,0) / 10000)::int;
+  v_total := v_sub - v_disc + v_tax;
+  -- promo_code on the order shows whichever code actually produced the
+  -- discount (the typed one, or an auto_apply promo's own code if that's
+  -- what fired) — falling back to the raw typed text so an invalid code
+  -- the customer entered is still recorded even though it discounted nothing.
+  update public.orders set subtotal_cents = v_sub, discount_cents = v_disc,
+    promo_code = case
+      when v_disc > 0 and v_promo_id is not null then (select code from public.promotions where id = v_promo_id)
+      else nullif(p_promo_code, '')
+    end,
+    tax_cents = v_tax, total_cents = v_total, tax_rate_bps = coalesce(p_tax_rate_bps, 0),
+    customer_note = nullif(left(coalesce(p_customer_note, ''), 500), ''),
+    status = 'in_kitchen', updated_at = now() where id = v_order_id;
+
+  insert into public.outbox (topic, payload) values ('order.placed', jsonb_build_object(
+    'order_id', v_order_id, 'order_number', v_no, 'total_cents', v_total, 'table_label', p_table_label));
+
+  return query select v_order_id, v_no, v_sub, v_disc, v_tax, v_total;
+end $$;
+revoke all on function public.place_order(text, text, text, integer, jsonb, int, text, text) from public;
+grant execute on function public.place_order(text, text, text, integer, jsonb, int, text, text) to authenticated, service_role, anon;
+
+-- Close a table's session and mark all its unpaid orders paid in one step.
+create or replace function public.close_session(p_session_id uuid, p_payment_method text)
+returns void
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  update public.orders
+     set status = 'paid',
+         payment_method = coalesce(nullif(p_payment_method, ''), 'cash'),
+         paid_at = now(),
+         updated_at = now()
+   where session_id = p_session_id and status <> 'void' and paid_at is null;
+  update public.table_sessions set status = 'closed', closed_at = now()
+   where id = p_session_id and status = 'open';
+end $fn$;
+revoke all on function public.close_session(uuid, text) from public;
+grant execute on function public.close_session(uuid, text) to authenticated, service_role;
+
+-- ── Payments, refunds & sensitive order actions (P4) ─────────────────────
+create table public.payments (
+  id             uuid primary key default gen_random_uuid(),
+  order_id       uuid references public.orders(id) on delete set null,
+  amount_cents   int not null check (amount_cents > 0),
+  method         text not null default 'cash',
+  reference      text,
+  tendered_cents int,
+  change_cents   int,
+  refunded_cents int not null default 0 check (refunded_cents >= 0),
+  status         text not null default 'captured'
+                 check (status in ('captured','partially_refunded','refunded','voided')),
+  captured_by    uuid,
+  portal_id      uuid,
+  note           text,
+  created_at     timestamptz not null default now()
+);
+create index payments_order_idx on public.payments(order_id);
+
+create table public.refunds (
+  id           uuid primary key default gen_random_uuid(),
+  payment_id   uuid references public.payments(id) on delete set null,
+  order_id     uuid references public.orders(id) on delete set null,
+  amount_cents int not null check (amount_cents > 0),
+  reason       text not null,
+  method       text,
+  reference    text,
+  requested_by uuid,
+  approved_by  uuid,
+  portal_id    uuid,
+  created_at   timestamptz not null default now()
+);
+create index refunds_order_idx on public.refunds(order_id);
+
+create table public.order_adjustments (
+  id              uuid primary key default gen_random_uuid(),
+  order_id        uuid references public.orders(id) on delete cascade,
+  line_id         uuid,
+  kind            text not null check (kind in ('discount','price_override','void','reopen','comp')),
+  old_value_cents int,
+  new_value_cents int,
+  reason          text,
+  actor_id        uuid,
+  portal_id       uuid,
+  created_at      timestamptz not null default now()
+);
+create index order_adjustments_order_idx on public.order_adjustments(order_id, created_at desc);
+
+alter table public.payments enable row level security;
+alter table public.refunds enable row level security;
+alter table public.order_adjustments enable row level security;
+-- Financial read — deliberately NOT "or app.is_staff()" (unlike most
+-- tables here): payment/refund amounts are exactly the kind of data a
+-- manager should only see when explicitly granted payments.view, per
+-- the Owner's Portal & Access Control configuration. Every other
+-- read/write policy in this file keeps its existing is_staff()/
+-- can_write() fallback untouched — this is a deliberately narrow,
+-- named exception for the finance domain, not a schema-wide change.
+create policy staff_read on public.payments for select using (app.has_perm('payments.view'));
+create policy staff_read on public.refunds for select using (app.has_perm('payments.view'));
+create policy staff_read on public.order_adjustments for select using (app.has_perm('orders.view') or app.is_staff());
+alter publication supabase_realtime add table public.payments;
+
+create or replace function app.recalc_order_totals(p_order_id uuid) returns void
+language plpgsql set search_path = public, app as $fn$
+declare v_sub int; v_disc int; v_rate int; v_tax int;
+begin
+  select coalesce(sum(line_total_cents), 0) into v_sub
+    from public.order_lines where order_id = p_order_id;
+  select greatest(0, coalesce(discount_cents, 0)), coalesce(tax_rate_bps, 0)
+    into v_disc, v_rate from public.orders where id = p_order_id;
+  v_disc := least(v_disc, v_sub);
+  v_tax  := round((v_sub - v_disc)::numeric * v_rate / 10000)::int;
+  update public.orders
+     set subtotal_cents = v_sub, discount_cents = v_disc,
+         tax_cents = v_tax, total_cents = v_sub - v_disc + v_tax, updated_at = now()
+   where id = p_order_id;
+end $fn$;
+
+create or replace function public.record_payment(
+  p_order_id uuid, p_amount_cents int, p_method text default 'cash',
+  p_tendered_cents int default null, p_reference text default null
+) returns public.payments
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_order public.orders; v_pay public.payments; v_paid int; v_due int;
+begin
+  if not app.has_perm('payments.accept') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_amount_cents, 0) <= 0 then
+    raise exception 'bad_amount' using errcode = 'check_violation';
+  end if;
+  select * into v_order from public.orders where id = p_order_id;
+  if not found then raise exception 'order_not_found' using errcode = 'no_data_found'; end if;
+  if v_order.status = 'void' then raise exception 'order_void' using errcode = 'check_violation'; end if;
+
+  insert into public.payments
+    (order_id, amount_cents, method, reference, tendered_cents, change_cents, captured_by, portal_id)
+  values
+    (p_order_id, p_amount_cents, coalesce(nullif(p_method, ''), 'cash'), nullif(p_reference, ''),
+     p_tendered_cents,
+     case when p_tendered_cents is not null then greatest(0, p_tendered_cents - p_amount_cents) end,
+     app.jwt_sub(), app.current_portal_id())
+  returning * into v_pay;
+
+  select coalesce(sum(amount_cents - refunded_cents), 0) into v_paid
+    from public.payments where order_id = p_order_id and status <> 'voided';
+  v_due := v_order.total_cents - coalesce(v_order.refunded_cents, 0);
+  if v_paid >= v_due then
+    update public.orders
+       set status = 'paid', paid_at = coalesce(paid_at, now()),
+           payment_method = coalesce(nullif(p_method, ''), 'cash'), updated_at = now()
+     where id = p_order_id;
+  end if;
+  return v_pay;
+end $fn$;
+revoke all on function public.record_payment(uuid, int, text, int, text) from public;
+grant execute on function public.record_payment(uuid, int, text, int, text) to authenticated, service_role;
+
+create or replace function public.refund_payment(
+  p_payment_id uuid, p_amount_cents int, p_reason text, p_method text default null
+) returns public.refunds
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_pay public.payments; v_ref public.refunds; v_remaining int; v_threshold int;
+begin
+  if not app.has_perm('payments.refund') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'reason_required' using errcode = 'check_violation';
+  end if;
+  select * into v_pay from public.payments where id = p_payment_id;
+  if not found then raise exception 'payment_not_found' using errcode = 'no_data_found'; end if;
+  v_remaining := v_pay.amount_cents - v_pay.refunded_cents;
+  if coalesce(p_amount_cents, 0) <= 0 or p_amount_cents > v_remaining then
+    raise exception 'bad_refund_amount: max %', v_remaining using errcode = 'check_violation';
+  end if;
+
+  -- Configurable amount-tiered approval (spec §6/§18): a restaurant that
+  -- has set max_refund_without_approval_cents requires payments.approve_refund
+  -- (or full can_write()) for anything over it — enforced here, not only
+  -- by whether the UI happens to show an Approve button.
+  select max_refund_without_approval_cents into v_threshold from public.business_settings where id;
+  if v_threshold is not null and p_amount_cents > v_threshold
+     and not (app.has_perm('payments.approve_refund') or app.can_write()) then
+    raise exception 'refund_needs_approval: max % without manager approval', v_threshold
+      using errcode = 'insufficient_privilege';
+  end if;
+
+  insert into public.refunds
+    (payment_id, order_id, amount_cents, reason, method, requested_by, approved_by, portal_id)
+  values
+    (p_payment_id, v_pay.order_id, p_amount_cents, trim(p_reason),
+     coalesce(nullif(p_method, ''), v_pay.method), app.jwt_sub(),
+     -- Only recorded when an approval threshold actually applied and this
+     -- caller's own approve permission is what let it through — a refund
+     -- under the threshold (or when none is configured) needed no
+     -- approval decision, so approved_by stays null for it.
+     case when v_threshold is not null and p_amount_cents > v_threshold then app.jwt_sub() else null end,
+     app.current_portal_id())
+  returning * into v_ref;
+
+  update public.payments
+     set refunded_cents = refunded_cents + p_amount_cents,
+         status = case when refunded_cents + p_amount_cents >= amount_cents
+                       then 'refunded' else 'partially_refunded' end
+   where id = p_payment_id;
+
+  if v_pay.order_id is not null then
+    update public.orders
+       set refunded_cents = coalesce(refunded_cents, 0) + p_amount_cents, updated_at = now()
+     where id = v_pay.order_id;
+  end if;
+  return v_ref;
+end $fn$;
+revoke all on function public.refund_payment(uuid, int, text, text) from public;
+grant execute on function public.refund_payment(uuid, int, text, text) to authenticated, service_role;
+
+create or replace function public.void_payment(p_payment_id uuid, p_reason text)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_pay public.payments; v_left int;
+begin
+  if not app.has_perm('payments.void') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v_pay from public.payments where id = p_payment_id;
+  if not found then raise exception 'payment_not_found' using errcode = 'no_data_found'; end if;
+  if v_pay.refunded_cents > 0 then
+    raise exception 'cannot_void_refunded' using errcode = 'check_violation';
+  end if;
+  update public.payments set status = 'voided' where id = p_payment_id;
+  insert into public.order_adjustments
+    (order_id, kind, old_value_cents, new_value_cents, reason, actor_id, portal_id)
+  values
+    (v_pay.order_id, 'void', v_pay.amount_cents, 0,
+     coalesce(nullif(trim(p_reason), ''), 'payment voided'), app.jwt_sub(), app.current_portal_id());
+
+  if v_pay.order_id is not null then
+    select coalesce(sum(amount_cents - refunded_cents), 0) into v_left
+      from public.payments where order_id = v_pay.order_id and status <> 'voided';
+    if v_left <= 0 then
+      update public.orders set status = 'served', paid_at = null, updated_at = now()
+       where id = v_pay.order_id and status = 'paid';
+    end if;
+  end if;
+end $fn$;
+revoke all on function public.void_payment(uuid, text) from public;
+grant execute on function public.void_payment(uuid, text) to authenticated, service_role;
+
+create or replace function public.cancel_order(p_order_id uuid, p_reason text)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_status app.order_status;
+begin
+  if not app.has_perm('orders.cancel') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select status into v_status from public.orders where id = p_order_id;
+  if not found then raise exception 'order_not_found' using errcode = 'no_data_found'; end if;
+  if v_status = 'void' then return; end if;
+  if v_status = 'paid' then
+    raise exception 'refund_before_cancel' using errcode = 'check_violation';
+  end if;
+  update public.orders set status = 'void', updated_at = now() where id = p_order_id;
+  insert into public.order_adjustments (order_id, kind, reason, actor_id, portal_id)
+  values (p_order_id, 'void', coalesce(nullif(trim(p_reason), ''), 'cancelled'),
+          app.jwt_sub(), app.current_portal_id());
+end $fn$;
+revoke all on function public.cancel_order(uuid, text) from public;
+grant execute on function public.cancel_order(uuid, text) to authenticated, service_role;
+
+create or replace function public.apply_order_discount(p_order_id uuid, p_discount_cents int, p_reason text)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_old int;
+begin
+  if not app.has_perm('orders.apply_discount') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select coalesce(discount_cents, 0) into v_old from public.orders where id = p_order_id;
+  if not found then raise exception 'order_not_found' using errcode = 'no_data_found'; end if;
+  update public.orders set discount_cents = greatest(0, coalesce(p_discount_cents, 0)) where id = p_order_id;
+  perform app.recalc_order_totals(p_order_id);
+  insert into public.order_adjustments
+    (order_id, kind, old_value_cents, new_value_cents, reason, actor_id, portal_id)
+  values (p_order_id, 'discount', v_old, greatest(0, coalesce(p_discount_cents, 0)),
+          coalesce(nullif(trim(p_reason), ''), 'discount'), app.jwt_sub(), app.current_portal_id());
+end $fn$;
+revoke all on function public.apply_order_discount(uuid, int, text) from public;
+grant execute on function public.apply_order_discount(uuid, int, text) to authenticated, service_role;
+
+create or replace function public.override_line_price(p_line_id uuid, p_unit_price_cents int, p_reason text)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_line public.order_lines;
+begin
+  if not app.has_perm('orders.override_price') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_unit_price_cents, -1) < 0 then
+    raise exception 'bad_price' using errcode = 'check_violation';
+  end if;
+  select * into v_line from public.order_lines where id = p_line_id;
+  if not found then raise exception 'line_not_found' using errcode = 'no_data_found'; end if;
+  update public.order_lines
+     set unit_price_cents = p_unit_price_cents, line_total_cents = p_unit_price_cents * qty
+   where id = p_line_id;
+  perform app.recalc_order_totals(v_line.order_id);
+  insert into public.order_adjustments
+    (order_id, line_id, kind, old_value_cents, new_value_cents, reason, actor_id, portal_id)
+  values (v_line.order_id, p_line_id, 'price_override', v_line.unit_price_cents, p_unit_price_cents,
+          coalesce(nullif(trim(p_reason), ''), 'price override'), app.jwt_sub(), app.current_portal_id());
+end $fn$;
+revoke all on function public.override_line_price(uuid, int, text) from public;
+grant execute on function public.override_line_price(uuid, int, text) to authenticated, service_role;
+
+create or replace function public.reopen_order(p_order_id uuid, p_reason text)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_status app.order_status;
+begin
+  if not app.has_perm('orders.reopen') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select status into v_status from public.orders where id = p_order_id;
+  if not found then raise exception 'order_not_found' using errcode = 'no_data_found'; end if;
+  if v_status not in ('served', 'paid') then return; end if;
+  update public.orders
+     set status = 'ready', paid_at = case when v_status = 'paid' then null else paid_at end,
+         updated_at = now()
+   where id = p_order_id;
+  insert into public.order_adjustments (order_id, kind, reason, actor_id, portal_id)
+  values (p_order_id, 'reopen', coalesce(nullif(trim(p_reason), ''), 'reopened'),
+          app.jwt_sub(), app.current_portal_id());
+end $fn$;
+revoke all on function public.reopen_order(uuid, text) from public;
+grant execute on function public.reopen_order(uuid, text) to authenticated, service_role;
+
+-- ── Kitchen Portal (P5) ─────────────────────────────────────────────────
+create or replace function public.kitchen_start_order(p_order_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_status app.order_status;
+begin
+  if not app.has_perm('kitchen.update_status') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select status into v_status from public.orders where id = p_order_id;
+  if not found then raise exception 'order_not_found' using errcode = 'no_data_found'; end if;
+  if v_status in ('void', 'paid', 'served') then
+    raise exception 'order_not_active' using errcode = 'check_violation';
+  end if;
+  update public.order_lines set kds_status = 'preparing'
+   where order_id = p_order_id and kds_status = 'queued';
+  update public.orders set status = 'in_kitchen', updated_at = now()
+   where id = p_order_id and status = 'pending';
+  perform app.log_action('kitchen.start', 'orders', p_order_id::text);
+end $fn$;
+revoke all on function public.kitchen_start_order(uuid) from public;
+grant execute on function public.kitchen_start_order(uuid) to authenticated, service_role;
+
+create or replace function public.kitchen_mark_ready(p_order_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_status app.order_status;
+begin
+  if not app.has_perm('kitchen.update_status') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select status into v_status from public.orders where id = p_order_id;
+  if not found then raise exception 'order_not_found' using errcode = 'no_data_found'; end if;
+  if v_status in ('void', 'paid', 'served') then
+    raise exception 'order_not_active' using errcode = 'check_violation';
+  end if;
+  update public.order_lines set kds_status = 'ready'
+   where order_id = p_order_id and kds_status <> 'served';
+  update public.orders set status = 'ready', updated_at = now() where id = p_order_id;
+  perform app.log_action('kitchen.ready', 'orders', p_order_id::text);
+end $fn$;
+revoke all on function public.kitchen_mark_ready(uuid) from public;
+grant execute on function public.kitchen_mark_ready(uuid) to authenticated, service_role;
+
+-- Kitchen picks which counter this order goes to (e.g. Counter 1 vs Counter
+-- 2) — the assignment the customer's tracking page then shows by name
+-- instead of listing every active checkout counter.
+create or replace function public.kitchen_set_pickup_counter(p_order_id uuid, p_portal_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not app.has_perm('kitchen.update_status') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if not exists (
+    select 1 from public.portals where id = p_portal_id and type = 'checkout' and status = 'active'
+  ) then
+    raise exception 'invalid_counter' using errcode = 'check_violation';
+  end if;
+  update public.orders set pickup_counter_portal_id = p_portal_id, updated_at = now()
+   where id = p_order_id;
+  if not found then raise exception 'order_not_found' using errcode = 'no_data_found'; end if;
+  perform app.log_action('kitchen.pickup_counter', 'orders', p_order_id::text, null, jsonb_build_object('portal_id', p_portal_id));
+end $fn$;
+revoke all on function public.kitchen_set_pickup_counter(uuid, uuid) from public;
+grant execute on function public.kitchen_set_pickup_counter(uuid, uuid) to authenticated, service_role;
+
+create or replace function public.kitchen_complete_order(p_order_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_status app.order_status;
+begin
+  if not app.has_perm('kitchen.update_status') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select status into v_status from public.orders where id = p_order_id;
+  if not found then raise exception 'order_not_found' using errcode = 'no_data_found'; end if;
+  if v_status in ('void', 'paid') then
+    raise exception 'order_not_active' using errcode = 'check_violation';
+  end if;
+  update public.order_lines set kds_status = 'served'
+   where order_id = p_order_id and kds_status <> 'served';
+  update public.orders set status = 'served', updated_at = now()
+   where id = p_order_id and status <> 'served';
+  perform app.log_action('kitchen.complete', 'orders', p_order_id::text);
+end $fn$;
+revoke all on function public.kitchen_complete_order(uuid) from public;
+grant execute on function public.kitchen_complete_order(uuid) to authenticated, service_role;
+
+create or replace function public.kitchen_set_line_status(p_line_id uuid, p_status text)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_order uuid; v_all boolean;
+begin
+  if not app.has_perm('kitchen.update_status') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_status not in ('queued', 'preparing', 'ready', 'served') then
+    raise exception 'bad_status' using errcode = 'check_violation';
+  end if;
+  update public.order_lines set kds_status = p_status::app.line_status
+   where id = p_line_id returning order_id into v_order;
+  if v_order is null then raise exception 'line_not_found' using errcode = 'no_data_found'; end if;
+
+  select bool_and(kds_status in ('ready', 'served')) into v_all
+    from public.order_lines where order_id = v_order;
+  if v_all then
+    update public.orders set status = 'ready', updated_at = now()
+     where id = v_order and status not in ('served', 'paid', 'void');
+  end if;
+  perform app.log_action('kitchen.line_status', 'order_lines', p_line_id::text,
+                         null, jsonb_build_object('kds_status', p_status));
+end $fn$;
+revoke all on function public.kitchen_set_line_status(uuid, text) from public;
+grant execute on function public.kitchen_set_line_status(uuid, text) to authenticated, service_role;
+
+create table public.food_stock_log (
+  id         uuid primary key default gen_random_uuid(),
+  variant_id uuid references public.menu_variants(id) on delete cascade,
+  delta      int,
+  new_qty    int,
+  reason     text not null check (reason in
+             ('waste','prepared','recount','closing','out_of_stock','restock')),
+  actor_id   uuid,
+  portal_id  uuid,
+  note       text,
+  created_at timestamptz not null default now()
+);
+create index food_stock_log_variant_idx on public.food_stock_log(variant_id, created_at desc);
+alter table public.food_stock_log enable row level security;
+create policy staff_read on public.food_stock_log for select using (app.has_perm('stock.view') or app.is_staff());
+
+create or replace function public.set_food_stock(
+  p_variant_id uuid, p_new_qty int, p_reason text, p_note text default null
+) returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_old int;
+begin
+  if not (app.has_perm('kitchen.manage_availability') or app.has_perm('stock.update')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_new_qty, -1) < 0 then raise exception 'bad_qty' using errcode = 'check_violation'; end if;
+  if coalesce(p_reason, '') not in ('recount','prepared','closing','restock','out_of_stock') then
+    raise exception 'bad_reason' using errcode = 'check_violation';
+  end if;
+  select available_qty into v_old from public.menu_variants where id = p_variant_id;
+  if not found then raise exception 'variant_not_found' using errcode = 'no_data_found'; end if;
+
+  update public.menu_variants
+     set available_qty = p_new_qty,
+         track_availability = true,
+         is_available = case when p_reason = 'out_of_stock' or p_new_qty = 0 then false else true end
+   where id = p_variant_id;
+
+  insert into public.food_stock_log (variant_id, delta, new_qty, reason, actor_id, portal_id, note)
+  values (p_variant_id, p_new_qty - v_old, p_new_qty, p_reason, app.jwt_sub(), app.current_portal_id(), p_note);
+  perform app.log_action('kitchen.set_stock', 'menu_variants', p_variant_id::text,
+                         jsonb_build_object('available_qty', v_old),
+                         jsonb_build_object('available_qty', p_new_qty, 'reason', p_reason));
+end $fn$;
+revoke all on function public.set_food_stock(uuid, int, text, text) from public;
+-- 0066: retired (legacy manual counters); service role only.
+grant execute on function public.set_food_stock(uuid, int, text, text) to service_role;
+
+create or replace function public.set_variant_available(
+  p_variant_id uuid, p_available boolean, p_reason text default null
+) returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('kitchen.manage_availability') or app.has_perm('availability.update')
+          or app.has_perm('menu.update')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.menu_variants set is_available = p_available where id = p_variant_id;
+  if not found then raise exception 'variant_not_found' using errcode = 'no_data_found'; end if;
+  perform app.log_action('kitchen.availability', 'menu_variants', p_variant_id::text,
+                         null, jsonb_build_object('is_available', p_available, 'reason', p_reason));
+end $fn$;
+revoke all on function public.set_variant_available(uuid, boolean, text) from public;
+grant execute on function public.set_variant_available(uuid, boolean, text) to authenticated, service_role;
+
+create or replace function public.record_waste(
+  p_variant_id uuid, p_qty int, p_reason text, p_note text default null
+) returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_old int; v_new int;
+begin
+  if not app.has_perm('kitchen.record_waste') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_qty, 0) <= 0 then raise exception 'bad_qty' using errcode = 'check_violation'; end if;
+  select available_qty into v_old from public.menu_variants where id = p_variant_id;
+  if not found then raise exception 'variant_not_found' using errcode = 'no_data_found'; end if;
+  v_new := greatest(0, v_old - p_qty);
+  update public.menu_variants
+     set available_qty = v_new, track_availability = true,
+         is_available = case when v_new = 0 then false else is_available end
+   where id = p_variant_id;
+  insert into public.food_stock_log (variant_id, delta, new_qty, reason, actor_id, portal_id, note)
+  values (p_variant_id, -p_qty, v_new, 'waste', app.jwt_sub(), app.current_portal_id(),
+          coalesce(nullif(trim(p_reason), ''), p_note));
+  perform app.log_action('kitchen.waste', 'menu_variants', p_variant_id::text,
+                         jsonb_build_object('available_qty', v_old),
+                         jsonb_build_object('available_qty', v_new, 'wasted', p_qty, 'reason', p_reason));
+end $fn$;
+revoke all on function public.record_waste(uuid, int, text, text) from public;
+grant execute on function public.record_waste(uuid, int, text, text) to service_role;
+
+alter publication supabase_realtime add table public.menu_variants;
+
+-- Created ahead of its "Attendance & business settings" section below:
+-- app.promotion_is_valid_now() (in Promotions, just past this point) is a
+-- `language sql` function, whose body — unlike a plpgsql function's — is
+-- parsed and validated against the catalog at CREATE FUNCTION time, so the
+-- table it queries must already exist here. RLS/policies for it stay in
+-- their original spot since those only need the table to exist by then.
+create table public.business_settings (
+  id                        boolean primary key default true check (id),
+  timezone                  text not null default 'UTC',
+  business_day_start_minutes int not null default 0,
+  currency_code             text not null default 'USD',
+  week_start                int not null default 1,
+  -- Configurable approval policy (spec: "Action + amount + role + policy
+  -- = authorization" — never hardcode a threshold when the restaurant
+  -- should be able to set its own). Null = no ceiling, i.e. today's
+  -- behavior unchanged: anyone holding payments.refund can refund any
+  -- amount. Set by an owner/manager in Settings; enforced inside
+  -- refund_payment() below, never only in the UI.
+  max_refund_without_approval_cents int,
+  -- Receipt customization (0045) — null receipt_template_html means "use
+  -- the built-in printed-receipt layout"; when set it's plain HTML with
+  -- {{placeholder}} tokens substituted client-side before printing.
+  -- brand_logo_url (0046) is this restaurant's one general-purpose logo —
+  -- also used on receipts/PDFs; not duplicated under a receipt-specific name.
+  brand_logo_url       text,
+  receipt_footer_text  text,
+  receipt_template_html text,
+  -- Brand Kit (0046) — the restaurant's visual identity, in the SAME
+  -- token shape apps/web/src/lib/theme.ts's ThemeTokens already defines
+  -- (persisted here instead of per-browser localStorage). Null means "use
+  -- the built-in default theme" throughout.
+  brand_primary        text,
+  brand_primary_fg     text,
+  brand_bg_main        text,
+  brand_bg_surface     text,
+  brand_border         text,
+  brand_text_body      text,
+  brand_text_muted     text,
+  brand_radius         text,
+  brand_appearance     text check (brand_appearance in ('light', 'dark', 'system')),
+  -- Restaurant contact fields (0048) — the "Restaurant Information"
+  -- receipt section's data source; nothing in this schema stored these
+  -- before (restaurant_name/slug live control-plane side only).
+  address              text,
+  phone                text,
+  contact_email        text,
+  website               text,
+  tax_registration_number text,
+  -- Structured, section-based receipt template (0048). Null = this
+  -- restaurant never configured one — receipt rendering falls back to
+  -- the existing receipt_footer_text/receipt_template_html behavior.
+  receipt_config       jsonb,
+  -- Portal identity (0049) — the browser <title> every portal page and
+  -- sub-page inherits (via Next.js title templates). Null falls back to
+  -- the restaurant's own name (control-plane tenants.restaurant_name).
+  meta_title           text,
+  -- Plan entitlements (0055) — synced from the control-plane subscription
+  -- by apps/api/src/lib/entitlementSync.ts; not writable by tenant staff.
+  -- Lets this project enforce its OWN plan (e.g. the Brand Kit trigger
+  -- below) without a round trip to the control plane on every write.
+  plan_tier            text,
+  plan_features         text[] not null default '{}'
+);
+insert into public.business_settings (id) values (true);
+
+-- Narrow, anon-safe read of ONLY the visual-identity columns (0046) — see
+-- tenant-migrations/0046_brand_kit.sql for the full rationale.
+create or replace function public.get_brand_kit()
+returns table(
+  logo_url text, primary_color text, primary_fg text,
+  bg_main text, bg_surface text, border_color text,
+  text_body text, text_muted text, radius text, appearance text,
+  meta_title text
+)
+language sql stable security definer set search_path = public as $$
+  select brand_logo_url, brand_primary, brand_primary_fg,
+         brand_bg_main, brand_bg_surface, brand_border,
+         brand_text_body, brand_text_muted, brand_radius, brand_appearance,
+         meta_title
+  from public.business_settings where id = true
+$$;
+revoke all on function public.get_brand_kit() from public;
+grant execute on function public.get_brand_kit() to anon, authenticated, service_role;
+
+-- Real, DB-level entitlement enforcement (0055) — only menu.branded has an
+-- obvious single write surface (the brand_* columns) worth blocking; the
+-- other enforceable features are read-side, gated in the frontend instead.
+create or replace function app.enforce_plan_entitlements()
+returns trigger language plpgsql as $fn$
+begin
+  -- business_settings' own mgr_write RLS policy lets anyone holding
+  -- settings.update (e.g. the Owner) write ANY column on this row —
+  -- without this check, a tenant could simply set plan_features itself
+  -- and hand itself entitlements it doesn't actually have. Only the
+  -- service-role sync (entitlementSync.ts) may ever change these two.
+  if app.jwt_role() is distinct from 'service_role' then
+    if new.plan_tier is distinct from old.plan_tier
+    or new.plan_features is distinct from old.plan_features
+    then
+      raise exception 'plan_tier/plan_features are managed by the platform and cannot be changed directly'
+        using errcode = '42501';
+    end if;
+  end if;
+
+  if not ('menu.branded' = any(coalesce(new.plan_features, '{}'))) then
+    if new.brand_logo_url      is distinct from old.brand_logo_url
+    or new.brand_primary       is distinct from old.brand_primary
+    or new.brand_primary_fg    is distinct from old.brand_primary_fg
+    or new.brand_bg_main       is distinct from old.brand_bg_main
+    or new.brand_bg_surface    is distinct from old.brand_bg_surface
+    or new.brand_border        is distinct from old.brand_border
+    or new.brand_text_body     is distinct from old.brand_text_body
+    or new.brand_text_muted    is distinct from old.brand_text_muted
+    or new.brand_radius        is distinct from old.brand_radius
+    or new.brand_appearance    is distinct from old.brand_appearance
+    then
+      raise exception 'menu.branded is not included in this restaurant''s current plan'
+        using errcode = '42501';
+    end if;
+  end if;
+  return new;
+end;
+$fn$;
+
+create trigger enforce_plan_entitlements_brand
+  before update on public.business_settings
+  for each row execute function app.enforce_plan_entitlements();
+
+-- ── Promotions ───────────────────────────────────────────────────────────
+-- (app.promo_kind is created earlier, right before place_order() — see the
+-- comment there.)
+create table public.promotions (
+  id                uuid primary key default gen_random_uuid(),
+  name              text not null,
+  kind              app.promo_kind not null default 'percent',
+  value_bps         int check (value_bps between 0 and 10000), -- for percent
+  value_cents       int check (value_cents >= 0),              -- for fixed
+  code              text unique,
+  min_subtotal_cents int not null default 0,
+  active            boolean not null default true,
+  starts_at         timestamptz,
+  ends_at           timestamptz,
+  -- Happy-hour scheduling (spec: time-based scheduling): both null means
+  -- "every day, all day" — the pre-existing unscheduled behavior.
+  days_of_week      smallint[], -- 0=Sunday..6=Saturday; null = every day
+  start_time        time,       -- null = no lower bound
+  end_time          time,       -- null = no upper bound
+  -- Usage limit (spec: promo codes with usage limits). usage_count is bumped
+  -- atomically by place_order() at redemption time — the same
+  -- update-where-still-true-then-check-affected-rows pattern used for deal
+  -- and variant availability, so a race for the last redemption can't
+  -- double-spend it. Per-customer limits are deferred: this system has no
+  -- customer identity (guest orders carry only a free-text name), so there
+  -- is nothing stable to key a per-customer count on yet.
+  usage_limit_total int check (usage_limit_total is null or usage_limit_total > 0),
+  usage_count       int not null default 0,
+  -- Auto-apply (spec: automatic happy-hour/time-based discounts that need
+  -- no code): place_order() applies the best eligible auto_apply promotion
+  -- itself when no code was entered (or the entered one didn't discount
+  -- anything) — see best_auto_promotion() below. A code-bearing promo may
+  -- ALSO be auto_apply; the two are independent.
+  auto_apply        boolean not null default false,
+  -- BOGO (spec: buy-X-get-Y). Only meaningful when kind = 'bogo' — the
+  -- other kinds leave these null, same convention as value_bps/value_cents
+  -- being null for the kind that doesn't use them. v1 scope: one specific
+  -- menu item, code-required (not auto_apply — see best_auto_promotion()),
+  -- computed from the order's own lines at redemption time since it needs
+  -- to know how many of that item were actually bought, not just the
+  -- subtotal (see bogo_discount_for_order() below).
+  bogo_menu_item_id     uuid references public.menu_items(id) on delete cascade,
+  bogo_buy_qty          int check (bogo_buy_qty is null or bogo_buy_qty > 0),
+  bogo_get_qty          int check (bogo_get_qty is null or bogo_get_qty > 0),
+  bogo_get_discount_bps int check (bogo_get_discount_bps is null or bogo_get_discount_bps between 0 and 10000),
+  created_at        timestamptz not null default now()
+);
+
+-- discount fields on orders (place_order takes p_discount_cents)
+alter table public.orders add column discount_cents int not null default 0 check (discount_cents >= 0);
+alter table public.orders add column promo_code text;
+
+-- Every validity rule a promotion must pass to apply RIGHT NOW, shared by
+-- promo_discount(), best_auto_promotion() and place_order()'s explicit-code
+-- lookup so they can never disagree about whether a promotion is currently
+-- eligible. Takes the whole row (avoids re-querying it) plus the order
+-- subtotal being evaluated against min_subtotal_cents.
+create or replace function app.promotion_is_valid_now(p public.promotions, p_subtotal_cents int)
+returns boolean language sql stable as $fn$
+  select p.active
+     and p_subtotal_cents >= p.min_subtotal_cents
+     and (p.starts_at is null or p.starts_at <= now())
+     and (p.ends_at is null or p.ends_at >= now())
+     and (p.usage_limit_total is null or p.usage_count < p.usage_limit_total)
+     and (p.days_of_week is null or extract(
+            dow from (now() at time zone coalesce((select timezone from public.business_settings where id), 'UTC'))
+          )::smallint = any(p.days_of_week))
+     and (p.start_time is null or
+          (now() at time zone coalesce((select timezone from public.business_settings where id), 'UTC'))::time >= p.start_time)
+     and (p.end_time is null or
+          (now() at time zone coalesce((select timezone from public.business_settings where id), 'UTC'))::time <= p.end_time);
+$fn$;
+
+-- BOGO discount for an already-placed order's lines: total qty of the
+-- target item actually bought (à la carte lines only — deal-embedded
+-- copies of the item don't count, same as everywhere else in this file
+-- that reasons about "what was really purchased"), how many of those
+-- qualify as the discounted "get" units under buy_qty/get_qty, and which
+-- specific units get discounted — the CHEAPEST ones first (the
+-- customer-favorable, standard retail convention when variants price
+-- differently), each by bogo_get_discount_bps.
+create or replace function public.bogo_discount_for_order(p_order_id uuid, p_promotion_id uuid)
+returns int language plpgsql stable security definer set search_path = public, app as $fn$
+declare
+  v_buy int; v_get int; v_bps int; v_item_id uuid;
+  v_total_qty int; v_free_units int; v_remaining int; v_take int;
+  v_discount int := 0;
+  v_line record;
+begin
+  select bogo_buy_qty, bogo_get_qty, bogo_get_discount_bps, bogo_menu_item_id
+    into v_buy, v_get, v_bps, v_item_id
+    from public.promotions where id = p_promotion_id and kind = 'bogo';
+  if v_item_id is null or v_buy is null or v_get is null then
+    return 0;
+  end if;
+
+  select coalesce(sum(qty), 0) into v_total_qty
+    from public.order_lines
+   where order_id = p_order_id and menu_item_id = v_item_id and deal_id is null;
+
+  v_free_units := (v_total_qty / (v_buy + v_get)) * v_get;
+  if v_free_units <= 0 then
+    return 0;
+  end if;
+
+  v_remaining := v_free_units;
+  for v_line in
+    select qty, unit_price_cents from public.order_lines
+     where order_id = p_order_id and menu_item_id = v_item_id and deal_id is null
+     order by unit_price_cents asc
+  loop
+    exit when v_remaining <= 0;
+    v_take := least(v_line.qty, v_remaining);
+    v_discount := v_discount + round(v_take * v_line.unit_price_cents * coalesce(v_bps, 0) / 10000.0);
+    v_remaining := v_remaining - v_take;
+  end loop;
+
+  return v_discount;
+end;
+$fn$;
+revoke all on function public.bogo_discount_for_order(uuid, uuid) from public;
+grant execute on function public.bogo_discount_for_order(uuid, uuid) to authenticated, service_role;
+
+-- Validate a code and return the discount for a given subtotal (0 if
+-- invalid, or if it's a BOGO code — that needs the actual cart contents to
+-- compute, which this endpoint doesn't have; see bogo_discount_for_order())
+-- — schedule, usage-limit and min-subtotal checks all live in
+-- app.promotion_is_valid_now() so the storefront's live preview
+-- (/api/public/promo) and place_order's real redemption can never disagree
+-- about whether a code is currently valid.
+create or replace function public.promo_discount(p_code text, p_subtotal_cents int)
+returns int language sql stable security definer set search_path = public, app as $fn$
+  select coalesce((
+    select case
+      when p.kind = 'percent' then (p_subtotal_cents * coalesce(p.value_bps, 0) / 10000)
+      when p.kind = 'fixed' then least(coalesce(p.value_cents, 0), p_subtotal_cents)
+      else 0
+    end
+    from public.promotions p
+    where lower(p.code) = lower(p_code)
+      and app.promotion_is_valid_now(p, p_subtotal_cents)
+    limit 1
+  ), 0);
+$fn$;
+grant execute on function public.promo_discount(text, int) to authenticated, service_role, anon;
+
+-- The single best currently-eligible auto_apply promotion for a subtotal
+-- (same validity checks as promo_discount, minus the code match — instead
+-- filtered to auto_apply promotions, ranked by whichever discounts the
+-- most). place_order() calls this when no explicit code produced a
+-- discount, so a scheduled happy-hour promo actually fires on its own —
+-- the gap a code-only design would otherwise leave. BOGO is excluded here:
+-- auto-apply BOGO would need this to know cart contents, not just the
+-- subtotal — deferred, BOGO is code-required for now (see the table comment).
+create or replace function public.best_auto_promotion(p_subtotal_cents int)
+returns table (id uuid, discount_cents int)
+language sql stable security definer set search_path = public, app as $fn$
+  select p.id,
+         case
+           when p.kind = 'percent' then (p_subtotal_cents * coalesce(p.value_bps, 0) / 10000)
+           else least(coalesce(p.value_cents, 0), p_subtotal_cents)
+         end as discount_cents
+    from public.promotions p
+   where p.auto_apply
+     and p.kind in ('percent', 'fixed')
+     and app.promotion_is_valid_now(p, p_subtotal_cents)
+   order by discount_cents desc
+   limit 1;
+$fn$;
+grant execute on function public.best_auto_promotion(int) to authenticated, service_role;
+
+-- Storefront code preview: unlike promo_discount() (which folds "invalid"
+-- and "valid but this endpoint can't compute it" into the same 0), this
+-- tells the caller WHICH one it is — a BOGO code is real and will apply at
+-- checkout, it just can't show a dollar figure without the actual cart.
+create or replace function public.promo_preview(p_code text, p_subtotal_cents int)
+returns table (kind app.promo_kind, discount_cents int)
+language sql stable security definer set search_path = public, app as $fn$
+  select p.kind,
+         case
+           when p.kind = 'percent' then (p_subtotal_cents * coalesce(p.value_bps, 0) / 10000)
+           when p.kind = 'fixed' then least(coalesce(p.value_cents, 0), p_subtotal_cents)
+           else 0
+         end
+    from public.promotions p
+   where lower(p.code) = lower(p_code) and app.promotion_is_valid_now(p, p_subtotal_cents)
+   limit 1;
+$fn$;
+grant execute on function public.promo_preview(text, int) to authenticated, service_role, anon;
+
+alter table public.promotions enable row level security;
+create policy staff_read on public.promotions for select using (app.has_perm('menu.view') or app.is_staff());
+create policy mgr_write on public.promotions for all using (app.has_perm('menu.update') or app.can_write()) with check (app.has_perm('menu.update') or app.can_write());
+-- anon may read active promos so the storefront can validate a code
+create policy guest_read on public.promotions for select using (active);
+
+-- One row per successful promo-code redemption (spec: promotion analytics).
+-- Written only by place_order() (security definer) at the point usage_count
+-- is bumped — never directly by staff or the storefront.
+create table public.promotion_redemptions (
+  id            uuid primary key default gen_random_uuid(),
+  promotion_id  uuid not null references public.promotions(id) on delete cascade,
+  order_id      uuid references public.orders(id) on delete set null,
+  discount_cents int not null,
+  redeemed_at   timestamptz not null default now()
+);
+create index promotion_redemptions_promo_idx on public.promotion_redemptions(promotion_id, redeemed_at desc);
+alter table public.promotion_redemptions enable row level security;
+create policy staff_read on public.promotion_redemptions for select using (app.has_perm('menu.view') or app.is_staff());
+
+-- Per-promotion redemption count, total discount given and total revenue of
+-- the orders it was applied to, over an optional window (both bounds null =
+-- all time). Same authoritative-calc-layer principle as period_profitability
+-- etc: this is the one place that answers "how is this promo doing" for
+-- both the Promotions page and the AI assistant.
+create or replace function public.promotion_performance(p_from timestamptz default null, p_to timestamptz default null)
+returns table (
+  promotion_id uuid, name text, code text, kind app.promo_kind,
+  redemptions bigint, total_discount_cents bigint, total_order_revenue_cents bigint,
+  usage_limit_total int, usage_count int
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not app.has_perm('menu.view') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select p.id, p.name, p.code, p.kind,
+           count(r.id)::bigint,
+           coalesce(sum(r.discount_cents), 0)::bigint,
+           coalesce(sum(o.total_cents), 0)::bigint,
+           p.usage_limit_total, p.usage_count
+      from public.promotions p
+      left join public.promotion_redemptions r
+        on r.promotion_id = p.id
+       and (p_from is null or r.redeemed_at >= p_from)
+       and (p_to   is null or r.redeemed_at <  p_to)
+      left join public.orders o on o.id = r.order_id
+     group by p.id, p.name, p.code, p.kind, p.usage_limit_total, p.usage_count
+     order by count(r.id) desc, p.name;
+end;
+$fn$;
+revoke all on function public.promotion_performance(timestamptz, timestamptz) from public;
+grant execute on function public.promotion_performance(timestamptz, timestamptz) to authenticated, service_role;
+
+-- ── Suppliers & purchasing ───────────────────────────────────────────────
+create type app.po_status as enum ('draft', 'sent', 'partial', 'received', 'cancelled');
+
+create table public.suppliers (
+  id            uuid primary key default gen_random_uuid(),
+  name          text not null,
+  contact_name  text,
+  email         text,
+  phone         text,
+  address       text,
+  payment_terms text,
+  notes         text,
+  currency            text not null default 'USD',
+  credit_period_days  int not null default 30,   -- used to default an invoice's due_date when not stated
+  preferred_payment_method text,
+  is_active           boolean not null default true,
+  created_at    timestamptz not null default now()
+);
+
+create table public.po_counter (
+  id boolean primary key default true check (id),
+  next_number bigint not null default 1
+);
+insert into public.po_counter default values;
+
+create table public.purchase_orders (
+  id          uuid primary key default gen_random_uuid(),
+  po_number   bigint not null unique,
+  supplier_id uuid references public.suppliers(id) on delete set null,
+  status      app.po_status not null default 'draft',
+  expected_at date,
+  notes       text,
+  -- Approval gate (spec §6-7): a PO can't be sent until approved_at is set.
+  -- Kept as a plain timestamp rather than new enum values — safer than an
+  -- ALTER TYPE ADD VALUE mid-migration, and simpler than it needs to be.
+  requested_by       uuid,
+  approved_by        uuid,
+  approved_at        timestamptz,
+  sent_at            timestamptz,
+  payment_terms_days int,
+  subtotal_cents     int not null default 0,   -- maintained by a trigger off the lines below
+  created_at  timestamptz not null default now(),
+  received_at timestamptz
+);
+
+create table public.purchase_order_lines (
+  id                uuid primary key default gen_random_uuid(),
+  purchase_order_id uuid not null references public.purchase_orders(id) on delete cascade,
+  inventory_item_id uuid references public.inventory_items(id) on delete set null,
+  description       text not null,
+  qty               numeric(14,3) not null check (qty > 0),
+  unit_cost_cents   int not null default 0 check (unit_cost_cents >= 0),
+  received_qty       numeric(14,3) not null default 0,
+  -- Accept/reject split on receiving (spec §10): only (received_qty -
+  -- rejected_qty) ever reaches inventory — see receive_purchase_order_line().
+  rejected_qty       numeric(14,3) not null default 0,
+  reject_reason      text
+);
+create index po_lines_po_idx on public.purchase_order_lines(purchase_order_id);
+
+create or replace function app.recalc_po_subtotal() returns trigger
+language plpgsql set search_path = public, app as $fn$
+declare v_po uuid;
+begin
+  v_po := coalesce(new.purchase_order_id, old.purchase_order_id);
+  update public.purchase_orders
+     set subtotal_cents = coalesce(
+       (select sum(pol.qty * pol.unit_cost_cents) from public.purchase_order_lines pol where pol.purchase_order_id = v_po), 0)
+   where id = v_po;
+  return null;
+end $fn$;
+create trigger recalc_po_subtotal after insert or update or delete on public.purchase_order_lines
+  for each row execute function app.recalc_po_subtotal();
+
+alter table public.suppliers enable row level security;
+alter table public.purchase_orders enable row level security;
+alter table public.purchase_order_lines enable row level security;
+alter table public.po_counter enable row level security; -- functions only
+create policy staff_read on public.suppliers for select using (app.has_perm('supplier.view') or app.is_staff());
+create policy mgr_write on public.suppliers for all using (app.has_perm('supplier.manage') or app.can_write()) with check (app.has_perm('supplier.manage') or app.can_write());
+create policy staff_read on public.purchase_orders for select using (app.has_perm('purchases.view') or app.is_staff());
+create policy mgr_write on public.purchase_orders for all using (app.has_perm('purchases.update') or app.can_write()) with check (app.has_perm('purchases.update') or app.can_write());
+create policy staff_read on public.purchase_order_lines for select using (app.has_perm('purchases.view') or app.is_staff());
+create policy mgr_write on public.purchase_order_lines for all using (app.has_perm('purchases.update') or app.can_write()) with check (app.has_perm('purchases.update') or app.can_write());
+
+create or replace function public.next_po_number() returns bigint
+language plpgsql security definer set search_path = public, app as $fn$
+declare v bigint;
+begin
+  update public.po_counter set next_number = next_number + 1 where id returning next_number - 1 into v;
+  return v;
+end $fn$;
+grant execute on function public.next_po_number() to authenticated, service_role;
+
+create or replace function public.approve_purchase_order(p_po_id uuid) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('purchases.approve') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.purchase_orders set approved_by = app.jwt_sub(), approved_at = now()
+   where id = p_po_id and status = 'draft';
+  if not found then raise exception 'not_approvable' using errcode = 'check_violation'; end if;
+end $fn$;
+revoke all on function public.approve_purchase_order(uuid) from public;
+grant execute on function public.approve_purchase_order(uuid) to authenticated, service_role;
+
+-- A PO can't be sent until it's been approved (spec §6-7).
+create or replace function public.send_purchase_order(p_po_id uuid) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_approved timestamptz;
+begin
+  if not (app.has_perm('purchases.update') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select approved_at into v_approved from public.purchase_orders where id = p_po_id;
+  if not found then raise exception 'po_not_found' using errcode = 'no_data_found'; end if;
+  if v_approved is null then raise exception 'not_approved' using errcode = 'check_violation'; end if;
+  update public.purchase_orders set status = 'sent', sent_at = now() where id = p_po_id and status = 'draft';
+end $fn$;
+revoke all on function public.send_purchase_order(uuid) from public;
+grant execute on function public.send_purchase_order(uuid) to authenticated, service_role;
+
+-- Receive a PO in full: every outstanding line goes to fully received.
+-- purchase_order_lines.qty/received_qty are in the item's PURCHASE unit
+-- (e.g. "10 KG bags"); purchase_unit_to_base converts that to the base unit
+-- stock_qty is kept in (spec §6-7). Cost updates by weighted average across
+-- the existing balance and this receipt (spec §8) — the one costing method
+-- used everywhere, including the recipe-cost snapshot on order_lines.
+create or replace function public.receive_purchase_order(p_po_id uuid) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare r record; v_factor numeric; v_old_stock numeric; v_old_cost numeric;
+  v_recv_base numeric; v_receipt_cost_per_base numeric; v_new_cost numeric;
+begin
+  if not (app.has_perm('purchases.receive') or app.has_perm('inventory.manage_purchases') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  for r in
+    select id, inventory_item_id, qty, received_qty, unit_cost_cents from public.purchase_order_lines
+    where purchase_order_id = p_po_id
+  loop
+    if r.inventory_item_id is not null and r.qty > r.received_qty then
+      select purchase_unit_to_base, stock_qty, cost_cents_per_base_unit
+        into v_factor, v_old_stock, v_old_cost
+        from public.inventory_items where id = r.inventory_item_id;
+      v_recv_base := (r.qty - r.received_qty) * coalesce(v_factor, 1);
+      v_receipt_cost_per_base := r.unit_cost_cents / greatest(coalesce(v_factor, 1), 0.0001);
+      v_new_cost := case when (coalesce(v_old_stock, 0) + v_recv_base) > 0
+        then (coalesce(v_old_stock, 0) * coalesce(v_old_cost, 0) + v_recv_base * v_receipt_cost_per_base)
+             / (coalesce(v_old_stock, 0) + v_recv_base)
+        else coalesce(v_old_cost, 0) end;
+      update public.inventory_items
+         set stock_qty = stock_qty + v_recv_base, cost_cents_per_base_unit = v_new_cost
+       where id = r.inventory_item_id;
+      insert into public.stock_ledger (inventory_item_id, delta_qty, reason, note, unit_cost_cents_base)
+      values (r.inventory_item_id, v_recv_base, 'restock', 'PO receipt', v_receipt_cost_per_base);
+    end if;
+    update public.purchase_order_lines set received_qty = qty where id = r.id;
+  end loop;
+  update public.purchase_orders set status = 'received', received_at = now() where id = p_po_id;
+end $fn$;
+grant execute on function public.receive_purchase_order(uuid) to authenticated, service_role;
+
+-- Partial receiving with an accept/reject split (spec §10, §22): p_qty is
+-- the total physically delivered against this line (up to whatever's still
+-- outstanding); p_rejected_qty is however much of THAT was rejected
+-- (damaged/wrong/short). Only the accepted portion (p_qty - p_rejected_qty)
+-- ever reaches inventory — never marks the rest of the PO received. Same
+-- weighted-average costing as the full receive above.
+drop function if exists public.receive_purchase_order_line(uuid, numeric);
+create or replace function public.receive_purchase_order_line(
+  p_line_id uuid, p_qty numeric, p_rejected_qty numeric default 0, p_reject_reason text default null
+) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  r record; v_factor numeric; v_old_stock numeric; v_old_cost numeric;
+  v_take numeric; v_accept numeric; v_recv_base numeric; v_receipt_cost_per_base numeric; v_new_cost numeric;
+  v_remaining_lines int;
+begin
+  if not (app.has_perm('purchases.receive') or app.has_perm('inventory.manage_purchases') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_qty, 0) <= 0 then raise exception 'bad_qty' using errcode = 'check_violation'; end if;
+  if coalesce(p_rejected_qty, 0) < 0 or coalesce(p_rejected_qty, 0) > p_qty then
+    raise exception 'bad_rejected_qty' using errcode = 'check_violation';
+  end if;
+  select id, purchase_order_id, inventory_item_id, qty, received_qty, unit_cost_cents
+    into r from public.purchase_order_lines where id = p_line_id;
+  if not found then raise exception 'line_not_found' using errcode = 'foreign_key_violation'; end if;
+  v_take := least(p_qty, r.qty - r.received_qty);
+  if v_take <= 0 then raise exception 'nothing_outstanding' using errcode = 'check_violation'; end if;
+  v_accept := v_take - least(coalesce(p_rejected_qty, 0), v_take);
+
+  if r.inventory_item_id is not null and v_accept > 0 then
+    select purchase_unit_to_base, stock_qty, cost_cents_per_base_unit
+      into v_factor, v_old_stock, v_old_cost
+      from public.inventory_items where id = r.inventory_item_id;
+    v_recv_base := v_accept * coalesce(v_factor, 1);
+    v_receipt_cost_per_base := r.unit_cost_cents / greatest(coalesce(v_factor, 1), 0.0001);
+    v_new_cost := case when (coalesce(v_old_stock, 0) + v_recv_base) > 0
+      then (coalesce(v_old_stock, 0) * coalesce(v_old_cost, 0) + v_recv_base * v_receipt_cost_per_base)
+           / (coalesce(v_old_stock, 0) + v_recv_base)
+      else coalesce(v_old_cost, 0) end;
+    update public.inventory_items
+       set stock_qty = stock_qty + v_recv_base, cost_cents_per_base_unit = v_new_cost
+     where id = r.inventory_item_id;
+    insert into public.stock_ledger (inventory_item_id, delta_qty, reason, note, unit_cost_cents_base)
+    values (r.inventory_item_id, v_recv_base, 'restock', 'PO partial receipt', v_receipt_cost_per_base);
+  end if;
+  update public.purchase_order_lines
+     set received_qty = received_qty + v_take,
+         rejected_qty = rejected_qty + coalesce(p_rejected_qty, 0),
+         reject_reason = coalesce(p_reject_reason, reject_reason)
+   where id = p_line_id;
+
+  select count(*) into v_remaining_lines from public.purchase_order_lines
+   where purchase_order_id = r.purchase_order_id and received_qty < qty;
+  update public.purchase_orders
+     set status = case when v_remaining_lines = 0 then 'received'::app.po_status else 'partial'::app.po_status end,
+         received_at = case when v_remaining_lines = 0 then now() else received_at end
+   where id = r.purchase_order_id;
+end $fn$;
+revoke all on function public.receive_purchase_order_line(uuid, numeric, numeric, text) from public;
+grant execute on function public.receive_purchase_order_line(uuid, numeric, numeric, text) to authenticated, service_role;
+
+-- ── Supplier price catalog (spec §4-5) ──────────────────────────────────────
+-- A supplier isn't just linked to a generic ingredient — the same ingredient
+-- can have a different price per supplier, and that price's history must
+-- never be overwritten (only ever appended to).
+create table public.supplier_items (
+  id                     uuid primary key default gen_random_uuid(),
+  supplier_id            uuid not null references public.suppliers(id) on delete cascade,
+  inventory_item_id      uuid not null references public.inventory_items(id) on delete cascade,
+  supplier_sku           text,
+  supplier_item_name     text,
+  purchase_unit_label    text,
+  purchase_unit_to_base  numeric(14,4) not null default 1 check (purchase_unit_to_base > 0),
+  current_price_cents    int not null default 0 check (current_price_cents >= 0),
+  moq                    numeric(14,3),
+  lead_time_days         int,
+  is_preferred           boolean not null default false,
+  is_active              boolean not null default true,
+  updated_at             timestamptz not null default now(),
+  unique (supplier_id, inventory_item_id)
+);
+create index supplier_items_item_idx on public.supplier_items(inventory_item_id);
+
+create table public.supplier_price_history (
+  id                 uuid primary key default gen_random_uuid(),
+  supplier_item_id   uuid not null references public.supplier_items(id) on delete cascade,
+  old_price_cents    int,
+  new_price_cents    int not null,
+  pct_change         numeric(7,2),
+  effective_date     date not null default current_date,
+  source             text not null default 'manual' check (source in ('manual','purchase_order','invoice')),
+  reference_id       uuid,
+  created_at         timestamptz not null default now()
+);
+create index supplier_price_history_item_idx on public.supplier_price_history(supplier_item_id, effective_date desc);
+
+alter table public.supplier_items enable row level security;
+alter table public.supplier_price_history enable row level security;
+create policy staff_read on public.supplier_items for select using (app.has_perm('supplier.view') or app.is_staff());
+create policy mgr_write on public.supplier_items for all using (app.has_perm('supplier.manage') or app.can_write()) with check (app.has_perm('supplier.manage') or app.can_write());
+create policy staff_read on public.supplier_price_history for select using (app.has_perm('supplier.view') or app.is_staff());
+
+-- Explicit price update: records the change in supplier_price_history rather
+-- than silently overwriting (spec §5). Also used internally by
+-- match_supplier_invoice() when an in-tolerance invoice line reveals a new
+-- price (source='invoice').
+create or replace function public.set_supplier_item_price(
+  p_supplier_item_id uuid, p_new_price_cents int, p_source text default 'manual', p_reference_id uuid default null
+) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_old int;
+begin
+  if not (app.has_perm('supplier.manage') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_new_price_cents, 0) < 0 then raise exception 'bad_price' using errcode = 'check_violation'; end if;
+  select current_price_cents into v_old from public.supplier_items where id = p_supplier_item_id;
+  if not found then raise exception 'supplier_item_not_found' using errcode = 'foreign_key_violation'; end if;
+  update public.supplier_items set current_price_cents = p_new_price_cents, updated_at = now()
+   where id = p_supplier_item_id;
+  insert into public.supplier_price_history
+    (supplier_item_id, old_price_cents, new_price_cents, pct_change, source, reference_id)
+  values (p_supplier_item_id, v_old, p_new_price_cents,
+    case when coalesce(v_old,0) > 0 then round((p_new_price_cents - v_old)::numeric / v_old * 1000) / 10 else null end,
+    coalesce(nullif(p_source,''),'manual'), p_reference_id);
+end $fn$;
+revoke all on function public.set_supplier_item_price(uuid, int, text, uuid) from public;
+grant execute on function public.set_supplier_item_price(uuid, int, text, uuid) to authenticated, service_role;
+
+-- ── Purchasing settings — matching tolerances (spec §15) ───────────────────
+create table public.purchasing_settings (
+  id                     boolean primary key default true check (id),
+  qty_tolerance_pct      numeric(5,2) not null default 2,
+  price_tolerance_pct    numeric(5,2) not null default 1
+);
+insert into public.purchasing_settings (id) values (true);
+alter table public.purchasing_settings enable row level security;
+create policy staff_read on public.purchasing_settings for select using (app.has_perm('finance.view') or app.is_staff());
+create policy mgr_write on public.purchasing_settings for all using (app.has_perm('finance.manage_purchases') or app.can_write()) with check (app.has_perm('finance.manage_purchases') or app.can_write());
+
+-- ── Supplier invoices (spec §11-16) ─────────────────────────────────────────
+create type app.invoice_status as enum (
+  'received','matched','on_hold','approved','partially_paid','paid','cancelled'
+);
+
+create table public.invoice_counter (
+  id boolean primary key default true check (id),
+  next_number bigint not null default 1
+);
+insert into public.invoice_counter default values;
+alter table public.invoice_counter enable row level security; -- functions only (0112)
+create or replace function public.next_invoice_ref() returns bigint
+language plpgsql security definer set search_path = public, app as $fn$
+declare v bigint;
+begin
+  update public.invoice_counter set next_number = next_number + 1 where id returning next_number - 1 into v;
+  return v;
+end $fn$;
+grant execute on function public.next_invoice_ref() to authenticated, service_role;
+
+create table public.supplier_invoices (
+  id                     uuid primary key default gen_random_uuid(),
+  invoice_ref            bigint not null unique default public.next_invoice_ref(), -- our own sequence, distinct from the supplier's own number
+  supplier_id            uuid not null references public.suppliers(id) on delete restrict,
+  purchase_order_id      uuid references public.purchase_orders(id) on delete set null,
+  supplier_invoice_number text not null,
+  invoice_date           date not null,
+  due_date               date,                          -- defaulted from supplier.credit_period_days if not given
+  currency               text not null default 'USD',
+  subtotal_cents         int not null default 0 check (subtotal_cents >= 0),
+  tax_cents              int not null default 0 check (tax_cents >= 0),
+  discount_cents         int not null default 0 check (discount_cents >= 0),
+  delivery_fee_cents     int not null default 0 check (delivery_fee_cents >= 0),
+  total_cents            int not null default 0 check (total_cents >= 0),
+  status                 app.invoice_status not null default 'received',
+  attachment_path        text,                          -- path in the private 'supplier-invoices' bucket
+  notes                  text,
+  created_by             uuid,
+  created_at             timestamptz not null default now(),
+  -- Deterministic duplicate-invoice guard (spec §36): the same supplier
+  -- can't have the same invoice number twice.
+  unique (supplier_id, supplier_invoice_number)
+);
+create index supplier_invoices_supplier_idx on public.supplier_invoices(supplier_id, invoice_date desc);
+create index supplier_invoices_status_idx on public.supplier_invoices(status);
+
+create or replace function app.default_invoice_due_date() returns trigger
+language plpgsql set search_path = public, app as $fn$
+declare v_days int;
+begin
+  if new.due_date is null then
+    select credit_period_days into v_days from public.suppliers where id = new.supplier_id;
+    new.due_date := new.invoice_date + make_interval(days => coalesce(v_days, 30));
+  end if;
+  return new;
+end $fn$;
+create trigger default_invoice_due_date before insert on public.supplier_invoices
+  for each row execute function app.default_invoice_due_date();
+
+create table public.supplier_invoice_lines (
+  id                uuid primary key default gen_random_uuid(),
+  invoice_id        uuid not null references public.supplier_invoices(id) on delete cascade,
+  po_line_id        uuid references public.purchase_order_lines(id) on delete set null,
+  inventory_item_id uuid references public.inventory_items(id) on delete set null,
+  description       text not null,
+  qty               numeric(14,3) not null check (qty > 0),
+  unit_cost_cents   int not null default 0 check (unit_cost_cents >= 0),
+  line_total_cents  int not null default 0 check (line_total_cents >= 0)
+);
+create index supplier_invoice_lines_invoice_idx on public.supplier_invoice_lines(invoice_id);
+
+alter table public.supplier_invoices enable row level security;
+alter table public.supplier_invoice_lines enable row level security;
+create policy staff_read on public.supplier_invoices for select using (app.has_perm('invoices.view') or app.has_perm('purchases.view') or app.is_staff());
+create policy mgr_write on public.supplier_invoices for all using (app.has_perm('invoices.create') or app.can_write()) with check (app.has_perm('invoices.create') or app.can_write());
+create policy staff_read on public.supplier_invoice_lines for select using (app.has_perm('invoices.view') or app.has_perm('purchases.view') or app.is_staff());
+create policy mgr_write on public.supplier_invoice_lines for all using (app.has_perm('invoices.create') or app.can_write()) with check (app.has_perm('invoices.create') or app.can_write());
+
+-- Private bucket (spec §12 — never a public invoice URL): the app must mint
+-- a signed URL to view an attachment.
+insert into storage.buckets (id, name, public)
+values ('supplier-invoices', 'supplier-invoices', false)
+on conflict (id) do nothing;
+create policy "supplier-invoices staff read" on storage.objects for select
+  using (bucket_id = 'supplier-invoices' and (app.has_perm('invoices.view') or app.is_staff()));
+create policy "supplier-invoices staff write" on storage.objects for all
+  using (bucket_id = 'supplier-invoices' and (app.has_perm('invoices.create') or app.can_write()))
+  with check (bucket_id = 'supplier-invoices' and (app.has_perm('invoices.create') or app.can_write()));
+
+-- ── Payment holds (spec §16) ─────────────────────────────────────────────
+create table public.supplier_payment_holds (
+  id               uuid primary key default gen_random_uuid(),
+  invoice_id       uuid not null references public.supplier_invoices(id) on delete cascade,
+  reason           text not null,
+  amount_cents     int not null check (amount_cents >= 0),
+  status           text not null default 'open' check (status in ('open','resolved')),
+  created_at       timestamptz not null default now(),
+  created_by       uuid,
+  resolved_at      timestamptz,
+  resolved_by      uuid,
+  resolution_note  text
+);
+create index supplier_payment_holds_invoice_idx on public.supplier_payment_holds(invoice_id);
+create index supplier_payment_holds_open_idx on public.supplier_payment_holds(status) where status = 'open';
+alter table public.supplier_payment_holds enable row level security;
+create policy staff_read on public.supplier_payment_holds for select using (app.has_perm('payables.view') or app.has_perm('invoices.view') or app.is_staff());
+create policy mgr_write on public.supplier_payment_holds for all using (app.has_perm('payables.manage') or app.can_write()) with check (app.has_perm('payables.manage') or app.can_write());
+
+-- ── Credit notes (spec §19) ──────────────────────────────────────────────
+create table public.supplier_credit_notes (
+  id            uuid primary key default gen_random_uuid(),
+  supplier_id   uuid not null references public.suppliers(id) on delete cascade,
+  invoice_id    uuid references public.supplier_invoices(id) on delete set null,
+  amount_cents  int not null check (amount_cents > 0),
+  reason        text not null,
+  credit_date   date not null default current_date,
+  created_by    uuid,
+  created_at    timestamptz not null default now()
+);
+create index supplier_credit_notes_supplier_idx on public.supplier_credit_notes(supplier_id, credit_date desc);
+alter table public.supplier_credit_notes enable row level security;
+create policy staff_read on public.supplier_credit_notes for select using (app.has_perm('payables.view') or app.is_staff());
+create policy mgr_write on public.supplier_credit_notes for all using (app.has_perm('payables.manage') or app.can_write()) with check (app.has_perm('payables.manage') or app.can_write());
+
+-- ── Supplier payments (spec §17, §20-21) ────────────────────────────────
+create table public.supplier_payments (
+  id            uuid primary key default gen_random_uuid(),
+  supplier_id   uuid not null references public.suppliers(id) on delete restrict,
+  amount_cents  int not null check (amount_cents > 0),
+  method        text not null default 'bank_transfer',
+  reference     text,
+  paid_at       timestamptz not null default now(),
+  note          text,
+  created_by    uuid
+);
+create index supplier_payments_supplier_idx on public.supplier_payments(supplier_id, paid_at desc);
+
+-- A single payment may be split across multiple invoices, and a single
+-- invoice may be paid by multiple payments (spec §21) — never a bare
+-- paid=true boolean on the invoice.
+create table public.supplier_payment_allocations (
+  id            uuid primary key default gen_random_uuid(),
+  payment_id    uuid not null references public.supplier_payments(id) on delete cascade,
+  invoice_id    uuid not null references public.supplier_invoices(id) on delete restrict,
+  amount_cents  int not null check (amount_cents > 0),
+  unique (payment_id, invoice_id)
+);
+create index supplier_payment_allocations_invoice_idx on public.supplier_payment_allocations(invoice_id);
+
+alter table public.supplier_payments enable row level security;
+alter table public.supplier_payment_allocations enable row level security;
+create policy staff_read on public.supplier_payments for select using (app.has_perm('payables.view') or app.is_staff());
+create policy mgr_write on public.supplier_payments for all using (app.has_perm('payables.record_payment') or app.can_write()) with check (app.has_perm('payables.record_payment') or app.can_write());
+create policy staff_read on public.supplier_payment_allocations for select using (app.has_perm('payables.view') or app.is_staff());
+create policy mgr_write on public.supplier_payment_allocations for all using (app.has_perm('payables.record_payment') or app.can_write()) with check (app.has_perm('payables.record_payment') or app.can_write());
+
+-- Outstanding = total - allocated payments - credit notes. The ONE place
+-- this is computed (spec §18, §59) — invoice status and supplier_payable()
+-- both derive from this, never a separately-maintained balance.
+create or replace function app.invoice_outstanding_cents(p_invoice_id uuid) returns int
+language sql stable set search_path = public, app as $fn$
+  select greatest(0,
+    (select si.total_cents from public.supplier_invoices si where si.id = p_invoice_id)
+    - coalesce((select sum(spa.amount_cents) from public.supplier_payment_allocations spa where spa.invoice_id = p_invoice_id), 0)
+    - coalesce((select sum(scn.amount_cents) from public.supplier_credit_notes scn where scn.invoice_id = p_invoice_id), 0)
+  )::int
+$fn$;
+
+-- ── Three-way matching (spec §14-15) ─────────────────────────────────────
+-- Compares each invoice line against its linked PO line's price and actual
+-- RECEIVED quantity (not ordered quantity — an invoice should match what
+-- arrived). Within the configured tolerance: auto-match, and sync the
+-- supplier's price catalog if the price moved. Outside tolerance, or an
+-- invoice line with no PO line to check against: open a payment hold with
+-- the specific reason, and put the whole invoice on hold — a defensible v1
+-- simplification of true partial-line holds.
+create or replace function public.match_supplier_invoice(p_invoice_id uuid) returns jsonb
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_qty_tol numeric; v_price_tol numeric;
+  v_line record; v_po_price int; v_recv_qty numeric;
+  v_qty_diff_pct numeric; v_price_diff_pct numeric;
+  v_all_ok boolean := true; v_unmatched_amount int := 0;
+  v_sitem_id uuid; v_old_price int;
+begin
+  if not (app.has_perm('invoices.match') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select qty_tolerance_pct, price_tolerance_pct into v_qty_tol, v_price_tol from public.purchasing_settings;
+  v_qty_tol := coalesce(v_qty_tol, 2); v_price_tol := coalesce(v_price_tol, 1);
+
+  update public.supplier_payment_holds
+     set status = 'resolved', resolved_at = now(), resolution_note = 'superseded by re-match'
+   where invoice_id = p_invoice_id and status = 'open';
+
+  for v_line in
+    select sil.id, sil.qty, sil.unit_cost_cents, sil.line_total_cents, sil.po_line_id, sil.inventory_item_id
+      from public.supplier_invoice_lines sil where sil.invoice_id = p_invoice_id
+  loop
+    if v_line.po_line_id is null then
+      v_all_ok := false;
+      v_unmatched_amount := v_unmatched_amount + v_line.line_total_cents;
+      insert into public.supplier_payment_holds (invoice_id, reason, amount_cents, created_by)
+        values (p_invoice_id, 'Invoice line not linked to a purchase order — needs manual review', v_line.line_total_cents, app.jwt_sub());
+      continue;
+    end if;
+
+    select pol.received_qty, pol.unit_cost_cents into v_recv_qty, v_po_price
+      from public.purchase_order_lines pol where pol.id = v_line.po_line_id;
+
+    v_qty_diff_pct := case when coalesce(v_recv_qty,0) > 0
+      then abs(v_line.qty - v_recv_qty) / v_recv_qty * 100 else 100 end;
+    v_price_diff_pct := case when coalesce(v_po_price,0) > 0
+      then abs(v_line.unit_cost_cents - v_po_price) / v_po_price::numeric * 100 else 100 end;
+
+    if v_qty_diff_pct > v_qty_tol then
+      v_all_ok := false;
+      v_unmatched_amount := v_unmatched_amount + v_line.line_total_cents;
+      insert into public.supplier_payment_holds (invoice_id, reason, amount_cents, created_by)
+        values (p_invoice_id,
+          format('Quantity mismatch: invoiced %s vs received %s (%s%% difference)', v_line.qty, coalesce(v_recv_qty,0), round(v_qty_diff_pct,1)),
+          v_line.line_total_cents, app.jwt_sub());
+    elsif v_price_diff_pct > v_price_tol then
+      v_all_ok := false;
+      v_unmatched_amount := v_unmatched_amount + v_line.line_total_cents;
+      insert into public.supplier_payment_holds (invoice_id, reason, amount_cents, created_by)
+        values (p_invoice_id,
+          format('Price variance: invoiced %s vs PO %s per unit (%s%% difference)', v_line.unit_cost_cents, coalesce(v_po_price,0), round(v_price_diff_pct,1)),
+          v_line.line_total_cents, app.jwt_sub());
+    else
+      if v_line.inventory_item_id is not null then
+        select si.id, si.current_price_cents into v_sitem_id, v_old_price
+          from public.supplier_items si
+          join public.supplier_invoices inv on inv.id = p_invoice_id
+         where si.supplier_id = inv.supplier_id and si.inventory_item_id = v_line.inventory_item_id;
+        if v_sitem_id is not null and v_old_price is distinct from v_line.unit_cost_cents then
+          perform public.set_supplier_item_price(v_sitem_id, v_line.unit_cost_cents, 'invoice', p_invoice_id);
+        end if;
+      end if;
+    end if;
+  end loop;
+
+  update public.supplier_invoices
+     set status = case when v_all_ok then 'matched'::app.invoice_status else 'on_hold'::app.invoice_status end
+   where id = p_invoice_id;
+
+  return jsonb_build_object('matched', v_all_ok, 'unmatched_amount_cents', v_unmatched_amount);
+end $fn$;
+revoke all on function public.match_supplier_invoice(uuid) from public;
+grant execute on function public.match_supplier_invoice(uuid) to authenticated, service_role;
+
+create or replace function public.approve_supplier_invoice(p_invoice_id uuid) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('invoices.match') or app.has_perm('payables.manage') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.supplier_invoices set status = 'approved' where id = p_invoice_id and status = 'matched';
+  if not found then raise exception 'not_approvable' using errcode = 'check_violation'; end if;
+end $fn$;
+revoke all on function public.approve_supplier_invoice(uuid) from public;
+grant execute on function public.approve_supplier_invoice(uuid) to authenticated, service_role;
+
+create or replace function public.resolve_payment_hold(p_hold_id uuid, p_resolution_note text) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_invoice uuid; v_remaining int;
+begin
+  if not (app.has_perm('payables.manage') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.supplier_payment_holds
+     set status = 'resolved', resolved_at = now(), resolved_by = app.jwt_sub(),
+         resolution_note = coalesce(nullif(trim(p_resolution_note), ''), 'resolved')
+   where id = p_hold_id and status = 'open'
+   returning invoice_id into v_invoice;
+  if not found then raise exception 'hold_not_found_or_resolved' using errcode = 'check_violation'; end if;
+
+  select count(*) into v_remaining from public.supplier_payment_holds
+   where invoice_id = v_invoice and status = 'open';
+  if v_remaining = 0 then
+    update public.supplier_invoices set status = 'matched' where id = v_invoice and status = 'on_hold';
+  end if;
+end $fn$;
+revoke all on function public.resolve_payment_hold(uuid, text) from public;
+grant execute on function public.resolve_payment_hold(uuid, text) to authenticated, service_role;
+
+-- Record a supplier payment and allocate it across one or more invoices in
+-- one atomic call (spec §17, §21). Never lets an allocation exceed either
+-- the payment itself or the target invoice's own outstanding balance.
+create or replace function public.record_supplier_payment(
+  p_supplier_id uuid, p_amount_cents int, p_method text, p_reference text,
+  p_allocations jsonb, p_note text default null
+) returns uuid
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_payment_id uuid; v_alloc jsonb; v_inv uuid; v_amt int; v_sum int := 0;
+  v_outstanding int; v_inv_supplier uuid;
+begin
+  if not (app.has_perm('payables.record_payment') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_amount_cents, 0) <= 0 then raise exception 'bad_amount' using errcode = 'check_violation'; end if;
+
+  insert into public.supplier_payments (supplier_id, amount_cents, method, reference, note, created_by)
+  values (p_supplier_id, p_amount_cents, coalesce(nullif(p_method,''),'bank_transfer'), nullif(p_reference,''), p_note, app.jwt_sub())
+  returning id into v_payment_id;
+
+  for v_alloc in select value from jsonb_array_elements(coalesce(p_allocations, '[]'::jsonb)) as t(value) loop
+    v_inv := (v_alloc->>'invoice_id')::uuid;
+    v_amt := (v_alloc->>'amount_cents')::int;
+    if coalesce(v_amt, 0) <= 0 then continue; end if;
+
+    select si.supplier_id into v_inv_supplier from public.supplier_invoices si where si.id = v_inv;
+    if v_inv_supplier is null then raise exception 'invoice_not_found: %', v_inv using errcode = 'foreign_key_violation'; end if;
+    if v_inv_supplier is distinct from p_supplier_id then
+      raise exception 'invoice_supplier_mismatch: %', v_inv using errcode = 'check_violation';
+    end if;
+    v_outstanding := app.invoice_outstanding_cents(v_inv);
+    if v_amt > v_outstanding then
+      raise exception 'allocation_exceeds_outstanding: % > %', v_amt, v_outstanding using errcode = 'check_violation';
+    end if;
+
+    insert into public.supplier_payment_allocations (payment_id, invoice_id, amount_cents)
+    values (v_payment_id, v_inv, v_amt);
+    v_sum := v_sum + v_amt;
+
+    update public.supplier_invoices
+       set status = case when app.invoice_outstanding_cents(v_inv) = 0 then 'paid'::app.invoice_status else 'partially_paid'::app.invoice_status end
+     where id = v_inv;
+  end loop;
+
+  if v_sum > p_amount_cents then
+    raise exception 'allocations_exceed_payment: % > %', v_sum, p_amount_cents using errcode = 'check_violation';
+  end if;
+  return v_payment_id;
+end $fn$;
+revoke all on function public.record_supplier_payment(uuid, int, text, text, jsonb, text) from public;
+grant execute on function public.record_supplier_payment(uuid, int, text, text, jsonb, text) to authenticated, service_role;
+
+create or replace function public.record_supplier_credit_note(
+  p_supplier_id uuid, p_invoice_id uuid, p_amount_cents int, p_reason text
+) returns uuid
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_id uuid; v_inv_supplier uuid;
+begin
+  if not (app.has_perm('payables.manage') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_amount_cents, 0) <= 0 then raise exception 'bad_amount' using errcode = 'check_violation'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  if p_invoice_id is not null then
+    select si.supplier_id into v_inv_supplier from public.supplier_invoices si where si.id = p_invoice_id;
+    if v_inv_supplier is distinct from p_supplier_id then
+      raise exception 'invoice_supplier_mismatch' using errcode = 'check_violation';
+    end if;
+  end if;
+  insert into public.supplier_credit_notes (supplier_id, invoice_id, amount_cents, reason, created_by)
+  values (p_supplier_id, p_invoice_id, p_amount_cents, p_reason, app.jwt_sub())
+  returning id into v_id;
+  if p_invoice_id is not null then
+    update public.supplier_invoices
+       set status = case when app.invoice_outstanding_cents(p_invoice_id) = 0 then 'paid'::app.invoice_status else status end
+     where id = p_invoice_id and status not in ('paid','cancelled');
+  end if;
+  return v_id;
+end $fn$;
+revoke all on function public.record_supplier_credit_note(uuid, uuid, int, text) from public;
+grant execute on function public.record_supplier_credit_note(uuid, uuid, int, text) to authenticated, service_role;
+
+-- ── ONE authoritative accounts-payable ledger (spec §18, §59) ─────────────
+-- Every page/report/AI answer that states what a supplier is owed calls
+-- this — never a second payable formula anywhere else.
+create or replace function public.supplier_payable(p_supplier_id uuid default null)
+returns table (
+  supplier_id uuid, supplier_name text,
+  invoiced_cents int, on_hold_cents int, approved_cents int,
+  paid_cents int, credited_cents int, outstanding_cents int, overdue_cents int,
+  open_invoices int, open_holds int
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('payables.view') or app.has_perm('finance.view') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    with inv as (
+      select si.id, si.supplier_id as sup_id, si.total_cents, si.status, si.due_date,
+             app.invoice_outstanding_cents(si.id) as outstanding
+        from public.supplier_invoices si
+       where si.status <> 'cancelled' and (p_supplier_id is null or si.supplier_id = p_supplier_id)
+    ),
+    hold as (
+      select inv.sup_id, coalesce(sum(h.amount_cents),0)::int as sum_hold, count(*)::int as cnt_hold
+        from public.supplier_payment_holds h
+        join inv on inv.id = h.invoice_id
+       where h.status = 'open'
+       group by inv.sup_id
+    ),
+    paid as (
+      select sp.supplier_id as sup_id, coalesce(sum(sp.amount_cents),0)::int as sum_paid
+        from public.supplier_payments sp
+       where p_supplier_id is null or sp.supplier_id = p_supplier_id
+       group by sp.supplier_id
+    ),
+    credited as (
+      select scn.supplier_id as sup_id, coalesce(sum(scn.amount_cents),0)::int as sum_credited
+        from public.supplier_credit_notes scn
+       where p_supplier_id is null or scn.supplier_id = p_supplier_id
+       group by scn.supplier_id
+    ),
+    agg as (
+      select inv.sup_id,
+             coalesce(sum(inv.total_cents),0)::int as sum_invoiced,
+             coalesce(sum(inv.total_cents) filter (where inv.status = 'approved'),0)::int as sum_approved,
+             coalesce(sum(inv.outstanding),0)::int as sum_outstanding,
+             coalesce(sum(inv.outstanding) filter (where inv.due_date is not null and inv.due_date < current_date),0)::int as sum_overdue,
+             count(*) filter (where inv.outstanding > 0)::int as cnt_open
+        from inv
+       group by inv.sup_id
+    )
+    select s.id, s.name,
+           coalesce(agg.sum_invoiced,0), coalesce(hold.sum_hold,0), coalesce(agg.sum_approved,0),
+           coalesce(paid.sum_paid,0), coalesce(credited.sum_credited,0),
+           coalesce(agg.sum_outstanding,0), coalesce(agg.sum_overdue,0),
+           coalesce(agg.cnt_open,0), coalesce(hold.cnt_hold,0)
+      from public.suppliers s
+      left join agg on agg.sup_id = s.id
+      left join hold on hold.sup_id = s.id
+      left join paid on paid.sup_id = s.id
+      left join credited on credited.sup_id = s.id
+     where p_supplier_id is null or s.id = p_supplier_id
+     order by coalesce(agg.sum_outstanding,0) desc;
+end $fn$;
+revoke all on function public.supplier_payable(uuid) from public;
+grant execute on function public.supplier_payable(uuid) to authenticated, service_role;
+
+-- Chronological statement (spec §23): invoices, credit notes and payments,
+-- each signed so a running balance can be built by summing them in order.
+create or replace function public.supplier_statement(p_supplier_id uuid, p_from date, p_to date)
+returns table (txn_date date, kind text, reference text, amount_cents int, note text)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('payables.view') or app.has_perm('finance.view') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select si.invoice_date, 'invoice'::text, si.supplier_invoice_number, si.total_cents, si.notes
+      from public.supplier_invoices si
+     where si.supplier_id = p_supplier_id and si.status <> 'cancelled'
+       and si.invoice_date >= p_from and si.invoice_date <= p_to
+    union all
+    select scn.credit_date, 'credit_note'::text, scn.reason, -scn.amount_cents, scn.reason
+      from public.supplier_credit_notes scn
+     where scn.supplier_id = p_supplier_id
+       and scn.credit_date >= p_from and scn.credit_date <= p_to
+    union all
+    select sp.paid_at::date, 'payment'::text, coalesce(sp.reference, sp.method), -sp.amount_cents, sp.note
+      from public.supplier_payments sp
+     where sp.supplier_id = p_supplier_id
+       and sp.paid_at::date >= p_from and sp.paid_at::date <= p_to
+    order by 1;
+end $fn$;
+revoke all on function public.supplier_statement(uuid, date, date) from public;
+grant execute on function public.supplier_statement(uuid, date, date) to authenticated, service_role;
+
+-- ── AI Management: automatic low-stock supplier email ───────────────────
+-- The trigger itself is deterministic SQL, not an AI decision — it must
+-- keep working even if the AI model is unreachable (spec §22-23). AI's role
+-- is limited to explaining this log when asked, never to deciding when to
+-- fire it.
+alter table public.inventory_items
+  add column target_stock_qty numeric(14,3),   -- required for a reorder email to be eligible — never guessed
+  add column auto_reorder_email boolean not null default true;  -- per-item opt-out
+
+alter table public.purchasing_settings
+  add column low_stock_email_enabled boolean not null default false;  -- restaurant-wide master switch, off by default
+
+do $$ begin
+  create type app.low_stock_event_status as enum ('open', 'resolved');
+exception when duplicate_object then null; end $$;
+
+-- At most one OPEN event per item at a time (the dedup guard, spec §2) —
+-- enforced by the partial unique index below, not application logic.
+create table public.low_stock_events (
+  id                uuid primary key default gen_random_uuid(),
+  inventory_item_id uuid not null references public.inventory_items(id) on delete cascade,
+  status            app.low_stock_event_status not null default 'open',
+  stock_at_open     numeric(14,3) not null,
+  threshold_at_open numeric(14,3) not null,
+  opened_at         timestamptz not null default now(),
+  resolved_at       timestamptz
+);
+create unique index low_stock_events_one_open_idx on public.low_stock_events(inventory_item_id) where status = 'open';
+create index low_stock_events_item_idx on public.low_stock_events(inventory_item_id, opened_at desc);
+alter table public.low_stock_events enable row level security;
+create policy staff_read on public.low_stock_events for select using (app.has_perm('stock.view') or app.is_staff());
+
+-- Fires on every stock_qty/min_threshold change regardless of source (order
+-- consumption, receiving, waste, adjustment, stock count) — opens a new
+-- event only when none is already open, and resolves the open one the
+-- moment stock rises back above threshold (spec §3). AFTER UPDATE only
+-- (not INSERT), so a freshly created item at stock=0/threshold=0 never
+-- fires before it has a real threshold configured.
+create or replace function app.sync_low_stock_event() returns trigger
+language plpgsql set search_path = public, app as $fn$
+declare v_open_id uuid;
+begin
+  select id into v_open_id from public.low_stock_events
+   where inventory_item_id = new.id and status = 'open';
+  if new.stock_qty <= new.min_threshold then
+    if v_open_id is null then
+      insert into public.low_stock_events (inventory_item_id, stock_at_open, threshold_at_open)
+      values (new.id, new.stock_qty, new.min_threshold);
+    end if;
+  elsif v_open_id is not null then
+    update public.low_stock_events set status = 'resolved', resolved_at = now() where id = v_open_id;
+  end if;
+  return new;
+end $fn$;
+drop trigger if exists sync_low_stock_event on public.inventory_items;
+create trigger sync_low_stock_event after update of stock_qty, min_threshold on public.inventory_items
+  for each row execute function app.sync_low_stock_event();
+
+-- The email log / supplier communication history (spec §13, §15, §19).
+create table public.supplier_communications (
+  id                 uuid primary key default gen_random_uuid(),
+  supplier_id        uuid not null references public.suppliers(id) on delete cascade,
+  inventory_item_id  uuid references public.inventory_items(id) on delete set null,
+  low_stock_event_id uuid references public.low_stock_events(id) on delete set null,
+  kind               text not null default 'low_stock_reorder' check (kind in ('low_stock_reorder')),
+  subject            text not null,
+  body               text not null,
+  recipient_email    text not null,
+  suggested_qty      numeric(14,3),
+  status             text not null default 'pending' check (status in ('pending','sent','failed')),
+  provider           text,
+  error              text,
+  sent_at            timestamptz,
+  created_at         timestamptz not null default now()
+);
+create index supplier_communications_supplier_idx on public.supplier_communications(supplier_id, created_at desc);
+create index supplier_communications_event_idx on public.supplier_communications(low_stock_event_id);
+alter table public.supplier_communications enable row level security;
+create policy staff_read on public.supplier_communications for select using (app.has_perm('payables.view') or app.has_perm('supplier.view') or app.is_staff());
+
+-- The ONE authoritative eligibility query (spec §4, §24-25): open event,
+-- restaurant automation on, item opted in, a real target stock configured
+-- (never a guessed one), an active preferred supplier with a real email,
+-- and — the actual dedup mechanism — no successful email already sent for
+-- THIS event. apps/api's sweep calls this; nothing else decides eligibility.
+create or replace function public.pending_low_stock_reorders()
+returns table (
+  low_stock_event_id uuid, inventory_item_id uuid, item_name text, unit text,
+  stock_qty numeric, min_threshold numeric, target_stock_qty numeric, suggested_qty numeric,
+  supplier_id uuid, supplier_name text, supplier_email text
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('supplier.view') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select lse.id, ii.id, ii.name, ii.unit,
+           ii.stock_qty, ii.min_threshold, ii.target_stock_qty,
+           greatest(0, coalesce(ii.target_stock_qty, 0) - ii.stock_qty),
+           s.id, s.name, s.email
+      from public.low_stock_events lse
+      join public.inventory_items ii on ii.id = lse.inventory_item_id
+      join public.supplier_items si on si.inventory_item_id = ii.id and si.is_preferred and si.is_active
+      join public.suppliers s on s.id = si.supplier_id and s.is_active
+      cross join public.purchasing_settings ps
+     where lse.status = 'open'
+       and ii.auto_reorder_email
+       and ps.low_stock_email_enabled
+       and ii.target_stock_qty is not null
+       and s.email is not null and s.email <> ''
+       and not exists (
+         select 1 from public.supplier_communications sc
+          where sc.low_stock_event_id = lse.id and sc.status = 'sent'
+       );
+end $fn$;
+revoke all on function public.pending_low_stock_reorders() from public;
+grant execute on function public.pending_low_stock_reorders() to authenticated, service_role;
+
+-- ── Shifts & attendance ──────────────────────────────────────────────────
+create table public.shifts (
+  id            uuid primary key default gen_random_uuid(),
+  membership_id uuid not null references public.memberships(id) on delete cascade,
+  starts_at     timestamptz not null,
+  ends_at       timestamptz not null,
+  role_label    text,
+  notes         text,
+  created_at    timestamptz not null default now(),
+  check (ends_at > starts_at)
+);
+create index shifts_time_idx on public.shifts(starts_at);
+
+create table public.attendance (
+  id            uuid primary key default gen_random_uuid(),
+  membership_id uuid not null references public.memberships(id) on delete cascade,
+  business_date date,
+  shift_id      uuid references public.shifts(id) on delete set null,
+  clock_in      timestamptz,
+  clock_out     timestamptz,
+  status        text check (status in
+                ('present','late','absent','half_day','leave','off','early_departure','incomplete')),
+  late_minutes             int not null default 0,
+  early_departure_minutes  int not null default 0,
+  worked_minutes           int not null default 0,
+  overtime_minutes         int not null default 0,
+  overtime_approved_minutes int not null default 0,
+  source        text not null default 'self' check (source in ('self','device','manager','auto')),
+  portal_id     uuid,
+  marked_by     uuid,
+  note          text,
+  created_at    timestamptz not null default now()
+);
+create index attendance_member_idx on public.attendance(membership_id, clock_in desc);
+create unique index attendance_member_date_uq on public.attendance(membership_id, business_date);
+
+-- ── Attendance & business settings (P6) ─────────────────────────────────
+-- (public.business_settings is created earlier, ahead of Promotions — see
+-- the comment there.)
+
+create table public.attendance_settings (
+  id                         boolean primary key default true check (id),
+  grace_minutes              int not null default 10,
+  standard_day_minutes       int not null default 480,
+  working_days               int[] not null default '{1,2,3,4,5}',
+  overtime_enabled           boolean not null default false,
+  overtime_requires_approval boolean not null default true,
+  auto_checkout              text not null default 'none' check (auto_checkout in ('none','shift_end')),
+  target_pct                 numeric(5,2),
+  band_excellent             int not null default 90,
+  band_good                  int not null default 80,
+  band_attention             int not null default 70
+);
+insert into public.attendance_settings (id) values (true);
+
+alter table public.business_settings enable row level security;
+alter table public.attendance_settings enable row level security;
+create policy staff_read on public.business_settings for select using (app.has_perm('settings.view') or app.is_staff());
+-- Writing business_settings includes the refund-approval-threshold
+-- policy (tenant-migrations/0041) — deliberately requires explicit
+-- settings.update rather than the usual can_write() manager-bypass, so
+-- an unconfigured manager can't quietly raise/remove that limit.
+create policy mgr_write  on public.business_settings for all using (app.has_perm('settings.update')) with check (app.has_perm('settings.update'));
+create policy staff_read on public.attendance_settings for select using (app.has_perm('settings.view') or app.is_staff());
+create policy mgr_write  on public.attendance_settings for all using (app.has_perm('settings.update') or app.can_write()) with check (app.has_perm('settings.update') or app.can_write());
+
+alter table public.shifts enable row level security;
+alter table public.attendance enable row level security;
+create policy staff_read on public.shifts for select using (app.has_perm('attendance.view') or app.is_staff());
+create policy mgr_write on public.shifts for all using (app.has_perm('attendance.mark') or app.can_write()) with check (app.has_perm('attendance.mark') or app.can_write());
+-- staff with attendance.view see everyone; anyone sees their own row; writes via
+-- the attendance_* RPCs (management still has a direct-write policy).
+create policy staff_read on public.attendance for select using (
+  app.has_perm('attendance.view') or app.is_staff() or membership_id = app.my_membership_id()
+);
+create policy mgr_write on public.attendance for all using (app.has_perm('attendance.mark') or app.can_write()) with check (app.has_perm('attendance.mark') or app.can_write());
+
+-- ── Attendance helpers + RPCs (P6) ─────────────────────────────────────
+create or replace function app.business_day(p_ts timestamptz default now())
+returns date language sql stable set search_path = public, app as $fn$
+  select ((p_ts at time zone (select timezone from public.business_settings where id))
+          - make_interval(mins => (select business_day_start_minutes from public.business_settings where id)))::date
+$fn$;
+
+create or replace function app.recompute_attendance(p_id uuid)
+returns void language plpgsql set search_path = public, app as $fn$
+declare
+  a public.attendance; s public.shifts; cfg public.attendance_settings; m public.memberships;
+  v_worked int := 0; v_late int := 0; v_early int := 0; v_ot int := 0; v_status text;
+  v_expected_start timestamptz; v_tz text;
+begin
+  select * into a from public.attendance where id = p_id;
+  if not found then return; end if;
+  select * into cfg from public.attendance_settings where id;
+  select * into m from public.memberships where id = a.membership_id;
+  select * into s from public.shifts
+   where membership_id = a.membership_id and app.business_day(starts_at) = a.business_date
+   order by starts_at limit 1;
+
+  if a.clock_in is not null and a.clock_out is not null then
+    v_worked := greatest(0, (extract(epoch from (a.clock_out - a.clock_in)) / 60)::int);
+  end if;
+
+  if s.id is not null then
+    v_expected_start := s.starts_at;
+  elsif m.shift_start_time is not null then
+    -- No shift scheduled for this day — fall back to the member's own
+    -- default start time (set at staff creation), interpreted in the
+    -- restaurant's configured timezone, same zone app.business_day() uses.
+    select timezone into v_tz from public.business_settings where id;
+    v_expected_start := (a.business_date::timestamp + m.shift_start_time) at time zone coalesce(v_tz, 'UTC');
+  end if;
+
+  if v_expected_start is not null and a.clock_in is not null then
+    v_late := greatest(0, (extract(epoch from (a.clock_in - v_expected_start)) / 60)::int - coalesce(cfg.grace_minutes, 0));
+  end if;
+  if s.id is not null and a.clock_out is not null then
+    v_early := greatest(0, (extract(epoch from (s.ends_at - a.clock_out)) / 60)::int);
+    if coalesce(cfg.overtime_enabled, false) then
+      v_ot := greatest(0, (extract(epoch from (a.clock_out - s.ends_at)) / 60)::int);
+    end if;
+  end if;
+
+  if a.status in ('absent', 'leave', 'off', 'half_day') then v_status := a.status;
+  elsif a.clock_in is null then v_status := 'absent';
+  elsif a.clock_out is null then v_status := 'incomplete';
+  elsif v_late > 0 then v_status := 'late';
+  elsif v_early > 0 then v_status := 'early_departure';
+  else v_status := 'present';
+  end if;
+
+  update public.attendance
+     set worked_minutes = v_worked, late_minutes = v_late, early_departure_minutes = v_early,
+         overtime_minutes = v_ot, status = v_status, shift_id = s.id
+   where id = p_id;
+end $fn$;
+
+create or replace function public.attendance_check_in(p_membership_id uuid default null)
+returns public.attendance language plpgsql security definer set search_path = public, app as $fn$
+declare v_mid uuid; v_date date := app.business_day(now()); v_row public.attendance; v_self boolean;
+begin
+  v_mid := coalesce(p_membership_id, app.my_membership_id());
+  if v_mid is null then raise exception 'no_membership' using errcode = 'no_data_found'; end if;
+  v_self := (v_mid = app.my_membership_id());
+  if not (app.has_perm('attendance.check_in') or (v_self and app.has_perm('attendance.view_own'))) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v_row from public.attendance where membership_id = v_mid and business_date = v_date;
+  if found and v_row.clock_in is not null and v_row.clock_out is null then
+    raise exception 'already_checked_in' using errcode = 'unique_violation';
+  end if;
+  if found then
+    update public.attendance
+       set clock_in = coalesce(clock_in, now()),
+           source = case when app.current_portal_id() is not null then 'device' else 'self' end,
+           portal_id = app.current_portal_id(), marked_by = app.jwt_sub()
+     where id = v_row.id returning * into v_row;
+  else
+    insert into public.attendance (membership_id, business_date, clock_in, source, portal_id, marked_by, status)
+    values (v_mid, v_date, now(),
+            case when app.current_portal_id() is not null then 'device' else 'self' end,
+            app.current_portal_id(), app.jwt_sub(), 'present')
+    returning * into v_row;
+  end if;
+  perform app.recompute_attendance(v_row.id);
+  perform app.log_action('attendance.check_in', 'attendance', v_row.id::text);
+  select * into v_row from public.attendance where id = v_row.id;
+  return v_row;
+end $fn$;
+revoke all on function public.attendance_check_in(uuid) from public;
+grant execute on function public.attendance_check_in(uuid) to authenticated, service_role;
+
+create or replace function public.attendance_check_out(p_membership_id uuid default null)
+returns public.attendance language plpgsql security definer set search_path = public, app as $fn$
+declare v_mid uuid; v_date date := app.business_day(now()); v_row public.attendance; v_self boolean;
+begin
+  v_mid := coalesce(p_membership_id, app.my_membership_id());
+  if v_mid is null then raise exception 'no_membership' using errcode = 'no_data_found'; end if;
+  v_self := (v_mid = app.my_membership_id());
+  if not (app.has_perm('attendance.check_out') or (v_self and app.has_perm('attendance.view_own'))) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v_row from public.attendance where membership_id = v_mid and business_date = v_date;
+  if not found or v_row.clock_in is null then
+    raise exception 'not_checked_in' using errcode = 'check_violation';
+  end if;
+  update public.attendance set clock_out = now() where id = v_row.id returning * into v_row;
+  perform app.recompute_attendance(v_row.id);
+  perform app.log_action('attendance.check_out', 'attendance', v_row.id::text);
+  select * into v_row from public.attendance where id = v_row.id;
+  return v_row;
+end $fn$;
+revoke all on function public.attendance_check_out(uuid) from public;
+grant execute on function public.attendance_check_out(uuid) to authenticated, service_role;
+
+create or replace function public.attendance_mark(
+  p_membership_id uuid, p_business_date date, p_status text, p_note text default null
+) returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not app.has_perm('attendance.mark') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_status not in ('present','absent','late','half_day','leave','off','early_departure') then
+    raise exception 'bad_status' using errcode = 'check_violation';
+  end if;
+  insert into public.attendance (membership_id, business_date, status, note, source, marked_by, portal_id)
+  values (p_membership_id, p_business_date, p_status, p_note, 'manager', app.jwt_sub(), app.current_portal_id())
+  on conflict (membership_id, business_date) do update
+    set status = excluded.status, note = coalesce(excluded.note, public.attendance.note),
+        source = 'manager', marked_by = excluded.marked_by;
+  perform app.log_action('attendance.mark', 'attendance', p_membership_id::text, null,
+                         jsonb_build_object('date', p_business_date, 'status', p_status));
+end $fn$;
+revoke all on function public.attendance_mark(uuid, date, text, text) from public;
+grant execute on function public.attendance_mark(uuid, date, text, text) to authenticated, service_role;
+
+create or replace function public.attendance_roster(p_date date default null)
+returns table (membership_id uuid, full_name text, role text, status text,
+               clock_in timestamptz, clock_out timestamptz, late_minutes int,
+               shift_start_time time, expected_start timestamptz)
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_date date := coalesce(p_date, app.business_day(now())); v_tz text;
+begin
+  if not (app.has_perm('attendance.view') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select timezone into v_tz from public.business_settings where id;
+  return query
+    select m.id, m.full_name, m.role::text,
+           coalesce(a.status, 'not_marked'), a.clock_in, a.clock_out, coalesce(a.late_minutes, 0),
+           m.shift_start_time,
+           coalesce(
+             (select sh.starts_at from public.shifts sh
+               where sh.membership_id = m.id and app.business_day(sh.starts_at) = v_date
+               order by sh.starts_at limit 1),
+             case when m.shift_start_time is not null
+               then (v_date::timestamp + m.shift_start_time) at time zone coalesce(v_tz, 'UTC')
+             end
+           )
+    from public.memberships m
+    left join public.attendance a
+      on a.membership_id = m.id and a.business_date = v_date
+    where m.status = 'active'
+    order by m.full_name nulls last;
+end $fn$;
+revoke all on function public.attendance_roster(date) from public;
+grant execute on function public.attendance_roster(date) to authenticated, service_role;
+
+-- ── Automatic absence marking (0053) — the 'auto' source value already
+-- existed in attendance.source's check constraint, unused until now.
+-- Called periodically per tenant by the API server (apps/api/src/lib/
+-- attendanceAutomation.ts), same setInterval-sweep pattern low-stock/
+-- recipe-cost automation already use — nothing here uses an AI model.
+create or replace function public.attendance_auto_absent_sweep(p_lookback_days int default 3)
+returns int language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_today date := app.business_day(now());
+  v_marked int := 0;
+  r record;
+begin
+  if not (app.jwt_role() = 'service_role' or app.has_perm('attendance.mark')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+
+  for r in
+    select m.id as membership_id, d.business_date
+      from public.memberships m
+      cross join lateral (
+        select (v_today - g)::date as business_date
+          from generate_series(1, greatest(p_lookback_days, 1)) as g
+      ) d
+     where m.status = 'active'
+       and d.business_date < v_today
+       and (
+         -- Only ever auto-absent someone who was actually expected that
+         -- day: an explicit shift, or a default shift_start_time on a day
+         -- this restaurant normally schedules (attendance_settings.
+         -- working_days) — never for someone never expected in.
+         exists (
+           select 1 from public.shifts sh
+            where sh.membership_id = m.id and app.business_day(sh.starts_at) = d.business_date
+         )
+         or (
+           m.shift_start_time is not null
+           and extract(isodow from d.business_date)::int = any(
+             select unnest(working_days) from public.attendance_settings where id
+           )
+         )
+       )
+       and not exists (
+         select 1 from public.attendance a
+          where a.membership_id = m.id and a.business_date = d.business_date
+            and (a.clock_in is not null or a.status in ('absent', 'leave', 'off', 'half_day'))
+       )
+  loop
+    insert into public.attendance (membership_id, business_date, status, source, marked_by)
+    values (r.membership_id, r.business_date, 'absent', 'auto', null)
+    on conflict (membership_id, business_date) do update
+      set status = 'absent', source = 'auto'
+      where public.attendance.clock_in is null
+        and public.attendance.status not in ('leave', 'off', 'half_day');
+    v_marked := v_marked + 1;
+    perform app.log_action('attendance.auto_absent', 'attendance', r.membership_id::text, null,
+      jsonb_build_object('business_date', r.business_date));
+  end loop;
+
+  return v_marked;
+end $fn$;
+revoke all on function public.attendance_auto_absent_sweep(int) from public;
+grant execute on function public.attendance_auto_absent_sweep(int) to authenticated, service_role;
+
+create or replace function public.attendance_month_summary(
+  p_membership_id uuid, p_year int, p_month int
+) returns jsonb language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_self boolean := (p_membership_id = app.my_membership_id());
+  cfg public.attendance_settings;
+  v_from date := make_date(p_year, p_month, 1);
+  v_to date := (make_date(p_year, p_month, 1) + interval '1 month')::date;
+  v_scheduled int; v_present int; v_absent int; v_late int; v_leave int; v_worked int; v_ot int;
+begin
+  if not (app.has_perm('attendance.view_reports') or app.has_perm('attendance.view_employee_reports')
+          or (v_self and app.has_perm('attendance.view_own'))) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into cfg from public.attendance_settings where id;
+  select count(*) into v_scheduled
+  from generate_series(v_from, v_to - 1, interval '1 day') d
+  where extract(isodow from d)::int = any(cfg.working_days);
+  select
+    count(*) filter (where status in ('present','late','early_departure','half_day')),
+    count(*) filter (where status = 'absent'),
+    count(*) filter (where status = 'late'),
+    count(*) filter (where status = 'leave'),
+    coalesce(sum(worked_minutes), 0), coalesce(sum(overtime_approved_minutes), 0)
+  into v_present, v_absent, v_late, v_leave, v_worked, v_ot
+  from public.attendance
+  where membership_id = p_membership_id and business_date >= v_from and business_date < v_to;
+  return jsonb_build_object(
+    'scheduled_days', v_scheduled, 'present', v_present, 'absent', v_absent, 'late', v_late, 'leave', v_leave,
+    'worked_minutes', v_worked, 'approved_overtime_minutes', v_ot,
+    'attendance_pct', case when v_scheduled - v_leave > 0 then round(v_present::numeric * 100 / (v_scheduled - v_leave), 1) end,
+    'punctuality_pct', case when v_present > 0 then round((v_present - v_late)::numeric * 100 / v_present, 1) end,
+    'bands', jsonb_build_object('excellent', cfg.band_excellent, 'good', cfg.band_good, 'attention', cfg.band_attention)
+  );
+end $fn$;
+revoke all on function public.attendance_month_summary(uuid, int, int) from public;
+grant execute on function public.attendance_month_summary(uuid, int, int) to authenticated, service_role;
+
+-- ── Audit log ────────────────────────────────────────────────────────────
+create table public.audit_logs (
+  id          bigint generated always as identity primary key,
+  actor_id    uuid,
+  actor_email text,
+  actor_role  text,
+  portal_id   uuid,            -- portal the change was made from (P8)
+  action      text not null,   -- INSERT | UPDATE | DELETE | domain verb
+  entity      text not null,   -- table name
+  entity_id   text,
+  before      jsonb,
+  after       jsonb,
+  created_at  timestamptz not null default now()
+);
+create index audit_logs_created_idx on public.audit_logs(created_at desc);
+create index audit_logs_entity_idx on public.audit_logs(entity, created_at desc);
+
+alter table public.audit_logs enable row level security;
+create policy mgr_read on public.audit_logs for select using (app.can_write());
+
+create or replace function app.audit_row() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_claims jsonb := nullif(current_setting('request.jwt.claims', true), '')::jsonb;
+begin
+  insert into public.audit_logs (
+    actor_id, actor_email, actor_role, portal_id, action, entity, entity_id, before, after
+  ) values (
+    (v_claims #>> '{sub}')::uuid,
+    v_claims #>> '{email}',
+    app.current_member_role(),
+    app.current_portal_id(),
+    tg_op,
+    tg_table_name,
+    coalesce(to_jsonb(new) ->> 'id', to_jsonb(old) ->> 'id'),
+    case when tg_op in ('UPDATE', 'DELETE') then to_jsonb(old) end,
+    case when tg_op in ('UPDATE', 'INSERT') then to_jsonb(new) end
+  );
+  return coalesce(new, old);
+end $fn$;
+
+-- Targeted order-lifecycle audit: create + meaningful status/payment/total
+-- changes only (not the KDS line-status churn).
+create or replace function app.audit_order() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if tg_op = 'INSERT' then
+    perform app.log_action('order.created', 'orders', new.id::text, null,
+      jsonb_build_object('order_number', new.order_number, 'status', new.status));
+  elsif tg_op = 'UPDATE' and (
+      new.status is distinct from old.status
+      or new.payment_method is distinct from old.payment_method
+      or (new.paid_at is null) is distinct from (old.paid_at is null)
+      or new.total_cents is distinct from old.total_cents
+      or coalesce(new.refunded_cents, 0) is distinct from coalesce(old.refunded_cents, 0)
+  ) then
+    perform app.log_action('order.updated', 'orders', new.id::text,
+      jsonb_build_object('status', old.status, 'total_cents', old.total_cents,
+                         'payment_method', old.payment_method, 'refunded_cents', old.refunded_cents),
+      jsonb_build_object('status', new.status, 'total_cents', new.total_cents,
+                         'payment_method', new.payment_method, 'refunded_cents', new.refunded_cents));
+  end if;
+  return coalesce(new, old);
+end $fn$;
+create trigger audit_order after insert or update on public.orders
+  for each row execute function app.audit_order();
+
+-- ── AI Approval Inbox ─────────────────────────────────────────────────────
+-- Persists every AI-proposed action (not just the one that happens to be
+-- confirmed inline, same chat, same session) so a "sensitive action"
+-- proposal is visible to any authorized approver, not lost the moment the
+-- proposing chat tab closes. Writes go through the tenant admin client
+-- (same as every other AI route) — RLS here is a defense-in-depth
+-- backstop, not the primary gate; the real permission checks live in
+-- Express (requirePortalPerm + permits(), matching every other AI route).
+create type app.ai_pending_action_status as enum ('pending', 'approved', 'rejected', 'expired', 'failed');
+
+create table public.ai_pending_actions (
+  id                 uuid primary key default gen_random_uuid(),
+  action_name        text not null,
+  args               jsonb not null,
+  summary            text not null,
+  status             app.ai_pending_action_status not null default 'pending',
+  proposed_by        uuid,
+  proposed_by_email  text,
+  proposed_by_role   text,
+  created_at         timestamptz not null default now(),
+  resolved_at        timestamptz,
+  resolved_by        uuid,
+  resolved_by_email  text,
+  result             jsonb,
+  error              text
+);
+create index ai_pending_actions_status_idx on public.ai_pending_actions(status, created_at desc);
+
+alter table public.ai_pending_actions enable row level security;
+create policy staff_read on public.ai_pending_actions for select
+  using (app.has_perm('ai.execute_write') or app.has_perm('ai.approve_sensitive_action') or app.can_write());
+create policy mgr_write on public.ai_pending_actions for all
+  using (app.has_perm('ai.execute_write') or app.has_perm('ai.approve_sensitive_action') or app.can_write())
+  with check (app.has_perm('ai.execute_write') or app.has_perm('ai.approve_sensitive_action') or app.can_write());
+
+-- ── Exception lifecycle state ─────────────────────────────────────────────
+-- computeAttentionItems() (the Exception Center / AI's own "what needs my
+-- attention") is deliberately stateless — it recomputes fresh every call,
+-- which is exactly right for detecting a problem, but gives a manager no
+-- way to note "seen this, handling it" without the exact same message
+-- reappearing as if untouched. An exception has no natural row of its own
+-- to attach state to (it's a computed fact, not a table), so the state is
+-- keyed on the exact "category::message" text the item itself carries —
+-- the moment the underlying condition changes even slightly (stock moves
+-- further, a hold gets a new reason), that's a materially different
+-- exception and correctly starts unacknowledged again, matching spec
+-- intent ("notify again when the condition changes") without any separate
+-- fingerprinting scheme to keep in sync.
+create type app.exception_state_status as enum ('acknowledged', 'resolved', 'ignored');
+
+create table public.exception_states (
+  fingerprint  text primary key,
+  status       app.exception_state_status not null,
+  note         text,
+  actor_id     uuid,
+  actor_email  text,
+  actor_role   text,
+  updated_at   timestamptz not null default now()
+);
+
+alter table public.exception_states enable row level security;
+create policy staff_read on public.exception_states for select using (app.has_perm('orders.view') or app.is_staff());
+create policy mgr_write on public.exception_states for all
+  using (app.has_perm('orders.view') or app.can_write())
+  with check (app.has_perm('orders.view') or app.can_write());
+
+-- ── Daily closing (P8) ───────────────────────────────────────────────────
+create table public.daily_closings (
+  id                 uuid primary key default gen_random_uuid(),
+  business_date      date not null unique,
+  status             text not null default 'open' check (status in ('open','closed')),
+  opening_cash_cents int not null default 0,
+  closing_cash_cents int,
+  expected_cash_cents int,
+  difference_cents   int,
+  gross_sales_cents  int not null default 0,
+  discounts_cents    int not null default 0,
+  refunds_cents      int not null default 0,
+  net_sales_cents    int not null default 0,
+  order_count        int not null default 0,
+  note               text,
+  closed_by          uuid,
+  closed_at          timestamptz,
+  reopened_by        uuid,
+  reopened_at        timestamptz,
+  created_at         timestamptz not null default now()
+);
+alter table public.daily_closings enable row level security;
+create policy staff_read on public.daily_closings for select using (app.has_perm('finance.view') or app.is_staff());
+
+create or replace function app.day_sales(p_date date)
+returns jsonb language sql stable set search_path = public, app as $fn$
+  with o as (
+    select * from public.orders
+    where status in ('served','paid') and app.business_day(coalesce(paid_at, created_at)) = p_date
+  )
+  select jsonb_build_object(
+    'gross_sales_cents', coalesce((select sum(subtotal_cents) from o), 0),
+    'discounts_cents',   coalesce((select sum(discount_cents) from o), 0),
+    'refunds_cents',     coalesce((select sum(refunded_cents) from o), 0),
+    'net_sales_cents',   coalesce((select sum(subtotal_cents - discount_cents - coalesce(refunded_cents,0)) from o), 0),
+    'order_count',       (select count(*) from o),
+    'cash_in_cents',     coalesce((select sum(p.amount_cents - p.refunded_cents)
+                                   from public.payments p join o on o.id = p.order_id
+                                   where p.status <> 'voided' and p.method = 'cash'), 0)
+  )
+$fn$;
+
+create or replace function public.close_business_day(
+  p_business_date date, p_opening_cash int default 0,
+  p_closing_cash int default null, p_note text default null
+) returns public.daily_closings
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_s jsonb; v_expected int; v_diff int; v_row public.daily_closings;
+begin
+  if not app.has_perm('finance.close_day') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  v_s := app.day_sales(p_business_date);
+  v_expected := coalesce(p_opening_cash, 0) + (v_s->>'cash_in_cents')::int;
+  v_diff := case when p_closing_cash is null then null else p_closing_cash - v_expected end;
+
+  insert into public.daily_closings (
+    business_date, status, opening_cash_cents, closing_cash_cents, expected_cash_cents,
+    difference_cents, gross_sales_cents, discounts_cents, refunds_cents, net_sales_cents,
+    order_count, note, closed_by, closed_at
+  ) values (
+    p_business_date, 'closed', coalesce(p_opening_cash, 0), p_closing_cash, v_expected, v_diff,
+    (v_s->>'gross_sales_cents')::int, (v_s->>'discounts_cents')::int, (v_s->>'refunds_cents')::int,
+    (v_s->>'net_sales_cents')::int, (v_s->>'order_count')::int, p_note, app.jwt_sub(), now()
+  )
+  on conflict (business_date) do update set
+    status = 'closed', opening_cash_cents = excluded.opening_cash_cents,
+    closing_cash_cents = excluded.closing_cash_cents, expected_cash_cents = excluded.expected_cash_cents,
+    difference_cents = excluded.difference_cents, gross_sales_cents = excluded.gross_sales_cents,
+    discounts_cents = excluded.discounts_cents, refunds_cents = excluded.refunds_cents,
+    net_sales_cents = excluded.net_sales_cents, order_count = excluded.order_count,
+    note = coalesce(excluded.note, public.daily_closings.note),
+    closed_by = excluded.closed_by, closed_at = now()
+  returning * into v_row;
+
+  perform app.log_action('day.closed', 'daily_closings', p_business_date::text, null, to_jsonb(v_row));
+  return v_row;
+end $fn$;
+revoke all on function public.close_business_day(date, int, int, text) from public;
+grant execute on function public.close_business_day(date, int, int, text) to authenticated, service_role;
+
+create or replace function public.reopen_business_day(p_business_date date, p_reason text)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not app.has_perm('finance.reopen_day') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.daily_closings
+     set status = 'open', reopened_by = app.jwt_sub(), reopened_at = now(),
+         note = coalesce(nullif(trim(p_reason), ''), note)
+   where business_date = p_business_date;
+  if not found then raise exception 'not_found' using errcode = 'no_data_found'; end if;
+  perform app.log_action('day.reopened', 'daily_closings', p_business_date::text, null,
+                         jsonb_build_object('reason', p_reason));
+end $fn$;
+revoke all on function public.reopen_business_day(date, text) from public;
+grant execute on function public.reopen_business_day(date, text) to authenticated, service_role;
+
+-- ── Dashboard sales trend (visual dashboard spec §5-9) ──────────────────────
+-- One row per real business day (never a future date, never a manufactured
+-- one — spec §34), built on app.day_sales() so the trend line, the daily
+-- closing report and any other surface agree on what "today's sales" means.
+create or replace function public.sales_by_day(p_from date, p_to date)
+returns table (
+  business_date date, gross_sales_cents int, discount_cents int,
+  refunded_cents int, net_sales_cents int, orders_count int
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select d.day::date,
+           (x.s->>'gross_sales_cents')::int, (x.s->>'discounts_cents')::int,
+           (x.s->>'refunds_cents')::int, (x.s->>'net_sales_cents')::int, (x.s->>'order_count')::int
+      from generate_series(p_from::timestamp, least(p_to, current_date)::timestamp, interval '1 day') as d(day),
+           lateral (select app.day_sales(d.day::date) as s) x
+     order by d.day;
+end $fn$;
+revoke all on function public.sales_by_day(date, date) from public;
+grant execute on function public.sales_by_day(date, date) to authenticated, service_role;
+
+-- Hourly breakdown for one business day — the drill-down behind the trend
+-- line's day picker. Every hour 0-23 is returned (0 sales renders as a real
+-- gap in the bar chart, not a missing bar) in the restaurant's own timezone.
+create or replace function public.sales_by_hour(p_date date)
+returns table (hour_of_day int, net_sales_cents int, orders_count int)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select h.hr,
+           coalesce(sum(o.subtotal_cents - o.discount_cents - coalesce(o.refunded_cents,0)) filter (where o.id is not null), 0)::int,
+           count(o.id)::int
+      from generate_series(0, 23) as h(hr)
+      left join public.orders o
+        on o.status in ('served','paid')
+       and app.business_day(coalesce(o.paid_at, o.created_at)) = p_date
+       and extract(hour from (coalesce(o.paid_at, o.created_at)
+             at time zone coalesce((select timezone from public.business_settings where id), 'UTC'))) = h.hr
+     group by h.hr
+     order by h.hr;
+end $fn$;
+revoke all on function public.sales_by_hour(date) from public;
+grant execute on function public.sales_by_hour(date) to authenticated, service_role;
+
+-- The "underlying orders" step of the Month -> Day -> hourly -> orders
+-- drill-down, same business-day population as the two functions above.
+create or replace function public.orders_on_day(p_date date)
+returns table (
+  order_id uuid, order_number bigint, status text, channel text, table_label text,
+  total_cents int, discount_cents int, event_at timestamptz
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select o.id, o.order_number, o.status::text, o.channel::text, o.table_label,
+           o.total_cents, o.discount_cents, coalesce(o.paid_at, o.created_at)
+      from public.orders o
+     where o.status in ('served','paid')
+       and app.business_day(coalesce(o.paid_at, o.created_at)) = p_date
+     order by coalesce(o.paid_at, o.created_at);
+end $fn$;
+revoke all on function public.orders_on_day(date) from public;
+grant execute on function public.orders_on_day(date) to authenticated, service_role;
+
+-- Revenue by menu category, à la carte lines only (same simplification as
+-- item_profitability — a deal's revenue is costed/reported as the deal, not
+-- split across its components' categories). Feeds the dashboard's revenue-
+-- mix pie chart.
+create or replace function public.revenue_by_category(p_from timestamptz, p_to timestamptz)
+returns table (category_id uuid, category_name text, revenue_cents int, qty_sold int)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select coalesce(mc.id, '00000000-0000-0000-0000-000000000000'::uuid) as cat_id,
+           coalesce(mc.name, 'Uncategorized') as cat_name,
+           sum(l.line_total_cents)::int as cat_revenue,
+           sum(l.qty)::int as cat_qty
+      from public.order_lines l
+      join public.orders o on o.id = l.order_id
+      left join public.menu_items mi on mi.id = l.menu_item_id
+      left join public.menu_categories mc on mc.id = mi.category_id
+     where l.deal_id is null and l.menu_item_id is not null
+       and o.status in ('served','paid')
+       and coalesce(o.paid_at, o.created_at) >= p_from and coalesce(o.paid_at, o.created_at) < p_to
+     group by mc.id, mc.name
+     order by sum(l.line_total_cents) desc;
+end $fn$;
+revoke all on function public.revenue_by_category(timestamptz, timestamptz) from public;
+grant execute on function public.revenue_by_category(timestamptz, timestamptz) to authenticated, service_role;
+
+-- Payment method mix for the dashboard's payment-mix pie chart.
+create or replace function public.payment_mix(p_from timestamptz, p_to timestamptz)
+returns table (method text, revenue_cents int, orders_count int)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select coalesce(o.payment_method, 'unknown') as pm,
+           sum(o.total_cents)::int as pm_revenue,
+           count(*)::int as pm_count
+      from public.orders o
+     where o.status = 'paid'
+       and o.paid_at >= p_from and o.paid_at < p_to
+     group by coalesce(o.payment_method, 'unknown')
+     order by sum(o.total_cents) desc;
+end $fn$;
+revoke all on function public.payment_mix(timestamptz, timestamptz) from public;
+grant execute on function public.payment_mix(timestamptz, timestamptz) to authenticated, service_role;
+
+-- Customer experience averages for the dashboard (spec §12) — category
+-- ratings are optional per submission, so each average is over whatever
+-- guests actually rated for that category, not the full response count.
+create or replace function public.feedback_summary(p_from timestamptz, p_to timestamptz)
+returns table (
+  responses int, avg_overall numeric, avg_food numeric, avg_service numeric,
+  avg_cleanliness numeric, avg_speed numeric, avg_ambiance numeric
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select count(*)::int,
+           round(avg(f.overall)::numeric, 2),
+           round(avg(f.food)::numeric, 2),
+           round(avg(f.service)::numeric, 2),
+           round(avg(f.cleanliness)::numeric, 2),
+           round(avg(f.speed)::numeric, 2),
+           round(avg(f.ambiance)::numeric, 2)
+      from public.feedback f
+     where f.created_at >= p_from and f.created_at < p_to;
+end $fn$;
+revoke all on function public.feedback_summary(timestamptz, timestamptz) from public;
+grant execute on function public.feedback_summary(timestamptz, timestamptz) to authenticated, service_role;
+
+-- ── Operating expenses (spec §28-29 — Prime Cost / Net Profit inputs) ──────
+-- Deliberately simple: a category + amount + date. Payroll/labor stays out
+-- of scope here (spec §28 — no arbitrary per-order salary allocation); this
+-- exists so period_profitability() can reach real Net Profit, not stop at
+-- Contribution/Gross Profit.
+create table public.expenses (
+  id           uuid primary key default gen_random_uuid(),
+  category     text not null,
+  description  text,
+  amount_cents int not null check (amount_cents > 0),
+  expense_date date not null default current_date,
+  recorded_by  uuid,
+  -- Which supplier this was actually paid to (0045) — optional, most
+  -- categories (Rent/Utilities/Labor) have none.
+  supplier_id  uuid references public.suppliers(id) on delete set null,
+  created_at   timestamptz not null default now()
+);
+create index expenses_date_idx on public.expenses(expense_date desc);
+alter table public.expenses enable row level security;
+-- Finance domain (same narrow exception as payments/refunds above): no
+-- is_staff()/can_write() fallback, so expense records stay invisible to
+-- a manager until the Owner explicitly grants finance.*.
+create policy staff_read on public.expenses for select using (app.has_perm('finance.view'));
+create policy staff_insert on public.expenses for insert with check (app.has_perm('finance.create_expense'));
+create policy staff_update on public.expenses for update using (app.has_perm('finance.update_expense')) with check (app.has_perm('finance.update_expense'));
+create policy staff_delete on public.expenses for delete using (app.has_perm('finance.delete_expense'));
+create trigger audit after insert or update or delete on public.expenses for each row execute function app.audit_row();
+
+-- ── COGS & Profitability engine (recipe/inventory/costing spec §22-31, §49) ─
+-- ONE authoritative calculation layer: the Finance page, the AI assistant,
+-- and any future report all call these same functions rather than each
+-- re-deriving gross/net/COGS/contribution with their own formula. Every
+-- number a caller can't get honestly (e.g. no recipe cost configured) comes
+-- back as null / a missing-lines count, never a guessed value (spec §64-65).
+--
+-- "Net sales" is always subtotal (gross) minus discount minus refunds —
+-- never gross alone (spec §23, §57 discount test). A deal's revenue is its
+-- own line_total_cents (the deal price actually charged), never the sum of
+-- component list prices (spec §15, §56 deal test) — that falls out for free
+-- because place_order() already prices deal components at zero and puts the
+-- deal price on the header line alone.
+--
+-- Theoretical vs Actual COGS (spec §30) is read straight off the ledger
+-- rather than reconstructed from historical stock balances: every ledger
+-- row now carries the cost basis it was valued at (unit_cost_cents_base,
+-- above), so "actual" ingredient value consumed/wasted/adjusted in a period
+-- is a straight sum, and the gap against the recipe-driven theoretical COGS
+-- is exactly the waste + shrinkage the period actually saw.
+
+create or replace function public.order_profitability(p_order_id uuid)
+returns table (
+  order_id uuid, order_number bigint, status text,
+  gross_sales_cents int, discount_cents int, refunded_cents int, tax_cents int,
+  net_sales_cents int, cogs_cents int, cogs_lines_total int, cogs_lines_missing int,
+  food_cost_pct numeric, contribution_cents int, contribution_margin_pct numeric
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.has_perm('inventory.view_cost')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    with base as (
+      select o.id, o.order_number, o.status::text as status,
+             o.subtotal_cents as gross_sales_cents, o.discount_cents,
+             coalesce(o.refunded_cents,0) as refunded_cents, o.tax_cents,
+             (o.subtotal_cents - o.discount_cents - coalesce(o.refunded_cents,0)) as net_sales_cents
+        from public.orders o where o.id = p_order_id
+    ),
+    agg as (
+      select coalesce(sum(ol.recipe_cost_cents),0)::int as cogs_cents,
+             count(*)::int as lines_total,
+             count(*) filter (where ol.recipe_cost_cents is null)::int as lines_missing
+        from public.order_lines ol where ol.order_id = p_order_id
+    )
+    select base.id, base.order_number, base.status,
+           base.gross_sales_cents, base.discount_cents, base.refunded_cents, base.tax_cents,
+           base.net_sales_cents, agg.cogs_cents, agg.lines_total, agg.lines_missing,
+           case when base.net_sales_cents > 0 then round(agg.cogs_cents::numeric / base.net_sales_cents * 1000) / 10 else null end,
+           (base.net_sales_cents - agg.cogs_cents),
+           case when base.net_sales_cents > 0 then round((base.net_sales_cents - agg.cogs_cents)::numeric / base.net_sales_cents * 1000) / 10 else null end
+      from base, agg;
+end $fn$;
+revoke all on function public.order_profitability(uuid) from public;
+grant execute on function public.order_profitability(uuid) to authenticated, service_role;
+
+-- A "sale" for period_profitability/item_profitability/deal_profitability is
+-- the same population daily-closing already uses (app.day_sales): status
+-- served or paid, bucketed by paid_at (or created_at if never paid) — the
+-- one existing authoritative definition of "this counts as a sale", not a
+-- second competing one.
+create or replace function public.period_profitability(p_from timestamptz, p_to timestamptz)
+returns table (
+  from_ts timestamptz, to_ts timestamptz,
+  orders_count int, gross_sales_cents int, discount_cents int, refunded_cents int,
+  net_sales_cents int, avg_order_cents int,
+  theoretical_cogs_cents int, cogs_lines_total int, cogs_lines_missing int,
+  gross_profit_cents int, gross_margin_pct numeric, food_cost_pct numeric,
+  consumption_ledger_cents int, waste_cents int, net_adjustment_cents int,
+  actual_cogs_cents int, cogs_variance_cents int,
+  expenses_cents int, net_profit_cents int, net_profit_margin_pct numeric
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.has_perm('inventory.view_cost')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    with sales as (
+      select o.id, o.subtotal_cents, o.discount_cents, coalesce(o.refunded_cents,0) as refunded_cents
+        from public.orders o
+       where o.status in ('served','paid')
+         and coalesce(o.paid_at, o.created_at) >= p_from and coalesce(o.paid_at, o.created_at) < p_to
+    ),
+    sales_agg as (
+      select count(*)::int as orders_count,
+             coalesce(sum(sales.subtotal_cents),0)::int as gross_sales_cents,
+             coalesce(sum(sales.discount_cents),0)::int as discount_cents,
+             coalesce(sum(sales.refunded_cents),0)::int as refunded_cents,
+             coalesce(sum(sales.subtotal_cents - sales.discount_cents - sales.refunded_cents),0)::int as net_sales_cents
+        from sales
+    ),
+    cogs_agg as (
+      select coalesce(sum(l.recipe_cost_cents),0)::int as cogs_cents,
+             count(*)::int as lines_total,
+             count(*) filter (where l.recipe_cost_cents is null)::int as lines_missing
+        from public.order_lines l join sales s on s.id = l.order_id
+    ),
+    -- Actual ingredient value moved in the period, read off the ledger's own
+    -- cost-basis snapshot (unit_cost_cents_base) rather than recomputed.
+    ledger_agg as (
+      select
+        coalesce(sum(abs(delta_qty * unit_cost_cents_base)) filter (where reason = 'order_deduction'), 0)::int as consumption_cents,
+        coalesce(sum(abs(delta_qty * unit_cost_cents_base)) filter (where reason = 'spoilage'), 0)::int as waste_cents,
+        coalesce(sum(delta_qty * unit_cost_cents_base) filter (where reason in ('adjustment','stock_take')), 0)::int as net_adjustment_cents
+        from public.stock_ledger
+       where created_at >= p_from and created_at < p_to and unit_cost_cents_base is not null
+    ),
+    exp_agg as (
+      -- expense_date is a plain date (no time-of-day); the upper bound is
+      -- inclusive so an expense dated "today" is still counted when p_to is
+      -- "now" — a strict "<" against a date-truncated timestamptz would
+      -- otherwise drop every expense recorded earlier today.
+      select coalesce(sum(amount_cents),0)::int as expenses_cents
+        from public.expenses
+       where expense_date >= p_from::date and expense_date <= p_to::date
+    )
+    select
+      p_from, p_to,
+      sales_agg.orders_count, sales_agg.gross_sales_cents, sales_agg.discount_cents, sales_agg.refunded_cents,
+      sales_agg.net_sales_cents,
+      case when sales_agg.orders_count > 0 then round(sales_agg.net_sales_cents::numeric / sales_agg.orders_count)::int else 0 end,
+      cogs_agg.cogs_cents, cogs_agg.lines_total, cogs_agg.lines_missing,
+      (sales_agg.net_sales_cents - cogs_agg.cogs_cents),
+      case when sales_agg.net_sales_cents > 0 then round((sales_agg.net_sales_cents - cogs_agg.cogs_cents)::numeric / sales_agg.net_sales_cents * 1000) / 10 else null end,
+      case when sales_agg.net_sales_cents > 0 then round(cogs_agg.cogs_cents::numeric / sales_agg.net_sales_cents * 1000) / 10 else null end,
+      ledger_agg.consumption_cents, ledger_agg.waste_cents, ledger_agg.net_adjustment_cents,
+      (ledger_agg.consumption_cents + ledger_agg.waste_cents - ledger_agg.net_adjustment_cents),
+      (ledger_agg.consumption_cents + ledger_agg.waste_cents - ledger_agg.net_adjustment_cents - cogs_agg.cogs_cents),
+      exp_agg.expenses_cents,
+      (sales_agg.net_sales_cents - cogs_agg.cogs_cents - exp_agg.expenses_cents),
+      case when sales_agg.net_sales_cents > 0 then round((sales_agg.net_sales_cents - cogs_agg.cogs_cents - exp_agg.expenses_cents)::numeric / sales_agg.net_sales_cents * 1000) / 10 else null end
+      from sales_agg, cogs_agg, ledger_agg, exp_agg;
+end $fn$;
+revoke all on function public.period_profitability(timestamptz, timestamptz) from public;
+grant execute on function public.period_profitability(timestamptz, timestamptz) to authenticated, service_role;
+
+-- Per menu item/variant, à la carte lines only (deal_id is null) — a deal's
+-- own components are costed as part of the deal, not folded into the item's
+-- own numbers here (spec §31 menu engineering needs "this item sold alone").
+create or replace function public.item_profitability(p_from timestamptz, p_to timestamptz)
+returns table (
+  menu_item_id uuid, variant_id uuid, name text,
+  qty_sold int, revenue_cents int, cogs_cents int, cogs_known boolean,
+  contribution_cents int, contribution_margin_pct numeric, food_cost_pct numeric
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.has_perm('inventory.view_cost')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select
+      l.menu_item_id, l.variant_id, max(l.name_snapshot) as name,
+      sum(l.qty)::int as qty_sold, sum(l.line_total_cents)::int as revenue_cents,
+      coalesce(sum(l.recipe_cost_cents),0)::int as cogs_cents,
+      bool_and(l.recipe_cost_cents is not null) as cogs_known,
+      (sum(l.line_total_cents) - coalesce(sum(l.recipe_cost_cents),0))::int as contribution_cents,
+      case when sum(l.line_total_cents) > 0
+        then round((sum(l.line_total_cents) - coalesce(sum(l.recipe_cost_cents),0))::numeric / sum(l.line_total_cents) * 1000) / 10
+        else null end as contribution_margin_pct,
+      case when sum(l.line_total_cents) > 0
+        then round(coalesce(sum(l.recipe_cost_cents),0)::numeric / sum(l.line_total_cents) * 1000) / 10
+        else null end as food_cost_pct
+      from public.order_lines l
+      join public.orders o on o.id = l.order_id
+     where l.deal_id is null and l.menu_item_id is not null
+       and o.status in ('served','paid')
+       and coalesce(o.paid_at, o.created_at) >= p_from and coalesce(o.paid_at, o.created_at) < p_to
+     group by l.menu_item_id, l.variant_id
+     order by revenue_cents desc;
+end $fn$;
+revoke all on function public.item_profitability(timestamptz, timestamptz) from public;
+grant execute on function public.item_profitability(timestamptz, timestamptz) to authenticated, service_role;
+
+-- Per deal: header line(s) for revenue, that same (order_id, deal_id)'s
+-- component lines for COGS (spec §15, §56). list_value_cents/
+-- customer_saving_cents use TODAY's component menu prices — an operational
+-- estimate, since a component's list price isn't snapshotted per historical
+-- sale the way revenue and COGS are.
+create or replace function public.deal_profitability(p_from timestamptz, p_to timestamptz)
+returns table (
+  deal_id uuid, name text, qty_sold int, revenue_cents int, cogs_cents int, cogs_known boolean,
+  contribution_cents int, contribution_margin_pct numeric, food_cost_pct numeric,
+  list_value_cents int, customer_saving_cents int
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.has_perm('inventory.view_cost')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    with header as (
+      select l.order_id, l.deal_id, l.name_snapshot as name, l.qty, l.line_total_cents
+        from public.order_lines l
+        join public.orders o on o.id = l.order_id
+       where l.deal_id is not null and l.menu_item_id is null
+         and o.status in ('served','paid')
+         and coalesce(o.paid_at, o.created_at) >= p_from and coalesce(o.paid_at, o.created_at) < p_to
+    ),
+    comp as (
+      select ol.order_id, ol.deal_id,
+             coalesce(sum(ol.recipe_cost_cents),0)::int as cogs_cents,
+             bool_and(ol.recipe_cost_cents is not null) as cogs_known
+        from public.order_lines ol
+       where ol.deal_id is not null and ol.menu_item_id is not null
+       group by ol.order_id, ol.deal_id
+    ),
+    list_price as (
+      select dc.deal_id, sum(dc.qty * coalesce(v.price_cents, mi.price_cents, 0))::int as list_value_cents
+        from public.deal_components dc
+        join public.menu_items mi on mi.id = dc.menu_item_id
+        left join public.menu_variants v on v.id = dc.variant_id
+       group by dc.deal_id
+    )
+    select
+      h.deal_id, max(h.name) as name, sum(h.qty)::int as qty_sold, sum(h.line_total_cents)::int as revenue_cents,
+      coalesce(sum(c.cogs_cents),0)::int as cogs_cents,
+      coalesce(bool_and(c.cogs_known), false) as cogs_known,
+      (sum(h.line_total_cents) - coalesce(sum(c.cogs_cents),0))::int as contribution_cents,
+      case when sum(h.line_total_cents) > 0
+        then round((sum(h.line_total_cents) - coalesce(sum(c.cogs_cents),0))::numeric / sum(h.line_total_cents) * 1000) / 10
+        else null end as contribution_margin_pct,
+      case when sum(h.line_total_cents) > 0
+        then round(coalesce(sum(c.cogs_cents),0)::numeric / sum(h.line_total_cents) * 1000) / 10
+        else null end as food_cost_pct,
+      max(lp.list_value_cents) as list_value_cents,
+      case when max(lp.list_value_cents) is not null
+        then (max(lp.list_value_cents) * sum(h.qty) - sum(h.line_total_cents))::int
+        else null end as customer_saving_cents
+      from header h
+      left join comp c on c.order_id = h.order_id and c.deal_id = h.deal_id
+      left join list_price lp on lp.deal_id = h.deal_id
+     group by h.deal_id
+     order by revenue_cents desc;
+end $fn$;
+revoke all on function public.deal_profitability(timestamptz, timestamptz) from public;
+grant execute on function public.deal_profitability(timestamptz, timestamptz) to authenticated, service_role;
+
+-- Menu engineering (spec §31): classify each à la carte item against the
+-- period's own average popularity and average contribution-per-unit —
+-- never by food-cost % alone, so a pricier-to-make item that still sells a
+-- lot and earns real Rupees per unit doesn't get flagged as "bad".
+create or replace function public.menu_engineering(p_from timestamptz, p_to timestamptz)
+returns table (
+  menu_item_id uuid, variant_id uuid, name text, qty_sold int, revenue_cents int,
+  contribution_per_unit_cents int, total_contribution_cents int, quadrant text
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+declare v_avg_qty numeric; v_avg_contrib numeric;
+begin
+  if not (app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.has_perm('inventory.view_cost')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+
+  select avg(ip.qty_sold), avg(case when ip.qty_sold > 0 then ip.contribution_cents::numeric / ip.qty_sold else 0 end)
+    into v_avg_qty, v_avg_contrib
+    from public.item_profitability(p_from, p_to) ip;
+
+  return query
+    select
+      ip.menu_item_id, ip.variant_id, ip.name, ip.qty_sold, ip.revenue_cents,
+      case when ip.qty_sold > 0 then round(ip.contribution_cents::numeric / ip.qty_sold)::int else 0 end,
+      ip.contribution_cents,
+      case
+        when ip.qty_sold >= coalesce(v_avg_qty,0) and (case when ip.qty_sold > 0 then ip.contribution_cents::numeric / ip.qty_sold else 0 end) >= coalesce(v_avg_contrib,0)
+          then 'Star (high sales, high contribution)'
+        when ip.qty_sold >= coalesce(v_avg_qty,0)
+          then 'Plowhorse (high sales, low contribution)'
+        when (case when ip.qty_sold > 0 then ip.contribution_cents::numeric / ip.qty_sold else 0 end) >= coalesce(v_avg_contrib,0)
+          then 'Puzzle (low sales, high contribution)'
+        else 'Dog (low sales, low contribution)'
+      end
+      from public.item_profitability(p_from, p_to) ip
+     order by ip.revenue_cents desc;
+end $fn$;
+revoke all on function public.menu_engineering(timestamptz, timestamptz) from public;
+grant execute on function public.menu_engineering(timestamptz, timestamptz) to authenticated, service_role;
+
+-- ── Portals (Phase 2) ────────────────────────────────────────────────────
+-- Super Admin (the owner) configures which portals exist. Each portal has its
+-- own Supabase Auth user (portal_user_id) carrying app_metadata.portal_id +
+-- app_metadata.permissions; routing is generated from route_key. Passwords are
+-- never stored here — they live as Auth password hashes on portal_user_id.
+create type app.portal_type as enum
+  ('super_admin', 'checkout', 'kitchen', 'attendance', 'manager', 'custom');
+
+create table public.portals (
+  id           uuid primary key default gen_random_uuid(),
+  name         text not null,
+  type         app.portal_type not null default 'custom',
+  route_key    text not null unique,
+  status       text not null default 'active' check (status in ('active', 'disabled')),
+  permissions  text[] not null default '{}',
+  portal_user_id uuid,                       -- auth.users id of the portal login
+  -- Mirror of that auth.users row's email (0047) — auth.users is still the
+  -- source of truth and every write path updates it first; this column
+  -- exists so Portal Management can list/edit the login email without an
+  -- admin API round trip per row, the same way `permissions` above mirrors
+  -- the login's app_metadata.
+  email        text,
+  force_pw_change boolean not null default false,
+  last_login_at timestamptz,
+  last_logout_at timestamptz,
+  created_at   timestamptz not null default now(),
+  created_by   uuid
+);
+create index portals_route_idx on public.portals(route_key);
+
+create table public.portal_staff (
+  portal_id     uuid not null references public.portals(id) on delete cascade,
+  membership_id uuid not null references public.memberships(id) on delete cascade,
+  primary key (portal_id, membership_id)
+);
+
+-- The portal id carried in the current JWT (empty for a person/owner login).
+create or replace function app.current_portal_id()
+returns uuid language sql stable as $$
+  select nullif(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb #>> '{app_metadata,portal_id}',
+    ''
+  )::uuid
+$$;
+
+-- A portal user clears its own force-password flag after changing the password.
+create or replace function public.clear_force_pw_change()
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_pid uuid := app.current_portal_id();
+begin
+  if v_pid is null then
+    raise exception 'not_a_portal_session' using errcode = 'insufficient_privilege';
+  end if;
+  update public.portals set force_pw_change = false where id = v_pid;
+end $fn$;
+revoke all on function public.clear_force_pw_change() from public;
+grant execute on function public.clear_force_pw_change() to authenticated, service_role;
+
+-- Portal session tracking (0053) — called by the web app right after a
+-- successful sign-in and right before sign-out. No-op for a staff (non-
+-- portal) login since current_portal_id() is only set on a 'kind: portal'
+-- JWT, so the one shared login form / SignOutButton can call these
+-- unconditionally. Also logs a 'portal.sign_in'/'portal.sign_out' row via
+-- app.log_action() so the existing Audit log page surfaces this history.
+create or replace function public.portal_record_sign_in()
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_pid uuid := app.current_portal_id();
+begin
+  if v_pid is null then return; end if;
+  update public.portals set last_login_at = now() where id = v_pid;
+  perform app.log_action('portal.sign_in', 'portals', v_pid::text);
+end $fn$;
+revoke all on function public.portal_record_sign_in() from public;
+grant execute on function public.portal_record_sign_in() to authenticated, service_role;
+
+create or replace function public.portal_record_sign_out()
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_pid uuid := app.current_portal_id();
+begin
+  if v_pid is null then return; end if;
+  update public.portals set last_logout_at = now() where id = v_pid;
+  perform app.log_action('portal.sign_out', 'portals', v_pid::text);
+end $fn$;
+revoke all on function public.portal_record_sign_out() from public;
+grant execute on function public.portal_record_sign_out() to authenticated, service_role;
+
+alter table public.portals enable row level security;
+alter table public.portal_staff enable row level security;
+
+-- Portal Management: anyone with portals.view reads all; a portal user always
+-- reads its own row (its dashboard needs the config).
+create policy portals_read on public.portals for select
+  using (app.has_perm('portals.view') or id = app.current_portal_id());
+create policy portals_write on public.portals for all
+  using (app.has_perm('portals.update')) with check (app.has_perm('portals.update'));
+-- The customer tracking page needs to know which counter(s) to send a guest
+-- to once their order is ready — name only, nothing sensitive in that row
+-- a guest couldn't already infer from being told where to pay.
+create policy guest_read on public.portals for select
+  using (type = 'checkout' and status = 'active');
+
+create policy portal_staff_read on public.portal_staff for select
+  using (app.has_perm('portals.view') or portal_id = app.current_portal_id());
+create policy portal_staff_write on public.portal_staff for all
+  using (app.has_perm('portals.update')) with check (app.has_perm('portals.update'));
+
+-- Replace the full set of staff memberships linked to one portal (0044).
+-- service_role-only — the API route re-checks the caller's own permissions
+-- in JS first, same pattern as /api/staff/access; this is a second,
+-- independent backstop for a direct RPC caller. Returns one row per
+-- AFFECTED membership (old ∪ new — a member being unlinked needs its
+-- permissions recomputed too), so the API can back-fill every affected
+-- Auth user's app_metadata.permissions in one round trip.
+create or replace function public.set_portal_staff(
+  p_portal_id uuid, p_membership_ids uuid[]
+) returns table(membership_id uuid, user_id uuid, effective text[])
+language plpgsql security definer set search_path = public, app as $$
+declare
+  v_portal record;
+  v_actor text[] := app.jwt_permissions();
+  v_all boolean := ('*' = any(v_actor)) or app.jwt_role() = 'service_role';
+  v_key text;
+  v_new uuid[] := coalesce(p_membership_ids, '{}'::uuid[]);
+begin
+  if not app.has_perm('portals.update') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+
+  select id, type, status, permissions into v_portal from public.portals where id = p_portal_id;
+  if not found then
+    raise exception 'portal_not_found' using errcode = 'no_data_found';
+  end if;
+  if v_portal.type = 'super_admin' then
+    raise exception 'the Super Admin portal cannot be assigned to staff' using errcode = 'insufficient_privilege';
+  end if;
+
+  if not v_all then
+    foreach v_key in array v_portal.permissions loop
+      if not (v_key = any(v_actor)) then
+        raise exception 'cannot grant a permission you do not hold: %', v_key
+          using errcode = 'insufficient_privilege';
+      end if;
+    end loop;
+  end if;
+
+  create temp table _affected(id uuid) on commit drop;
+  insert into _affected select ps.membership_id from public.portal_staff ps where ps.portal_id = p_portal_id;
+  insert into _affected select unnest(v_new) except select id from _affected;
+
+  delete from public.portal_staff where portal_id = p_portal_id;
+  insert into public.portal_staff (portal_id, membership_id)
+    select p_portal_id, m_id from unnest(v_new) as m_id
+    on conflict do nothing;
+
+  perform app.log_action('portal.staff', 'portals', p_portal_id::text, null,
+                         jsonb_build_object('membership_ids', v_new));
+
+  return query
+    select m.id, m.user_id,
+           app.membership_effective_permissions(m.role::text, m.extra_permissions, m.id)
+    from public.memberships m
+    where m.id in (select id from _affected);
+end $$;
+revoke all on function public.set_portal_staff(uuid, uuid[]) from public, authenticated, anon;
+grant execute on function public.set_portal_staff(uuid, uuid[]) to service_role;
+
+-- Recompute one membership's effective permissions from its CURRENT stored
+-- role/extra_permissions/portal_staff links (0044). Used after editing or
+-- deleting a portal, to re-sync every staff member linked to it.
+create or replace function public.membership_effective_permissions(
+  p_membership_id uuid
+) returns table(user_id uuid, effective text[])
+language sql stable security definer set search_path = public, app as $$
+  select m.user_id, app.membership_effective_permissions(m.role::text, m.extra_permissions, m.id)
+  from public.memberships m
+  where m.id = p_membership_id
+$$;
+revoke all on function public.membership_effective_permissions(uuid) from public, authenticated, anon;
+grant execute on function public.membership_effective_permissions(uuid) to service_role;
+
+do $$
+declare tbl text;
+begin
+  foreach tbl in array array[
+    'menu_categories','menu_items','menu_variants','modifier_groups','modifier_options','deals','deal_components',
+    'inventory_items','recipe_components','modifier_recipe_components',
+    'memberships','restaurant_tables','reservations',
+    'promotions','suppliers','purchase_orders','shifts','attendance',
+    'portals','portal_staff','roles','business_settings','attendance_settings',
+    'payments','refunds','order_adjustments','food_stock_log','daily_closings'
+  ] loop
+    execute format(
+      'create trigger audit after insert or update or delete on public.%I for each row execute function app.audit_row();',
+      tbl
+    );
+  end loop;
+end $$;
+
+-- ── Export audit trail (Restaurant Performance & Owner Activity
+-- Intelligence, spec §39) — one row per generated PDF/Excel report, so the
+-- owner can see who exported what, when, and for which period. Written by
+-- the API right after a report/export actually succeeds (or fails) —
+-- never backfilled or inferred, and this table records exports only, not
+-- the report CONTENT itself (which is never stored server-side; every
+-- report is generated fresh from the same authoritative data each time).
+create table public.export_audit_log (
+  id                 uuid primary key default gen_random_uuid(),
+  format             text not null check (format in ('pdf', 'excel')),
+  -- 'complete' = the full multi-section report/workbook; any other value
+  -- names the one section it was scoped to (e.g. 'suppliers',
+  -- 'purchasing', 'inventory', 'orders', 'expenses') — a per-section
+  -- export reuses the exact same generator, just narrowed.
+  domain             text not null default 'complete',
+  period_label       text not null,
+  period_from        timestamptz not null,
+  period_to          timestamptz not null,
+  -- Only meaningful for a 'excel' export narrowed by the Custom Export
+  -- sheet picker (spec §37) — null means the full workbook.
+  sheets             text[],
+  -- Path inside the private 'reports' bucket the generated file was
+  -- saved to, so it can be re-downloaded later instead of regenerated —
+  -- null when the file is not (or not yet) permanently stored (e.g. a
+  -- 'failed' row, or before this column existed).
+  storage_path       text,
+  requested_by       uuid,
+  requested_by_email text,
+  requested_by_role  text,
+  status             text not null default 'ready' check (status in ('ready', 'failed')),
+  error              text,
+  created_at         timestamptz not null default now()
+);
+create index export_audit_log_created_idx on public.export_audit_log(created_at desc);
+alter table public.export_audit_log enable row level security;
+create policy staff_read on public.export_audit_log for select
+  using (app.has_perm('reports.view') or app.has_perm('reports.export') or app.has_perm('reports.generate') or app.is_staff());
+create policy staff_insert on public.export_audit_log for insert
+  with check (app.has_perm('reports.generate') or app.has_perm('reports.export') or app.can_write());
+-- PDF generation happens client-side — the row is inserted server-side
+-- before the PDF bytes exist, then patched with storage_path once the
+-- browser renders and uploads the file. Excel is generated server-side in
+-- one request, so its row never needs this update path.
+create policy staff_update on public.export_audit_log for update
+  using (app.has_perm('reports.generate') or app.has_perm('reports.export') or app.can_write())
+  with check (app.has_perm('reports.generate') or app.has_perm('reports.export') or app.can_write());
+
+-- Permanent report storage: every generated PDF/Excel file is saved here
+-- (private bucket — a restaurant's financial reports are never public),
+-- keyed by the export_audit_log row's storage_path. A report is still
+-- always COMPUTED fresh from live data each time it's generated; storing
+-- the resulting file just means it can be re-downloaded byte-for-byte
+-- later without re-running the generation.
+insert into storage.buckets (id, name, public) values ('reports', 'reports', false) on conflict (id) do nothing;
+create policy "reports staff read" on storage.objects for select
+  using (bucket_id = 'reports' and (app.has_perm('reports.view') or app.has_perm('reports.export') or app.has_perm('reports.generate') or app.is_staff()));
+create policy "reports staff write" on storage.objects for all
+  using (bucket_id = 'reports' and (app.has_perm('reports.export') or app.has_perm('reports.generate') or app.can_write()))
+  with check (bucket_id = 'reports' and (app.has_perm('reports.export') or app.has_perm('reports.generate') or app.can_write()));
+
+-- ── Social media (Instagram) — connected accounts + a draft/approval queue
+-- for AI-proposed posts. Publishing is a SEPARATE, explicit human action
+-- (POST /api/social/publish/:id, social.approve_post) from drafting
+-- (social.propose_post) — the same two-gate shape as draft_deal (created
+-- off, a manager must separately switch it on) and draft_recipe (created
+-- draft, must be separately activated). Nothing here ever posts on its own.
+create table public.social_accounts (
+  id                 uuid primary key default gen_random_uuid(),
+  platform           text not null check (platform in ('instagram')),
+  account_name       text,
+  account_id         text not null,
+  -- The long-lived Page access token used for the Instagram Graph API
+  -- (never the short-lived user token from the OAuth callback itself).
+  access_token       text not null,
+  token_expires_at   timestamptz,
+  status             text not null default 'connected' check (status in ('connected', 'expired', 'disconnected')),
+  connected_by       uuid,
+  connected_at       timestamptz not null default now(),
+  created_at         timestamptz not null default now(),
+  updated_at         timestamptz not null default now(),
+  unique (platform, account_id)
+);
+create table public.social_posts (
+  id                 uuid primary key default gen_random_uuid(),
+  platform           text not null check (platform in ('instagram')),
+  account_id         uuid references public.social_accounts(id) on delete set null,
+  caption            text not null,
+  -- A publicly reachable image URL (Instagram's Graph API requires one to
+  -- build the media container) — auto-filled from the referenced deal/menu
+  -- item's own image_url when draft_social_post is given one that has a
+  -- photo on file; left null otherwise for a manager to add before publishing.
+  media_url          text,
+  related_type       text check (related_type is null or related_type in ('deal', 'promotion', 'menu_item')),
+  related_id         uuid,
+  status             text not null default 'draft' check (status in ('draft', 'approved', 'rejected', 'published', 'failed')),
+  proposed_by        uuid,
+  proposed_by_role   text,
+  approved_by        uuid,
+  approved_at        timestamptz,
+  published_at       timestamptz,
+  external_post_id   text,
+  error              text,
+  created_at         timestamptz not null default now()
+);
+create index social_posts_status_idx on public.social_posts(status, created_at desc);
+alter table public.social_accounts enable row level security;
+alter table public.social_posts enable row level security;
+create policy staff_read on public.social_accounts for select
+  using (app.has_perm('social.view') or app.can_write());
+create policy staff_write on public.social_accounts for all
+  using (app.has_perm('social.manage') or app.can_write())
+  with check (app.has_perm('social.manage') or app.can_write());
+create policy staff_read on public.social_posts for select
+  using (app.has_perm('social.view') or app.can_write());
+create policy staff_insert on public.social_posts for insert
+  with check (app.has_perm('social.propose_post') or app.can_write());
+-- Covers both a manager editing a draft (caption/media_url) and actually
+-- publishing it (status -> 'published') — the API re-checks
+-- social.approve_post specifically before ever calling the Graph API,
+-- this policy is the data-layer backstop, not the only gate.
+create policy staff_update on public.social_posts for update
+  using (app.has_perm('social.propose_post') or app.has_perm('social.approve_post') or app.can_write())
+  with check (app.has_perm('social.propose_post') or app.has_perm('social.approve_post') or app.can_write());
+create trigger audit_social_accounts after insert or update or delete on public.social_accounts
+  for each row execute function app.audit_row();
+create trigger audit_social_posts after insert or update or delete on public.social_posts
+  for each row execute function app.audit_row();
+
+-- ── Recipe-driven product availability engine (0052) ────────────────────
+-- Layers a derived "can we actually make this right now" signal on top of
+-- the existing manual toggles — see tenant-migrations/0052 for full
+-- rationale (kept in one place there rather than duplicated in both files).
+
+create table public.product_availability (
+  id                           uuid primary key default gen_random_uuid(),
+  menu_item_id                 uuid not null references public.menu_items(id) on delete cascade,
+  variant_id                   uuid references public.menu_variants(id) on delete cascade,
+  status                       text not null check (status in ('available', 'low_stock', 'unavailable')),
+  producible_qty                numeric(14,3),
+  bottleneck_inventory_item_id uuid references public.inventory_items(id) on delete set null,
+  reason                       text,
+  updated_at                   timestamptz not null default now()
+);
+create unique index product_availability_key_idx on public.product_availability(menu_item_id, variant_id) nulls not distinct;
+create index product_availability_item_idx on public.product_availability(menu_item_id);
+alter table public.product_availability enable row level security;
+create policy guest_read on public.product_availability for select using (true);
+create policy staff_read on public.product_availability for select using (app.has_perm('availability.view') or app.is_staff());
+
+create table public.availability_audit_log (
+  id                           bigint generated always as identity primary key,
+  menu_item_id                 uuid not null references public.menu_items(id) on delete cascade,
+  variant_id                   uuid references public.menu_variants(id) on delete cascade,
+  previous_status               text,
+  new_status                    text not null,
+  previous_producible_qty        numeric(14,3),
+  new_producible_qty             numeric(14,3),
+  bottleneck_inventory_item_id uuid references public.inventory_items(id) on delete set null,
+  reason                       text,
+  trigger_type                 text not null,
+  trigger_reference            text,
+  actor                        text not null default 'system',
+  created_at                   timestamptz not null default now()
+);
+create index availability_audit_log_item_idx on public.availability_audit_log(menu_item_id, created_at desc);
+create index availability_audit_log_created_idx on public.availability_audit_log(created_at desc);
+alter table public.availability_audit_log enable row level security;
+create policy staff_read on public.availability_audit_log for select using (app.has_perm('availability.view') or app.is_staff());
+
+-- ── Shared calculation core (0054) — the same math every version of this
+-- engine has used (floor(stock/qty_per_unit), bottleneck tracking,
+-- required-modifier-group viability), parameterized only on which stock
+-- figure to read per ingredient: live inventory_items.stock_qty
+-- (p_use_priority_pool = false — the plain per-product engine below) or
+-- priority_stock_pool.remaining (p_use_priority_pool = true — the
+-- priority waterfall, tenant-migrations/0054). Both callers share this
+-- ONE implementation rather than duplicating it.
+create or replace function app.compute_product_capacity(
+  p_menu_item_id uuid, p_variant_id uuid, p_use_priority_pool boolean default false
+) returns table (
+  tracked boolean, status text, producible_qty numeric,
+  bottleneck_inventory_item_id uuid, reason text
+) language plpgsql stable security definer set search_path = public, app as $fn$
+declare
+  v_effective_variant uuid;
+  v_has_variant_recipe boolean;
+  v_comp record;
+  v_capacity numeric;
+  v_min_capacity numeric;
+  v_bottleneck uuid;
+  v_bottleneck_name text;
+  v_bottleneck_low boolean;
+  v_has_recipe boolean := false;
+  v_tracked boolean := false;
+  v_producible numeric;
+  v_status text;
+  v_reason text;
+  v_req_group record;
+  v_group_viable boolean;
+  v_opt record;
+  v_opt_cap numeric;
+  v_opt_row record;
+  v_cap numeric;
+  v_needs_modifier_override boolean := false;
+  v_modifier_reason text;
+begin
+  if p_variant_id is not null then
+    select exists(
+      select 1 from public.recipe_components where menu_item_id = p_menu_item_id and variant_id = p_variant_id
+    ) into v_has_variant_recipe;
+    v_effective_variant := case when v_has_variant_recipe then p_variant_id else null end;
+  else
+    v_effective_variant := null;
+  end if;
+
+  v_min_capacity := null;
+  for v_comp in
+    select rc.inventory_item_id, rc.qty_per_unit, i.min_threshold, i.name,
+           case when p_use_priority_pool then coalesce(ps.remaining, i.stock_qty) else i.stock_qty end as eff_stock
+      from public.recipe_components rc
+      join public.inventory_items i on i.id = rc.inventory_item_id
+      left join public.priority_stock_pool ps on p_use_priority_pool and ps.inventory_item_id = rc.inventory_item_id
+     where rc.menu_item_id = p_menu_item_id
+       and rc.variant_id is not distinct from v_effective_variant
+  loop
+    v_has_recipe := true;
+    v_capacity := floor(greatest(v_comp.eff_stock, 0) / v_comp.qty_per_unit);
+    if v_min_capacity is null or v_capacity < v_min_capacity then
+      v_min_capacity := v_capacity;
+      v_bottleneck := v_comp.inventory_item_id;
+      v_bottleneck_name := v_comp.name;
+      v_bottleneck_low := v_comp.eff_stock <= v_comp.min_threshold;
+    end if;
+  end loop;
+
+  if v_has_recipe then
+    v_tracked := true;
+    v_producible := v_min_capacity;
+    if v_producible <= 0 then
+      v_status := 'unavailable';
+      v_reason := v_bottleneck_name || ' unavailable';
+    elsif v_bottleneck_low then
+      v_status := 'low_stock';
+      v_reason := v_bottleneck_name || ' approaching reorder level';
+    else
+      v_status := 'available';
+      v_reason := null;
+    end if;
+  else
+    -- No base/variant recipe — nothing constrains capacity from that side,
+    -- but the required-modifier-group check below may still find a real
+    -- constraint (e.g. a "Choose Sauce" group whose only ingredient link is
+    -- on its options, not the item itself — spec §9 / §31 scenario 7).
+    v_producible := null;
+    v_status := 'available';
+    v_reason := null;
+  end if;
+
+  -- Checked unconditionally, even when the item has no base recipe of its
+  -- own — a required group with nothing left to pick makes the product
+  -- itself unorderable regardless of whether it has other ingredients.
+  for v_req_group in
+    select id, name from public.modifier_groups
+     where menu_item_id = p_menu_item_id and min_select >= 1
+  loop
+    v_tracked := true;
+    v_group_viable := false;
+    for v_opt in
+      select id from public.modifier_options where group_id = v_req_group.id and is_available
+    loop
+      v_opt_cap := null;
+      for v_opt_row in
+        select mrc.qty_base,
+               case when p_use_priority_pool then coalesce(ps.remaining, i.stock_qty) else i.stock_qty end as eff_stock
+          from public.modifier_recipe_components mrc
+          join public.inventory_items i on i.id = mrc.inventory_item_id
+          left join public.priority_stock_pool ps on p_use_priority_pool and ps.inventory_item_id = mrc.inventory_item_id
+         where mrc.modifier_option_id = v_opt.id
+      loop
+        v_cap := floor(greatest(v_opt_row.eff_stock, 0) / v_opt_row.qty_base);
+        if v_opt_cap is null or v_cap < v_opt_cap then v_opt_cap := v_cap; end if;
+      end loop;
+      if v_opt_cap is null or v_opt_cap > 0 then
+        v_group_viable := true;
+        exit;
+      end if;
+    end loop;
+    if not v_group_viable then
+      v_needs_modifier_override := true;
+      v_modifier_reason := 'No available options for ' || v_req_group.name;
+      exit;
+    end if;
+  end loop;
+
+  if v_needs_modifier_override and v_status is distinct from 'unavailable' then
+    v_status := 'unavailable';
+    v_reason := v_modifier_reason;
+    v_producible := 0;
+  end if;
+
+  return query select v_tracked, v_status, v_producible, v_bottleneck, v_reason;
+end;
+$fn$;
+
+-- ── Shared write core (0054) — upserts product_availability and, only on
+-- a real change, appends to availability_audit_log + app.log_action.
+-- Used by both the plain engine and the priority waterfall so every
+-- consumer keeps reading the ONE same table regardless of which path
+-- computed it.
+create or replace function app.apply_product_availability_result(
+  p_menu_item_id uuid, p_variant_id uuid, p_tracked boolean, p_status text, p_producible numeric,
+  p_bottleneck uuid, p_reason text, p_trigger_type text, p_trigger_reference text, p_actor text
+) returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_prev record;
+begin
+  if not p_tracked then
+    delete from public.product_availability
+     where menu_item_id = p_menu_item_id and variant_id is not distinct from p_variant_id;
+    return;
+  end if;
+
+  select status, producible_qty into v_prev
+    from public.product_availability
+   where menu_item_id = p_menu_item_id and variant_id is not distinct from p_variant_id;
+
+  insert into public.product_availability
+    (menu_item_id, variant_id, status, producible_qty, bottleneck_inventory_item_id, reason, updated_at)
+  values
+    (p_menu_item_id, p_variant_id, p_status, p_producible, p_bottleneck, p_reason, now())
+  on conflict (menu_item_id, variant_id) do update set
+    status = excluded.status,
+    producible_qty = excluded.producible_qty,
+    bottleneck_inventory_item_id = excluded.bottleneck_inventory_item_id,
+    reason = excluded.reason,
+    updated_at = now();
+
+  if v_prev is null or v_prev.status is distinct from p_status or v_prev.producible_qty is distinct from p_producible then
+    insert into public.availability_audit_log
+      (menu_item_id, variant_id, previous_status, new_status, previous_producible_qty, new_producible_qty,
+       bottleneck_inventory_item_id, reason, trigger_type, trigger_reference, actor)
+    values
+      (p_menu_item_id, p_variant_id, v_prev.status, p_status, v_prev.producible_qty, p_producible,
+       p_bottleneck, p_reason, p_trigger_type, p_trigger_reference, p_actor);
+    perform app.log_action('availability.changed', 'menu_items', p_menu_item_id::text, null,
+      jsonb_build_object('variant_id', p_variant_id, 'status', p_status, 'producible_qty', p_producible, 'reason', p_reason));
+  end if;
+end;
+$fn$;
+
+create or replace function app.recalc_product_availability(
+  p_menu_item_id uuid,
+  p_variant_id uuid,
+  p_trigger_type text default 'manual_recalculation',
+  p_trigger_reference text default null,
+  p_actor text default 'system'
+) returns void
+language plpgsql security definer set search_path = public, app as $$
+declare v_r record;
+begin
+  select * into v_r from app.compute_product_capacity(p_menu_item_id, p_variant_id, false);
+  perform app.apply_product_availability_result(
+    p_menu_item_id, p_variant_id, v_r.tracked, v_r.status, v_r.producible_qty,
+    v_r.bottleneck_inventory_item_id, v_r.reason, p_trigger_type, p_trigger_reference, p_actor
+  );
+end;
+$$;
+
+create or replace function app.recalc_products_for_ingredient(
+  p_inventory_item_id uuid, p_trigger_type text, p_trigger_reference text default null
+) returns void
+language plpgsql security definer set search_path = public, app as $$
+declare r record;
+begin
+  for r in
+    select distinct menu_item_id, variant_id from public.recipe_components
+     where inventory_item_id = p_inventory_item_id
+  loop
+    perform app.recalc_product_availability(r.menu_item_id, r.variant_id, p_trigger_type, p_trigger_reference);
+  end loop;
+
+  for r in
+    select distinct x.menu_item_id, x.variant_id
+      from public.modifier_recipe_components mrc
+      join public.modifier_options mo on mo.id = mrc.modifier_option_id
+      join public.modifier_groups mg on mg.id = mo.group_id
+      join public.product_availability x on x.menu_item_id = mg.menu_item_id
+     where mrc.inventory_item_id = p_inventory_item_id
+  loop
+    perform app.recalc_product_availability(r.menu_item_id, r.variant_id, p_trigger_type, p_trigger_reference);
+  end loop;
+
+  for r in
+    select distinct mg.menu_item_id
+      from public.modifier_recipe_components mrc
+      join public.modifier_options mo on mo.id = mrc.modifier_option_id
+      join public.modifier_groups mg on mg.id = mo.group_id
+     where mrc.inventory_item_id = p_inventory_item_id
+       and not exists (select 1 from public.product_availability x where x.menu_item_id = mg.menu_item_id)
+  loop
+    perform app.recalc_product_availability(r.menu_item_id, null, p_trigger_type, p_trigger_reference);
+  end loop;
+end;
+$$;
+
+create or replace function app.on_inventory_stock_change() returns trigger
+language plpgsql security definer set search_path = public, app as $$
+begin
+  if new.stock_qty is distinct from old.stock_qty then
+    if exists(select 1 from public.product_priority) then
+      perform app.recalc_priority_allocation(
+        case when new.stock_qty > old.stock_qty then 'inventory_restock' else 'inventory_consumption' end,
+        null
+      );
+    else
+      perform app.recalc_products_for_ingredient(
+        new.id,
+        case when new.stock_qty > old.stock_qty then 'inventory_restock' else 'inventory_consumption' end,
+        null
+      );
+    end if;
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists recalc_availability_on_stock_change on public.inventory_items;
+create trigger recalc_availability_on_stock_change after update of stock_qty on public.inventory_items
+  for each row execute function app.on_inventory_stock_change();
+
+create or replace function app.on_recipe_components_change() returns trigger
+language plpgsql security definer set search_path = public, app as $$
+declare v_item uuid; v_variant uuid;
+begin
+  if tg_op = 'DELETE' then
+    v_item := old.menu_item_id; v_variant := old.variant_id;
+  else
+    v_item := new.menu_item_id; v_variant := new.variant_id;
+  end if;
+  if exists(select 1 from public.product_priority) then
+    perform app.recalc_priority_allocation('recipe_change', null);
+  else
+    perform app.recalc_product_availability(v_item, v_variant, 'recipe_change', null);
+    if v_variant is not null then
+      perform app.recalc_product_availability(v_item, null, 'recipe_change', null);
+    end if;
+  end if;
+  return coalesce(new, old);
+end;
+$$;
+drop trigger if exists recalc_availability_on_recipe_change on public.recipe_components;
+create trigger recalc_availability_on_recipe_change after insert or update or delete on public.recipe_components
+  for each row execute function app.on_recipe_components_change();
+
+create or replace function app.on_modifier_recipe_components_change() returns trigger
+language plpgsql security definer set search_path = public, app as $$
+declare v_option uuid; v_item uuid; r record;
+begin
+  v_option := coalesce(new.modifier_option_id, old.modifier_option_id);
+  select mg.menu_item_id into v_item
+    from public.modifier_options mo join public.modifier_groups mg on mg.id = mo.group_id
+   where mo.id = v_option;
+  if v_item is not null then
+    if exists(select 1 from public.product_priority) then
+      perform app.recalc_priority_allocation('recipe_change', null);
+    else
+      for r in select variant_id from public.product_availability where menu_item_id = v_item loop
+        perform app.recalc_product_availability(v_item, r.variant_id, 'recipe_change', null);
+      end loop;
+      perform app.recalc_product_availability(v_item, null, 'recipe_change', null);
+    end if;
+  end if;
+  return coalesce(new, old);
+end;
+$$;
+drop trigger if exists recalc_availability_on_modifier_recipe_change on public.modifier_recipe_components;
+create trigger recalc_availability_on_modifier_recipe_change after insert or update or delete on public.modifier_recipe_components
+  for each row execute function app.on_modifier_recipe_components_change();
+
+create or replace function app.on_modifier_option_availability_change() returns trigger
+language plpgsql security definer set search_path = public, app as $$
+declare v_item uuid; r record;
+begin
+  if new.is_available is distinct from old.is_available then
+    select mg.menu_item_id into v_item from public.modifier_groups mg where mg.id = new.group_id;
+    if v_item is not null then
+      if exists(select 1 from public.product_priority) then
+        perform app.recalc_priority_allocation('recipe_change', null);
+      else
+        for r in select variant_id from public.product_availability where menu_item_id = v_item loop
+          perform app.recalc_product_availability(v_item, r.variant_id, 'recipe_change', null);
+        end loop;
+        perform app.recalc_product_availability(v_item, null, 'recipe_change', null);
+      end if;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists recalc_availability_on_modifier_option_change on public.modifier_options;
+create trigger recalc_availability_on_modifier_option_change after update of is_available on public.modifier_options
+  for each row execute function app.on_modifier_option_availability_change();
+
+create or replace function public.get_product_availability_detail(p_menu_item_id uuid, p_variant_id uuid default null)
+returns table (
+  inventory_item_id uuid, ingredient_name text, unit text,
+  stock_qty numeric, qty_per_unit numeric, capacity numeric
+)
+language plpgsql security definer set search_path = public, app as $$
+declare v_effective_variant uuid; v_has_variant_recipe boolean;
+begin
+  if not (app.has_perm('availability.view') or app.has_perm('inventory.view_cost') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_variant_id is not null then
+    select exists(select 1 from public.recipe_components where menu_item_id = p_menu_item_id and variant_id = p_variant_id)
+      into v_has_variant_recipe;
+    v_effective_variant := case when v_has_variant_recipe then p_variant_id else null end;
+  else
+    v_effective_variant := null;
+  end if;
+  return query
+    select rc.inventory_item_id, i.name, i.unit, i.stock_qty, rc.qty_per_unit,
+           floor(greatest(i.stock_qty, 0) / rc.qty_per_unit) as capacity
+      from public.recipe_components rc
+      join public.inventory_items i on i.id = rc.inventory_item_id
+     where rc.menu_item_id = p_menu_item_id and rc.variant_id is not distinct from v_effective_variant
+     order by capacity asc;
+end;
+$$;
+revoke all on function public.get_product_availability_detail(uuid, uuid) from public;
+grant execute on function public.get_product_availability_detail(uuid, uuid) to authenticated, service_role;
+
+create or replace function public.recalculate_all_product_availability()
+returns void
+language plpgsql security definer set search_path = public, app as $$
+declare r record;
+begin
+  if not (app.has_perm('availability.update') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  for r in select distinct menu_item_id, variant_id from public.recipe_components loop
+    perform app.recalc_product_availability(r.menu_item_id, r.variant_id, 'manual_recalculation', null);
+  end loop;
+  -- Items with no base/variant recipe at all, but a required modifier
+  -- group of their own — recalc_product_availability() tracks these too
+  -- (spec §31 scenario 7), so the bulk backfill needs to reach them even
+  -- though recipe_components has no row for them.
+  for r in
+    select distinct mg.menu_item_id
+      from public.modifier_groups mg
+     where mg.min_select >= 1
+       and not exists (select 1 from public.recipe_components rc where rc.menu_item_id = mg.menu_item_id)
+  loop
+    perform app.recalc_product_availability(r.menu_item_id, null, 'manual_recalculation', null);
+  end loop;
+  perform app.recalc_priority_allocation('manual_recalculation', null);
+end;
+$$;
+revoke all on function public.recalculate_all_product_availability() from public;
+grant execute on function public.recalculate_all_product_availability() to authenticated, service_role;
+
+alter publication supabase_realtime add table public.product_availability;
+
+-- ── Recipe/Menu Inventory Consumption Priority (0054) ────────────────────
+-- Which menu items are "key" enough to have an explicit priority, and
+-- their level (critical/high/medium/low) + rank (drag-and-drop position
+-- within that level). Absence here means "no explicit priority" — such a
+-- product still joins the waterfall (as lowest priority, alphabetical)
+-- whenever ANY priority exists tenant-wide, so it sees the true leftover
+-- stock after prioritized products claim theirs.
+create table public.product_priority (
+  id             uuid primary key default gen_random_uuid(),
+  menu_item_id   uuid not null unique references public.menu_items(id) on delete cascade,
+  priority_level text not null default 'medium' check (priority_level in ('critical', 'high', 'medium', 'low')),
+  priority_rank  int not null,
+  created_at     timestamptz not null default now(),
+  updated_at     timestamptz not null default now()
+);
+create unique index product_priority_level_rank_uq on public.product_priority(priority_level, priority_rank);
+alter table public.product_priority enable row level security;
+create policy staff_read on public.product_priority for select using (app.has_perm('availability.view') or app.is_staff());
+-- No direct write policy — writes only through set_product_priority/
+-- remove_product_priority/reorder_product_priority below (SECURITY
+-- DEFINER), same immutable-from-client convention product_availability/
+-- availability_audit_log already use.
+create trigger audit_product_priority after insert or update or delete on public.product_priority
+  for each row execute function app.audit_row();
+
+-- Scratch working state for ONE app.recalc_priority_allocation() run —
+-- reseeded from live inventory_items.stock_qty at the start of every call,
+-- decremented as each product in priority order claims its share. Never
+-- read outside that function.
+create table public.priority_stock_pool (
+  inventory_item_id uuid primary key references public.inventory_items(id) on delete cascade,
+  remaining         numeric(14,3) not null default 0
+);
+alter table public.priority_stock_pool enable row level security;
+create policy staff_read on public.priority_stock_pool for select using (app.has_perm('availability.view') or app.is_staff());
+
+alter publication supabase_realtime add table public.product_priority;
+
+-- No-op when no priority is configured. Otherwise: reseed the working
+-- stock pool from live inventory, then walk every tracked (menu_item,
+-- variant) pair in priority order — critical, then high, then medium,
+-- then low, each ordered by rank within that level; anything with no
+-- explicit priority comes last, alphabetically. Each product's capacity
+-- is computed against whatever remains in the pool, then its own claim
+-- (producible_qty × qty_per_unit, per ingredient) is deducted before the
+-- next, lower-priority product is computed — a single-pass greedy
+-- allocation: the direct, auditable meaning of "higher priority gets
+-- shared capacity first".
+create or replace function app.recalc_priority_allocation(
+  p_trigger_type text default 'priority_reallocation', p_trigger_reference text default null
+) returns void language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_has_priorities boolean;
+  v_prod record;
+  v_r record;
+  v_effective_variant uuid;
+  v_has_variant_recipe boolean;
+begin
+  select exists(select 1 from public.product_priority) into v_has_priorities;
+  if not v_has_priorities then
+    return;
+  end if;
+
+  delete from public.priority_stock_pool where true;
+  insert into public.priority_stock_pool (inventory_item_id, remaining)
+    select id, greatest(stock_qty, 0) from public.inventory_items;
+
+  for v_prod in
+    select x.menu_item_id, x.variant_id,
+           case coalesce(pp.priority_level, 'unprioritized')
+             when 'critical' then 0 when 'high' then 1 when 'medium' then 2 when 'low' then 3
+             else 4
+           end as level_rank,
+           coalesce(pp.priority_rank, 999999) as rank_in_level,
+           mi.name as item_name
+      from (
+        select distinct menu_item_id, variant_id from public.recipe_components
+        union
+        select distinct mg.menu_item_id, null::uuid from public.modifier_groups mg where mg.min_select >= 1
+      ) x
+      join public.menu_items mi on mi.id = x.menu_item_id
+      left join public.product_priority pp on pp.menu_item_id = x.menu_item_id
+     order by level_rank, rank_in_level, mi.name, x.variant_id nulls first
+  loop
+    select * into v_r from app.compute_product_capacity(v_prod.menu_item_id, v_prod.variant_id, true);
+    perform app.apply_product_availability_result(
+      v_prod.menu_item_id, v_prod.variant_id, v_r.tracked, v_r.status, v_r.producible_qty,
+      v_r.bottleneck_inventory_item_id, v_r.reason, p_trigger_type, p_trigger_reference, 'system'
+    );
+
+    if v_r.tracked and coalesce(v_r.producible_qty, 0) > 0 then
+      if v_prod.variant_id is not null then
+        select exists(select 1 from public.recipe_components where menu_item_id = v_prod.menu_item_id and variant_id = v_prod.variant_id)
+          into v_has_variant_recipe;
+        v_effective_variant := case when v_has_variant_recipe then v_prod.variant_id else null end;
+      else
+        v_effective_variant := null;
+      end if;
+
+      update public.priority_stock_pool ps
+         set remaining = ps.remaining - (v_r.producible_qty * rc.qty_per_unit)
+        from public.recipe_components rc
+       where rc.menu_item_id = v_prod.menu_item_id
+         and rc.variant_id is not distinct from v_effective_variant
+         and ps.inventory_item_id = rc.inventory_item_id;
+    end if;
+  end loop;
+end;
+$fn$;
+
+create or replace function public.set_product_priority(p_menu_item_id uuid, p_priority_level text)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_next_rank int; v_cur_level text;
+begin
+  if not (app.has_perm('availability.update') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_priority_level not in ('critical', 'high', 'medium', 'low') then
+    raise exception 'bad_priority_level' using errcode = 'check_violation';
+  end if;
+
+  select priority_level into v_cur_level from public.product_priority where menu_item_id = p_menu_item_id;
+
+  if v_cur_level is null then
+    select coalesce(max(priority_rank), 0) + 1 into v_next_rank from public.product_priority where priority_level = p_priority_level;
+    insert into public.product_priority (menu_item_id, priority_level, priority_rank)
+    values (p_menu_item_id, p_priority_level, v_next_rank);
+  elsif v_cur_level <> p_priority_level then
+    select coalesce(max(priority_rank), 0) + 1 into v_next_rank from public.product_priority where priority_level = p_priority_level;
+    update public.product_priority set priority_level = p_priority_level, priority_rank = v_next_rank, updated_at = now()
+     where menu_item_id = p_menu_item_id;
+  end if;
+
+  perform app.recalc_priority_allocation('priority_change', p_menu_item_id::text);
+end;
+$fn$;
+revoke all on function public.set_product_priority(uuid, text) from public;
+grant execute on function public.set_product_priority(uuid, text) to authenticated, service_role;
+
+create or replace function public.remove_product_priority(p_menu_item_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('availability.update') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  delete from public.product_priority where menu_item_id = p_menu_item_id;
+  if not exists (select 1 from public.product_priority) then
+    perform public.recalculate_all_product_availability();
+  else
+    perform app.recalc_priority_allocation('priority_change', p_menu_item_id::text);
+  end if;
+end;
+$fn$;
+revoke all on function public.remove_product_priority(uuid) from public;
+grant execute on function public.remove_product_priority(uuid) to authenticated, service_role;
+
+create or replace function public.reorder_product_priority(p_priority_level text, p_ordered_menu_item_ids uuid[])
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_id uuid; v_rank int := 1;
+begin
+  if not (app.has_perm('availability.update') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_priority_level not in ('critical', 'high', 'medium', 'low') then
+    raise exception 'bad_priority_level' using errcode = 'check_violation';
+  end if;
+
+  update public.product_priority set priority_rank = priority_rank + 1000000
+   where priority_level = p_priority_level and menu_item_id = any(p_ordered_menu_item_ids);
+
+  foreach v_id in array p_ordered_menu_item_ids loop
+    update public.product_priority set priority_rank = v_rank, updated_at = now()
+     where menu_item_id = v_id and priority_level = p_priority_level;
+    v_rank := v_rank + 1;
+  end loop;
+
+  perform app.recalc_priority_allocation('priority_change', null);
+end;
+$fn$;
+revoke all on function public.reorder_product_priority(text, uuid[]) from public;
+grant execute on function public.reorder_product_priority(text, uuid[]) to authenticated, service_role;
+
+-- ── Seed ─────────────────────────────────────────────────────────────────
+insert into public.menu_categories (name) values ('Uncategorised');
+
+-- The implicit Super Admin portal (the owner). No portal_user_id — the owner
+-- signs in as a person; this row just anchors "everything" in Portal Management.
+insert into public.portals (name, type, route_key, permissions)
+values ('Super Admin', 'super_admin', 'admin', array['*']);
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- 0058 — portal permission coverage (verbatim from tenant-migrations/0058)
+-- ════════════════════════════════════════════════════════════════════════════
+-- ============================================================================
+-- Tenant delta 0058 — every Create Portal permission option does something.
+--
+-- 61 of the 127 permission_catalog keys had no effect on a generated custom
+-- portal: some were enforced server-side but never wired into a screen, some
+-- were checkboxes with no enforcement or feature behind them at all. This
+-- migration adds the server-side half for the second kind:
+--
+--   * Per-operation RLS for keys that name one operation on a table whose
+--     existing policy only checks a broader key — tables.create, deals.create/
+--     archive, variants.*, purchases.create/delete, supplier.create/update,
+--     roles.create/delete. These are ADDITIVE permissive policies: every
+--     existing policy is left in place, so no current user loses anything.
+--   * RPCs for actions that had no implementation — adjust_payment,
+--     payment reconciliation, cash counts, ingredient costs, attendance
+--     corrections/dashboard/history, review responses/moderation/analytics,
+--     member access list.
+--   * New tables for features that didn't exist — customers, cash_counts,
+--     attendance_corrections — plus review response/moderation columns on
+--     feedback.
+--   * Anti-escalation triggers on portals and roles. The portals_write and
+--     roles mgr_write RLS policies let any holder of portals.update /
+--     roles.update write rows DIRECTLY through PostgREST, skipping the API's
+--     "can't grant what you don't hold" check. Harmless while only the owner
+--     held those keys; now that Portal Management can be delegated to a
+--     custom portal, the database itself enforces it.
+--
+-- Idempotent: every policy is dropped-if-exists first, every table/column is
+-- if-not-exists, every function is create-or-replace.
+-- ============================================================================
+
+-- Defined in 0044; repeated here (identical body) because at least one tenant
+-- reached v57 without it.
+create or replace function app.jwt_role()
+returns text language sql stable as $$
+  select nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role'
+$$;
+
+-- ── Anti-escalation helper ────────────────────────────────────────────────
+-- True when every key in p_perms is held by the caller. service_role, '*'
+-- holders and legacy owner/manager JWTs (no permissions array, can_write())
+-- pass — the same callers app.has_perm() already treats as unrestricted.
+create or replace function app.caller_holds_all(p_perms text[])
+returns boolean language sql stable as $$
+  select
+    app.jwt_role() = 'service_role'
+    or '*' = any(app.jwt_permissions())
+    or (app.jwt_permissions() = '{}'::text[] and app.can_write())
+    or (not ('*' = any(coalesce(p_perms, '{}'::text[])))
+        and coalesce(p_perms, '{}'::text[]) <@ app.jwt_permissions())
+$$;
+
+-- ── Portals: database-level anti-escalation ───────────────────────────────
+create or replace function app.guard_portal_write() returns trigger
+language plpgsql as $$
+begin
+  -- Direct database sessions (provisioning, migrations) carry no JWT.
+  if app.jwt_role() = 'service_role' or nullif(current_setting('request.jwt.claims', true), '') is null then
+    return coalesce(new, old);
+  end if;
+  -- Bookkeeping a portal does on its own row (last sign-in/out, clearing
+  -- force_pw_change) doesn't touch access, so it isn't guarded.
+  if tg_op = 'UPDATE'
+     and (new.name, new.type, new.route_key, new.status, new.permissions, new.portal_user_id, new.email)
+         is not distinct from
+         (old.name, old.type, old.route_key, old.status, old.permissions, old.portal_user_id, old.email) then
+    return new;
+  end if;
+  if tg_op in ('UPDATE', 'DELETE') then
+    if old.type = 'super_admin' then
+      raise exception 'the Super Admin portal cannot be changed' using errcode = 'insufficient_privilege';
+    end if;
+    -- A portal can never manage itself, and nobody can touch a portal that
+    -- holds access they don't.
+    if old.id = app.current_portal_id() then
+      raise exception 'a portal cannot change its own access' using errcode = 'insufficient_privilege';
+    end if;
+    if not app.caller_holds_all(old.permissions) then
+      raise exception 'that portal holds access you do not have' using errcode = 'insufficient_privilege';
+    end if;
+  end if;
+  if tg_op in ('INSERT', 'UPDATE') then
+    if new.type = 'super_admin' and tg_op = 'INSERT' then
+      raise exception 'only one Super Admin portal exists' using errcode = 'insufficient_privilege';
+    end if;
+    if not app.caller_holds_all(new.permissions) then
+      raise exception 'cannot grant a permission you do not hold' using errcode = 'insufficient_privilege';
+    end if;
+    -- Enable/disable alone needs portals.disable, everything else portals.update.
+    if tg_op = 'UPDATE' and new.status is distinct from old.status
+       and not (app.has_perm('portals.disable') or app.has_perm('portals.update')) then
+      raise exception 'forbidden' using errcode = 'insufficient_privilege';
+    end if;
+    -- portals.disable alone may flip status and nothing else.
+    if tg_op = 'UPDATE' and not app.has_perm('portals.update')
+       and (new.name, new.type, new.route_key, new.permissions, new.portal_user_id, new.email)
+           is distinct from
+           (old.name, old.type, old.route_key, old.permissions, old.portal_user_id, old.email) then
+      raise exception 'forbidden' using errcode = 'insufficient_privilege';
+    end if;
+  end if;
+  return coalesce(new, old);
+end $$;
+drop trigger if exists guard_portal_write on public.portals;
+create trigger guard_portal_write before insert or update or delete on public.portals
+  for each row execute function app.guard_portal_write();
+
+-- portals.create may insert a row (the API still does the auth-user side);
+-- portals.disable may flip status. The existing portals_write policy
+-- (portals.update, all operations) stays.
+drop policy if exists portals_create on public.portals;
+create policy portals_create on public.portals for insert with check (app.has_perm('portals.create'));
+drop policy if exists portals_disable on public.portals;
+create policy portals_disable on public.portals for update
+  using (app.has_perm('portals.disable')) with check (app.has_perm('portals.disable'));
+
+-- ── Roles: per-operation keys + anti-escalation ───────────────────────────
+drop policy if exists roles_create on public.roles;
+create policy roles_create on public.roles for insert with check (app.has_perm('roles.create'));
+drop policy if exists roles_delete on public.roles;
+create policy roles_delete on public.roles for delete using (app.has_perm('roles.delete'));
+
+create or replace function app.guard_role_write() returns trigger
+language plpgsql as $$
+begin
+  -- Direct database sessions (provisioning, migrations) carry no JWT.
+  if app.jwt_role() = 'service_role' or nullif(current_setting('request.jwt.claims', true), '') is null then
+    return coalesce(new, old);
+  end if;
+  if tg_op in ('UPDATE', 'DELETE') and not app.caller_holds_all(old.permissions) then
+    raise exception 'that role holds access you do not have' using errcode = 'insufficient_privilege';
+  end if;
+  if tg_op in ('INSERT', 'UPDATE') and not app.caller_holds_all(new.permissions) then
+    raise exception 'cannot grant a permission you do not hold' using errcode = 'insufficient_privilege';
+  end if;
+  return coalesce(new, old);
+end $$;
+drop trigger if exists guard_role_write on public.roles;
+create trigger guard_role_write before insert or update or delete on public.roles
+  for each row execute function app.guard_role_write();
+
+-- ── permissions.view: who holds what ──────────────────────────────────────
+create or replace function public.member_access_list()
+returns table (
+  membership_id uuid, email text, full_name text, role text, status text,
+  extra_permissions text[], effective_permissions text[]
+) language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('permissions.view') or app.has_perm('permissions.assign')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select m.id, m.email, m.full_name, m.role::text, m.status::text, m.extra_permissions,
+           app.membership_effective_permissions(m.role::text, m.extra_permissions, m.id)
+      from public.memberships m
+     order by m.created_at;
+end $fn$;
+revoke all on function public.member_access_list() from public;
+grant execute on function public.member_access_list() to authenticated, service_role;
+
+-- ── Tables / Deals / Suppliers / Purchases: per-operation keys ─────────────
+drop policy if exists tables_create on public.restaurant_tables;
+create policy tables_create on public.restaurant_tables for insert with check (app.has_perm('tables.create'));
+
+drop policy if exists deals_create on public.deals;
+create policy deals_create on public.deals for insert with check (app.has_perm('deals.create'));
+drop policy if exists deals_archive on public.deals;
+create policy deals_archive on public.deals for delete using (app.has_perm('deals.archive'));
+
+-- Taking a deal off sale / back on sale without full edit rights.
+create or replace function public.set_deal_available(p_deal_id uuid, p_available boolean)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('deals.archive') or app.has_perm('deals.update')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.deals set is_available = p_available where id = p_deal_id;
+  if not found then raise exception 'deal_not_found' using errcode = 'no_data_found'; end if;
+  perform app.log_action('deal.availability', 'deals', p_deal_id::text, null,
+                         jsonb_build_object('is_available', p_available));
+end $fn$;
+revoke all on function public.set_deal_available(uuid, boolean) from public;
+grant execute on function public.set_deal_available(uuid, boolean) to authenticated, service_role;
+
+drop policy if exists supplier_create on public.suppliers;
+create policy supplier_create on public.suppliers for insert with check (app.has_perm('supplier.create'));
+drop policy if exists supplier_update on public.suppliers;
+create policy supplier_update on public.suppliers for update
+  using (app.has_perm('supplier.update')) with check (app.has_perm('supplier.update'));
+
+drop policy if exists purchases_create on public.purchase_orders;
+create policy purchases_create on public.purchase_orders for insert
+  with check (app.has_perm('purchases.create') and status = 'draft');
+drop policy if exists purchases_create_lines on public.purchase_order_lines;
+create policy purchases_create_lines on public.purchase_order_lines for insert
+  with check (app.has_perm('purchases.create') and exists (
+    select 1 from public.purchase_orders po where po.id = purchase_order_id and po.status = 'draft'));
+-- Only unsent drafts can be deleted by purchases.delete alone.
+drop policy if exists purchases_delete on public.purchase_orders;
+create policy purchases_delete on public.purchase_orders for delete
+  using (app.has_perm('purchases.delete') and status = 'draft' and sent_at is null);
+
+-- ── Menu variants: variants.* keys ────────────────────────────────────────
+drop policy if exists variants_read on public.menu_variants;
+create policy variants_read on public.menu_variants for select using (
+  app.has_perm('variants.view') or app.has_perm('availability.view')
+  or app.has_perm('kitchen.manage_availability') or app.has_perm('kitchen.record_waste'));
+drop policy if exists variants_create on public.menu_variants;
+create policy variants_create on public.menu_variants for insert with check (app.has_perm('variants.create'));
+drop policy if exists variants_update on public.menu_variants;
+create policy variants_update on public.menu_variants for update
+  using (app.has_perm('variants.update')) with check (app.has_perm('variants.update'));
+-- Variant names need their parent item name alongside them.
+drop policy if exists variants_item_read on public.menu_items;
+create policy variants_item_read on public.menu_items for select using (
+  app.has_perm('variants.view') or app.has_perm('availability.view')
+  or app.has_perm('kitchen.manage_availability') or app.has_perm('kitchen.record_waste'));
+
+-- Archiving hides a variant from sale without deleting its sales history.
+create or replace function public.set_variant_archived(p_variant_id uuid, p_archived boolean)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('variants.archive') or app.has_perm('menu.update')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.menu_variants set is_available = not p_archived where id = p_variant_id;
+  if not found then raise exception 'variant_not_found' using errcode = 'no_data_found'; end if;
+  perform app.log_action('variant.archive', 'menu_variants', p_variant_id::text, null,
+                         jsonb_build_object('archived', p_archived));
+end $fn$;
+revoke all on function public.set_variant_archived(uuid, boolean) from public;
+grant execute on function public.set_variant_archived(uuid, boolean) to authenticated, service_role;
+
+-- ── Payments: adjust + reconcile ──────────────────────────────────────────
+alter table public.payments add column if not exists reconciled_at timestamptz;
+alter table public.payments add column if not exists reconciled_by uuid;
+
+-- Correct a mis-keyed payment method/reference. Amounts never change here —
+-- that's a refund or void.
+create or replace function public.adjust_payment(
+  p_payment_id uuid, p_method text, p_reference text, p_reason text
+) returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_pay public.payments;
+begin
+  if not app.has_perm('payments.adjust') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'reason_required' using errcode = 'check_violation';
+  end if;
+  if coalesce(p_method, '') not in ('cash', 'card', 'mobile', 'online', 'wallet', 'other') then
+    raise exception 'bad_method' using errcode = 'check_violation';
+  end if;
+  select * into v_pay from public.payments where id = p_payment_id;
+  if not found then raise exception 'payment_not_found' using errcode = 'no_data_found'; end if;
+  if v_pay.status = 'voided' then
+    raise exception 'payment_voided' using errcode = 'check_violation';
+  end if;
+  if v_pay.reconciled_at is not null then
+    raise exception 'payment_reconciled' using errcode = 'check_violation';
+  end if;
+  update public.payments
+     set method = p_method, reference = nullif(trim(p_reference), '')
+   where id = p_payment_id;
+  perform app.log_action('payment.adjusted', 'payments', p_payment_id::text,
+                         jsonb_build_object('method', v_pay.method, 'reference', v_pay.reference),
+                         jsonb_build_object('method', p_method, 'reference', p_reference, 'reason', p_reason));
+end $fn$;
+revoke all on function public.adjust_payment(uuid, text, text, text) from public;
+grant execute on function public.adjust_payment(uuid, text, text, text) to authenticated, service_role;
+
+-- Totals per method for one business day, with how much is already reconciled.
+create or replace function public.payment_reconciliation(p_date date)
+returns table (method text, payment_count bigint, captured_cents bigint, refunded_cents bigint,
+               net_cents bigint, reconciled_count bigint, unreconciled_count bigint)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('payments.reconcile') or app.has_perm('payments.view')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select p.method,
+           count(*),
+           coalesce(sum(p.amount_cents), 0)::bigint,
+           coalesce(sum(p.refunded_cents), 0)::bigint,
+           coalesce(sum(p.amount_cents - p.refunded_cents), 0)::bigint,
+           count(*) filter (where p.reconciled_at is not null),
+           count(*) filter (where p.reconciled_at is null)
+      from public.payments p
+     where p.status <> 'voided'
+       and p.created_at >= p_date::timestamptz
+       and p.created_at < (p_date + 1)::timestamptz
+     group by p.method
+     order by p.method;
+end $fn$;
+revoke all on function public.payment_reconciliation(date) from public;
+grant execute on function public.payment_reconciliation(date) to authenticated, service_role;
+
+create or replace function public.reconcile_payments(p_date date, p_method text)
+returns int language plpgsql security definer set search_path = public, app as $fn$
+declare v_n int;
+begin
+  if not app.has_perm('payments.reconcile') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.payments
+     set reconciled_at = now(), reconciled_by = app.jwt_sub()
+   where method = p_method and status <> 'voided' and reconciled_at is null
+     and created_at >= p_date::timestamptz and created_at < (p_date + 1)::timestamptz;
+  get diagnostics v_n = row_count;
+  perform app.log_action('payments.reconciled', 'payments', p_date::text, null,
+                         jsonb_build_object('method', p_method, 'count', v_n));
+  return v_n;
+end $fn$;
+revoke all on function public.reconcile_payments(date, text) from public;
+grant execute on function public.reconcile_payments(date, text) to authenticated, service_role;
+
+-- ── finance.reconcile: cash counts ────────────────────────────────────────
+create table if not exists public.cash_counts (
+  id               uuid primary key default gen_random_uuid(),
+  business_date    date not null,
+  opening_cents    int not null default 0,
+  counted_cents    int not null,
+  expected_cents   int not null,
+  difference_cents int not null,
+  note             text,
+  counted_by       uuid,
+  counted_by_email text,
+  created_at       timestamptz not null default now()
+);
+create index if not exists cash_counts_date_idx on public.cash_counts(business_date desc, created_at desc);
+alter table public.cash_counts enable row level security;
+drop policy if exists staff_read on public.cash_counts;
+create policy staff_read on public.cash_counts for select
+  using (app.has_perm('finance.reconcile') or app.has_perm('finance.view') or app.can_write());
+
+-- Count the drawer at any time (shift change, mid-day, before closing) and
+-- see it against what the till should hold: opening float + cash taken.
+create or replace function public.record_cash_count(
+  p_business_date date, p_opening_cents int, p_counted_cents int, p_note text default null
+) returns public.cash_counts language plpgsql security definer set search_path = public, app as $fn$
+declare v_expected int; v_row public.cash_counts;
+begin
+  if not app.has_perm('finance.reconcile') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_counted_cents, -1) < 0 or coalesce(p_opening_cents, 0) < 0 then
+    raise exception 'bad_amount' using errcode = 'check_violation';
+  end if;
+  v_expected := coalesce(p_opening_cents, 0)
+              + coalesce((app.day_sales(p_business_date)->>'cash_in_cents')::int, 0);
+  insert into public.cash_counts
+    (business_date, opening_cents, counted_cents, expected_cents, difference_cents, note, counted_by, counted_by_email)
+  values
+    (p_business_date, coalesce(p_opening_cents, 0), p_counted_cents, v_expected, p_counted_cents - v_expected,
+     nullif(trim(p_note), ''), app.jwt_sub(),
+     nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'email')
+  returning * into v_row;
+  perform app.log_action('cash.counted', 'cash_counts', v_row.id::text, null,
+                         jsonb_build_object('counted', p_counted_cents, 'expected', v_expected));
+  return v_row;
+end $fn$;
+revoke all on function public.record_cash_count(date, int, int, text) from public;
+grant execute on function public.record_cash_count(date, int, int, text) to authenticated, service_role;
+
+-- ── finance.manage_costs: ingredient unit cost ────────────────────────────
+create or replace function public.set_ingredient_cost(p_item_id uuid, p_cost_cents_per_base_unit numeric)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_old numeric;
+begin
+  if not app.has_perm('finance.manage_costs') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_cost_cents_per_base_unit, -1) < 0 then
+    raise exception 'bad_cost' using errcode = 'check_violation';
+  end if;
+  select cost_cents_per_base_unit into v_old from public.inventory_items where id = p_item_id;
+  if not found then raise exception 'item_not_found' using errcode = 'no_data_found'; end if;
+  update public.inventory_items set cost_cents_per_base_unit = p_cost_cents_per_base_unit where id = p_item_id;
+  perform app.log_action('inventory.cost_changed', 'inventory_items', p_item_id::text,
+                         jsonb_build_object('cost_cents_per_base_unit', v_old),
+                         jsonb_build_object('cost_cents_per_base_unit', p_cost_cents_per_base_unit));
+end $fn$;
+revoke all on function public.set_ingredient_cost(uuid, numeric) from public;
+grant execute on function public.set_ingredient_cost(uuid, numeric) to authenticated, service_role;
+
+-- Cost managers need to see the items they price.
+drop policy if exists cost_read on public.inventory_items;
+create policy cost_read on public.inventory_items for select using (app.has_perm('finance.manage_costs'));
+
+-- ── Attendance: dashboard, history, corrections ───────────────────────────
+create or replace function public.attendance_dashboard(p_date date default null)
+returns table (total_staff bigint, present bigint, late bigint, absent bigint, on_leave bigint,
+               checked_out bigint, not_marked bigint, worked_minutes bigint)
+language plpgsql stable security definer set search_path = public, app as $fn$
+declare v_date date := coalesce(p_date, current_date);
+begin
+  if not (app.has_perm('attendance.view_dashboard') or app.has_perm('attendance.view')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    with staff as (select id from public.memberships where status = 'active' and role <> 'owner'),
+    day as (
+      select a.* from public.attendance a
+       where coalesce(a.business_date, a.clock_in::date) = v_date
+    )
+    select (select count(*) from staff),
+           count(*) filter (where d.status in ('present', 'late', 'early_departure', 'half_day', 'incomplete')),
+           count(*) filter (where d.status = 'late'),
+           count(*) filter (where d.status = 'absent'),
+           count(*) filter (where d.status in ('leave', 'off')),
+           count(*) filter (where d.clock_out is not null),
+           (select count(*) from staff s where not exists (
+              select 1 from day d2 where d2.membership_id = s.id)),
+           coalesce(sum(d.worked_minutes), 0)::bigint
+      from day d;
+end $fn$;
+revoke all on function public.attendance_dashboard(date) from public;
+grant execute on function public.attendance_dashboard(date) to authenticated, service_role;
+
+create or replace function public.attendance_history(p_from date, p_to date, p_membership_id uuid default null)
+returns table (id uuid, membership_id uuid, full_name text, email text, business_date date,
+               clock_in timestamptz, clock_out timestamptz, status text, late_minutes int,
+               worked_minutes int, overtime_minutes int, source text)
+language plpgsql stable security definer set search_path = public, app as $fn$
+declare v_self boolean := p_membership_id is not null and p_membership_id = app.my_membership_id();
+begin
+  if not (app.has_perm('attendance.view_history') or app.has_perm('attendance.view_reports')
+          or app.has_perm('attendance.view_employee_reports')
+          or (v_self and app.has_perm('attendance.view_own'))) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select a.id, a.membership_id, m.full_name, m.email,
+           coalesce(a.business_date, a.clock_in::date), a.clock_in, a.clock_out, a.status,
+           a.late_minutes, a.worked_minutes, a.overtime_minutes, a.source
+      from public.attendance a
+      join public.memberships m on m.id = a.membership_id
+     where coalesce(a.business_date, a.clock_in::date) between p_from and p_to
+       and (p_membership_id is null or a.membership_id = p_membership_id)
+     order by coalesce(a.business_date, a.clock_in::date) desc, m.full_name
+     limit 1000;
+end $fn$;
+revoke all on function public.attendance_history(date, date, uuid) from public;
+grant execute on function public.attendance_history(date, date, uuid) to authenticated, service_role;
+
+create table if not exists public.attendance_corrections (
+  id                  uuid primary key default gen_random_uuid(),
+  attendance_id       uuid references public.attendance(id) on delete cascade,
+  membership_id       uuid not null references public.memberships(id) on delete cascade,
+  business_date       date not null,
+  requested_clock_in  timestamptz,
+  requested_clock_out timestamptz,
+  reason              text not null,
+  status              text not null default 'pending' check (status in ('pending', 'approved', 'rejected')),
+  requested_by        uuid,
+  requested_by_email  text,
+  reviewed_by         uuid,
+  reviewed_by_email   text,
+  review_note         text,
+  created_at          timestamptz not null default now(),
+  reviewed_at         timestamptz
+);
+create index if not exists attendance_corrections_status_idx on public.attendance_corrections(status, created_at desc);
+alter table public.attendance_corrections enable row level security;
+drop policy if exists staff_read on public.attendance_corrections;
+create policy staff_read on public.attendance_corrections for select using (
+  app.has_perm('attendance.approve_correction') or app.has_perm('attendance.correct')
+  or app.has_perm('attendance.request_correction') or app.has_perm('attendance.view')
+  or membership_id = app.my_membership_id() or app.can_write());
+
+-- Apply clock times to a member's day (creating the row if the day has none)
+-- and let the existing attendance engine recompute late/worked minutes.
+create or replace function app.apply_attendance_times(
+  p_membership_id uuid, p_date date, p_clock_in timestamptz, p_clock_out timestamptz
+) returns uuid language plpgsql security definer set search_path = public, app as $fn$
+declare v_id uuid;
+begin
+  if p_clock_in is not null and p_clock_out is not null and p_clock_out <= p_clock_in then
+    raise exception 'clock_out_before_clock_in' using errcode = 'check_violation';
+  end if;
+  select id into v_id from public.attendance
+   where membership_id = p_membership_id and coalesce(business_date, clock_in::date) = p_date
+   order by clock_in nulls last limit 1;
+  if v_id is null then
+    insert into public.attendance (membership_id, business_date, clock_in, clock_out, source)
+    values (p_membership_id, p_date, p_clock_in, p_clock_out, 'manager')
+    returning id into v_id;
+  else
+    update public.attendance
+       set clock_in = coalesce(p_clock_in, clock_in),
+           clock_out = coalesce(p_clock_out, clock_out),
+           source = 'manager'
+     where id = v_id;
+  end if;
+  begin
+    perform app.recompute_attendance(v_id);
+  exception when undefined_function then null;
+  end;
+  return v_id;
+end $fn$;
+
+create or replace function public.request_attendance_correction(
+  p_membership_id uuid, p_business_date date, p_clock_in timestamptz, p_clock_out timestamptz, p_reason text
+) returns uuid language plpgsql security definer set search_path = public, app as $fn$
+declare v_self boolean := p_membership_id = app.my_membership_id(); v_att uuid; v_id uuid;
+begin
+  if not (app.has_perm('attendance.request_correction')
+          or (v_self and app.has_perm('attendance.view_own'))) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'reason_required' using errcode = 'check_violation';
+  end if;
+  if p_clock_in is null and p_clock_out is null then
+    raise exception 'times_required' using errcode = 'check_violation';
+  end if;
+  select id into v_att from public.attendance
+   where membership_id = p_membership_id and coalesce(business_date, clock_in::date) = p_business_date
+   limit 1;
+  insert into public.attendance_corrections
+    (attendance_id, membership_id, business_date, requested_clock_in, requested_clock_out, reason,
+     requested_by, requested_by_email)
+  values
+    (v_att, p_membership_id, p_business_date, p_clock_in, p_clock_out, trim(p_reason), app.jwt_sub(),
+     nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'email')
+  returning id into v_id;
+  perform app.log_action('attendance.correction_requested', 'attendance_corrections', v_id::text);
+  return v_id;
+end $fn$;
+revoke all on function public.request_attendance_correction(uuid, date, timestamptz, timestamptz, text) from public;
+grant execute on function public.request_attendance_correction(uuid, date, timestamptz, timestamptz, text) to authenticated, service_role;
+
+create or replace function public.review_attendance_correction(p_correction_id uuid, p_approve boolean, p_note text default null)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_c public.attendance_corrections;
+begin
+  if not app.has_perm('attendance.approve_correction') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v_c from public.attendance_corrections where id = p_correction_id for update;
+  if not found then raise exception 'correction_not_found' using errcode = 'no_data_found'; end if;
+  if v_c.status <> 'pending' then
+    raise exception 'already_reviewed' using errcode = 'check_violation';
+  end if;
+  if v_c.requested_by = app.jwt_sub() then
+    raise exception 'cannot_review_own_request' using errcode = 'insufficient_privilege';
+  end if;
+  if p_approve then
+    perform app.apply_attendance_times(v_c.membership_id, v_c.business_date,
+                                       v_c.requested_clock_in, v_c.requested_clock_out);
+  end if;
+  update public.attendance_corrections
+     set status = case when p_approve then 'approved' else 'rejected' end,
+         reviewed_by = app.jwt_sub(),
+         reviewed_by_email = nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'email',
+         review_note = nullif(trim(p_note), ''),
+         reviewed_at = now()
+   where id = p_correction_id;
+  perform app.log_action(case when p_approve then 'attendance.correction_approved'
+                              else 'attendance.correction_rejected' end,
+                         'attendance_corrections', p_correction_id::text);
+end $fn$;
+revoke all on function public.review_attendance_correction(uuid, boolean, text) from public;
+grant execute on function public.review_attendance_correction(uuid, boolean, text) to authenticated, service_role;
+
+-- attendance.correct: edit a day's times directly, no request/approval step.
+create or replace function public.correct_attendance(
+  p_membership_id uuid, p_business_date date, p_clock_in timestamptz, p_clock_out timestamptz, p_reason text
+) returns uuid language plpgsql security definer set search_path = public, app as $fn$
+declare v_id uuid;
+begin
+  if not app.has_perm('attendance.correct') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'reason_required' using errcode = 'check_violation';
+  end if;
+  v_id := app.apply_attendance_times(p_membership_id, p_business_date, p_clock_in, p_clock_out);
+  perform app.log_action('attendance.corrected', 'attendance', v_id::text, null,
+                         jsonb_build_object('clock_in', p_clock_in, 'clock_out', p_clock_out, 'reason', p_reason));
+  return v_id;
+end $fn$;
+revoke all on function public.correct_attendance(uuid, date, timestamptz, timestamptz, text) from public;
+grant execute on function public.correct_attendance(uuid, date, timestamptz, timestamptz, text) to authenticated, service_role;
+
+-- Names for the correction/history pickers without full staff.view.
+create or replace function public.attendance_staff_list()
+returns table (membership_id uuid, full_name text, email text, role text)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('attendance.view') or app.has_perm('attendance.view_history')
+          or app.has_perm('attendance.view_reports') or app.has_perm('attendance.view_employee_reports')
+          or app.has_perm('attendance.correct') or app.has_perm('attendance.request_correction')
+          or app.has_perm('attendance.approve_correction')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select m.id, m.full_name, m.email, m.role::text
+      from public.memberships m
+     where m.status = 'active' and m.role <> 'owner'
+     order by coalesce(m.full_name, m.email);
+end $fn$;
+revoke all on function public.attendance_staff_list() from public;
+grant execute on function public.attendance_staff_list() to authenticated, service_role;
+
+-- ── Reviews: respond, moderate, analytics ─────────────────────────────────
+alter table public.feedback add column if not exists response       text;
+alter table public.feedback add column if not exists responded_at   timestamptz;
+alter table public.feedback add column if not exists responded_by   text;
+alter table public.feedback add column if not exists is_hidden      boolean not null default false;
+alter table public.feedback add column if not exists moderation_note text;
+alter table public.feedback add column if not exists moderated_at   timestamptz;
+alter table public.feedback add column if not exists moderated_by   text;
+
+create or replace function public.respond_to_review(p_feedback_id uuid, p_response text)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not app.has_perm('reviews.respond') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.feedback
+     set response = nullif(trim(p_response), ''),
+         responded_at = case when nullif(trim(p_response), '') is null then null else now() end,
+         responded_by = nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'email'
+   where id = p_feedback_id;
+  if not found then raise exception 'review_not_found' using errcode = 'no_data_found'; end if;
+  perform app.log_action('review.responded', 'feedback', p_feedback_id::text);
+end $fn$;
+revoke all on function public.respond_to_review(uuid, text) from public;
+grant execute on function public.respond_to_review(uuid, text) to authenticated, service_role;
+
+create or replace function public.moderate_review(p_feedback_id uuid, p_hidden boolean, p_note text default null)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not app.has_perm('reviews.moderate') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.feedback
+     set is_hidden = p_hidden,
+         moderation_note = nullif(trim(p_note), ''),
+         moderated_at = now(),
+         moderated_by = nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'email'
+   where id = p_feedback_id;
+  if not found then raise exception 'review_not_found' using errcode = 'no_data_found'; end if;
+  perform app.log_action(case when p_hidden then 'review.hidden' else 'review.restored' end,
+                         'feedback', p_feedback_id::text);
+end $fn$;
+revoke all on function public.moderate_review(uuid, boolean, text) from public;
+grant execute on function public.moderate_review(uuid, boolean, text) to authenticated, service_role;
+
+-- Hidden (moderated) reviews are excluded from the numbers.
+create or replace function public.review_analytics(p_from timestamptz, p_to timestamptz)
+returns jsonb language plpgsql stable security definer set search_path = public, app as $fn$
+declare v jsonb;
+begin
+  if not app.has_perm('reviews.analytics') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  with f as (
+    select * from public.feedback
+     where not is_hidden and created_at >= p_from and created_at < p_to
+  )
+  select jsonb_build_object(
+    'count', (select count(*) from f),
+    'avg_overall', (select round(avg(overall)::numeric, 2) from f),
+    'avg_food', (select round(avg(food)::numeric, 2) from f),
+    'avg_service', (select round(avg(service)::numeric, 2) from f),
+    'avg_cleanliness', (select round(avg(cleanliness)::numeric, 2) from f),
+    'avg_speed', (select round(avg(speed)::numeric, 2) from f),
+    'avg_ambiance', (select round(avg(ambiance)::numeric, 2) from f),
+    'responded', (select count(*) from f where response is not null),
+    'by_star', (select coalesce(jsonb_object_agg(overall, n), '{}'::jsonb)
+                  from (select overall, count(*) n from f group by overall) s),
+    'by_week', (select coalesce(jsonb_agg(w order by w->>'week'), '[]'::jsonb) from (
+                  select jsonb_build_object('week', to_char(date_trunc('week', created_at), 'YYYY-MM-DD'),
+                                            'count', count(*), 'avg', round(avg(overall)::numeric, 2)) w
+                    from f group by date_trunc('week', created_at)) x)
+  ) into v;
+  return v;
+end $fn$;
+revoke all on function public.review_analytics(timestamptz, timestamptz) from public;
+grant execute on function public.review_analytics(timestamptz, timestamptz) to authenticated, service_role;
+
+-- ── Customers ─────────────────────────────────────────────────────────────
+create table if not exists public.customers (
+  id         uuid primary key default gen_random_uuid(),
+  name       text not null,
+  phone      text,
+  email      text,
+  birthday   date,
+  tags       text[] not null default '{}',
+  notes      text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists customers_phone_idx on public.customers(phone);
+create index if not exists customers_name_idx on public.customers(lower(name));
+alter table public.customers enable row level security;
+drop policy if exists staff_read on public.customers;
+create policy staff_read on public.customers for select using (app.has_perm('customers.view') or app.can_write());
+drop policy if exists customers_create on public.customers;
+create policy customers_create on public.customers for insert with check (app.has_perm('customers.create') or app.can_write());
+drop policy if exists customers_update on public.customers;
+create policy customers_update on public.customers for update
+  using (app.has_perm('customers.update') or app.can_write())
+  with check (app.has_perm('customers.update') or app.can_write());
+drop policy if exists customers_delete on public.customers;
+create policy customers_delete on public.customers for delete using (app.can_write());
+
+-- Visit history comes from reservations matched by phone number.
+create or replace function public.customer_stats()
+returns table (customer_id uuid, reservations bigint, last_reservation_at timestamptz, no_shows bigint)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('customers.view') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select c.id, count(r.id), max(r.reserved_at), count(r.id) filter (where r.status = 'no_show')
+      from public.customers c
+      left join public.reservations r
+        on c.phone is not null and length(trim(c.phone)) > 0
+       and regexp_replace(r.phone, '\D', '', 'g') = regexp_replace(c.phone, '\D', '', 'g')
+     group by c.id;
+end $fn$;
+revoke all on function public.customer_stats() from public;
+grant execute on function public.customer_stats() to authenticated, service_role;
+
+do $$
+declare t text;
+begin
+  foreach t in array array['customers', 'cash_counts', 'attendance_corrections'] loop
+    execute format('drop trigger if exists audit on public.%I', t);
+    begin
+      execute format('create trigger audit after insert or update or delete on public.%I
+                      for each row execute function app.audit_row()', t);
+    exception when undefined_function then null;
+    end;
+  end loop;
+end $$;
+
+-- ── Permission catalog labels for delegated Roles / Portal Management ────
+-- permission_catalog was readable by staff members only; a custom portal
+-- granted roles.view, portals.view or permissions.view needs the labels to
+-- show and pick permissions. Labels only — nothing sensitive.
+drop policy if exists catalog_read_delegated on public.permission_catalog;
+create policy catalog_read_delegated on public.permission_catalog for select using (
+  app.has_perm('roles.view') or app.has_perm('portals.view') or app.has_perm('permissions.view'));
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- 0059 — retire Customers / Roles & Access options (verbatim from tenant-migrations/0059)
+-- ════════════════════════════════════════════════════════════════════════════
+-- ============================================================================
+-- Tenant delta 0059 — retire the Customers and Roles & Access portal options.
+--
+-- The owner removed the Customers, Reservations and Roles & Access sections
+-- (and Assign staff) from the product. Reservations had no permission keys
+-- of its own (it used tables.*, which still drive Tables & QR codes), so
+-- only these catalog rows go — Create Portal no longer offers them.
+-- permissions.assign stays: the Staff screen's role change uses it.
+--
+-- Any portal still holding a retired key has it stripped, so nothing keeps
+-- an invisible grant. The customers table and the role presets themselves
+-- are left in place (no data is deleted).
+-- ============================================================================
+
+delete from public.permission_catalog
+ where key in ('customers.view', 'customers.create', 'customers.update',
+               'roles.view', 'roles.create', 'roles.update', 'roles.delete',
+               'permissions.view');
+
+update public.portals
+   set permissions = array(
+         select k from unnest(permissions) as k
+          where k not in ('customers.view', 'customers.create', 'customers.update',
+                          'roles.view', 'roles.create', 'roles.update', 'roles.delete',
+                          'permissions.view'))
+ where permissions && array['customers.view', 'customers.create', 'customers.update',
+                            'roles.view', 'roles.create', 'roles.update', 'roles.delete',
+                            'permissions.view'];
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- 0060_availability_automation (verbatim from tenant-migrations)
+-- ════════════════════════════════════════════════════════════════════════════
+-- ============================================================================
+-- Tenant delta 0060 — Food availability automation: scoped priority
+-- allocation, explicit ON/OFF setting, order-time enforcement.
+--
+-- Extends the existing engine (0052 recipe-driven availability, 0054
+-- priority waterfall) — it does not add a second one. product_availability
+-- stays the single authoritative result every surface reads (Kitchen, Menu,
+-- POS, customer storefront), and its realtime publication (0052) stays the
+-- notification path.
+--
+-- What changes:
+--   1. business_settings.priority_allocation_enabled — the explicit
+--      Priority Allocation ON/OFF switch. Before this, allocation silently
+--      switched on whenever any product_priority row existed. Existing
+--      tenants keep today's behavior (ON iff they had priorities).
+--   2. The waterfall is SCOPED: a stock/recipe/priority change reallocates
+--      only the connected group of products that share ingredients with
+--      what changed (transitive closure over recipe_components), not every
+--      product in the restaurant. Products outside that group can't be
+--      affected — they share no ingredient with it.
+--   3. place_order() lines are checked against the authoritative allocated
+--      quantity (BEFORE INSERT on order_lines). Raw-stock checks alone let a
+--      lower-priority product consume stock the waterfall had allocated to a
+--      higher-priority one. Existing orders/KOTs are never touched.
+--   4. Kitchen actions that work through the same chain instead of a
+--      separate manual count: record_dish_waste() deducts the dish's recipe
+--      ingredients (so availability recalculates), set_item_available() is
+--      the manual take-off-sale switch for items without variants.
+-- ============================================================================
+
+-- ── 1. Setting ────────────────────────────────────────────────────────────
+alter table public.business_settings
+  add column if not exists priority_allocation_enabled boolean not null default false;
+update public.business_settings
+   set priority_allocation_enabled = true
+ where id and exists (select 1 from public.product_priority);
+
+create or replace function app.priority_allocation_on() returns boolean
+language sql stable security definer set search_path = public, app as $$
+  select coalesce((select priority_allocation_enabled from public.business_settings where id), false)
+$$;
+
+-- ── 2. Dependency scope ───────────────────────────────────────────────────
+-- Every ingredient connected to the seed set: an ingredient pulls in every
+-- product whose recipe uses it, and each such product pulls in all of its
+-- own ingredients, repeated to a fixed point. A seed ingredient used only
+-- by a REQUIRED modifier also pulls in that item's recipe ingredients, so
+-- the item is reallocated against the right pool.
+create or replace function app.availability_scope(p_ingredient_ids uuid[])
+returns uuid[] language sql stable security definer set search_path = public, app as $$
+  with recursive seed(id) as (
+    select unnest(p_ingredient_ids)
+    union
+    select rc.inventory_item_id
+      from public.modifier_recipe_components mrc
+      join public.modifier_options mo on mo.id = mrc.modifier_option_id
+      join public.modifier_groups mg on mg.id = mo.group_id and mg.min_select >= 1
+      join public.recipe_components rc on rc.menu_item_id = mg.menu_item_id
+     where mrc.inventory_item_id = any(p_ingredient_ids)
+  ),
+  ing(id) as (
+    select id from seed
+    union
+    select rc2.inventory_item_id
+      from ing
+      join public.recipe_components rc1 on rc1.inventory_item_id = ing.id
+      join public.recipe_components rc2 on rc2.menu_item_id = rc1.menu_item_id
+  )
+  select coalesce(array_agg(distinct id), '{}'::uuid[]) from ing
+$$;
+
+-- Every ingredient an item's availability depends on (its recipes plus its
+-- required modifier groups' options).
+create or replace function app.item_ingredients(p_menu_item_id uuid)
+returns uuid[] language sql stable security definer set search_path = public, app as $$
+  select coalesce(array_agg(distinct x), '{}'::uuid[]) from (
+    select inventory_item_id as x from public.recipe_components where menu_item_id = p_menu_item_id
+    union
+    select mrc.inventory_item_id
+      from public.modifier_recipe_components mrc
+      join public.modifier_options mo on mo.id = mrc.modifier_option_id
+      join public.modifier_groups mg on mg.id = mo.group_id
+     where mg.menu_item_id = p_menu_item_id and mg.min_select >= 1
+  ) s
+$$;
+
+-- ── 3. Scoped waterfall ───────────────────────────────────────────────────
+-- Same greedy allocation as 0054 (critical → high → medium → low by rank,
+-- then unprioritized alphabetically; each product's claim is deducted from
+-- the pool before the next is computed), restricted to the connected
+-- scope. p_ingredient_ids null = the whole restaurant (manual recalculation
+-- and turning the setting on).
+drop function if exists app.recalc_priority_allocation(text, text);
+create or replace function app.recalc_priority_allocation(
+  p_trigger_type text default 'priority_reallocation',
+  p_trigger_reference text default null,
+  p_ingredient_ids uuid[] default null
+) returns void language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_scope uuid[];
+  v_prod record;
+  v_r record;
+  v_effective_variant uuid;
+  v_has_variant_recipe boolean;
+begin
+  if not app.priority_allocation_on() then
+    return;
+  end if;
+
+  -- One waterfall at a time per restaurant: runs share priority_stock_pool
+  -- rows, so concurrent orders reallocating overlapping scopes serialize
+  -- here instead of interleaving (or deadlocking) on the pool.
+  perform pg_advisory_xact_lock(hashtext('app.recalc_priority_allocation'));
+
+  if p_ingredient_ids is null then
+    select coalesce(array_agg(id), '{}'::uuid[]) into v_scope from public.inventory_items;
+  else
+    v_scope := app.availability_scope(p_ingredient_ids);
+  end if;
+  if cardinality(v_scope) = 0 then
+    return;
+  end if;
+
+  delete from public.priority_stock_pool where inventory_item_id = any(v_scope);
+  insert into public.priority_stock_pool (inventory_item_id, remaining)
+    select id, greatest(stock_qty, 0) from public.inventory_items where id = any(v_scope);
+
+  for v_prod in
+    select x.menu_item_id, x.variant_id,
+           case coalesce(pp.priority_level, 'unprioritized')
+             when 'critical' then 0 when 'high' then 1 when 'medium' then 2 when 'low' then 3
+             else 4
+           end as level_rank,
+           coalesce(pp.priority_rank, 999999) as rank_in_level,
+           mi.name as item_name
+      from (
+        select distinct menu_item_id, variant_id from public.recipe_components
+         where inventory_item_id = any(v_scope)
+        union
+        select distinct mg.menu_item_id, null::uuid
+          from public.modifier_groups mg
+         where mg.min_select >= 1
+           and (p_ingredient_ids is null or exists (
+                 select 1 from public.modifier_options mo
+                   join public.modifier_recipe_components mrc on mrc.modifier_option_id = mo.id
+                  where mo.group_id = mg.id and mrc.inventory_item_id = any(v_scope)))
+      ) x
+      join public.menu_items mi on mi.id = x.menu_item_id
+      left join public.product_priority pp on pp.menu_item_id = x.menu_item_id
+     order by level_rank, rank_in_level, mi.name, x.variant_id nulls first
+  loop
+    select * into v_r from app.compute_product_capacity(v_prod.menu_item_id, v_prod.variant_id, true);
+    perform app.apply_product_availability_result(
+      v_prod.menu_item_id, v_prod.variant_id, v_r.tracked, v_r.status, v_r.producible_qty,
+      v_r.bottleneck_inventory_item_id, v_r.reason, p_trigger_type, p_trigger_reference, 'system'
+    );
+
+    if v_r.tracked and coalesce(v_r.producible_qty, 0) > 0 then
+      if v_prod.variant_id is not null then
+        select exists(select 1 from public.recipe_components
+                       where menu_item_id = v_prod.menu_item_id and variant_id = v_prod.variant_id)
+          into v_has_variant_recipe;
+        v_effective_variant := case when v_has_variant_recipe then v_prod.variant_id else null end;
+      else
+        v_effective_variant := null;
+      end if;
+
+      update public.priority_stock_pool ps
+         set remaining = ps.remaining - (v_r.producible_qty * rc.qty_per_unit)
+        from public.recipe_components rc
+       where rc.menu_item_id = v_prod.menu_item_id
+         and rc.variant_id is not distinct from v_effective_variant
+         and ps.inventory_item_id = rc.inventory_item_id;
+    end if;
+  end loop;
+end;
+$fn$;
+
+-- ── 4. Triggers: ON → scoped waterfall, OFF → the targeted per-product
+-- engine exactly as before ────────────────────────────────────────────────
+create or replace function app.on_inventory_stock_change() returns trigger
+language plpgsql security definer set search_path = public, app as $$
+declare v_type text;
+begin
+  if new.stock_qty is distinct from old.stock_qty then
+    v_type := case when new.stock_qty > old.stock_qty then 'inventory_restock' else 'inventory_consumption' end;
+    if app.priority_allocation_on() then
+      perform app.recalc_priority_allocation(v_type, new.id::text, array[new.id]);
+    else
+      perform app.recalc_products_for_ingredient(new.id, v_type, null);
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+create or replace function app.on_recipe_components_change() returns trigger
+language plpgsql security definer set search_path = public, app as $$
+declare v_item uuid; v_variant uuid; v_ings uuid[];
+begin
+  if tg_op = 'DELETE' then
+    v_item := old.menu_item_id; v_variant := old.variant_id;
+  else
+    v_item := new.menu_item_id; v_variant := new.variant_id;
+  end if;
+  -- Per-product pass first: it also clears the row of a product whose last
+  -- recipe line was just removed (it's no longer tracked at all).
+  perform app.recalc_product_availability(v_item, v_variant, 'recipe_change', null);
+  if v_variant is not null then
+    perform app.recalc_product_availability(v_item, null, 'recipe_change', null);
+  end if;
+  if app.priority_allocation_on() then
+    v_ings := app.item_ingredients(v_item);
+    if tg_op in ('DELETE', 'UPDATE') then v_ings := v_ings || old.inventory_item_id; end if;
+    if tg_op in ('INSERT', 'UPDATE') then v_ings := v_ings || new.inventory_item_id; end if;
+    perform app.recalc_priority_allocation('recipe_change', v_item::text, v_ings);
+  end if;
+  return coalesce(new, old);
+end;
+$$;
+
+create or replace function app.on_modifier_recipe_components_change() returns trigger
+language plpgsql security definer set search_path = public, app as $$
+declare v_option uuid; v_item uuid; r record;
+begin
+  v_option := coalesce(new.modifier_option_id, old.modifier_option_id);
+  select mg.menu_item_id into v_item
+    from public.modifier_options mo join public.modifier_groups mg on mg.id = mo.group_id
+   where mo.id = v_option;
+  if v_item is not null then
+    if app.priority_allocation_on() then
+      perform app.recalc_priority_allocation('recipe_change', v_item::text,
+        app.item_ingredients(v_item) || coalesce(new.inventory_item_id, old.inventory_item_id));
+    else
+      for r in select variant_id from public.product_availability where menu_item_id = v_item loop
+        perform app.recalc_product_availability(v_item, r.variant_id, 'recipe_change', null);
+      end loop;
+      perform app.recalc_product_availability(v_item, null, 'recipe_change', null);
+    end if;
+  end if;
+  return coalesce(new, old);
+end;
+$$;
+
+create or replace function app.on_modifier_option_availability_change() returns trigger
+language plpgsql security definer set search_path = public, app as $$
+declare v_item uuid; r record;
+begin
+  if new.is_available is distinct from old.is_available then
+    select mg.menu_item_id into v_item from public.modifier_groups mg where mg.id = new.group_id;
+    if v_item is not null then
+      if app.priority_allocation_on() then
+        perform app.recalc_priority_allocation('recipe_change', v_item::text, app.item_ingredients(v_item));
+      else
+        for r in select variant_id from public.product_availability where menu_item_id = v_item loop
+          perform app.recalc_product_availability(v_item, r.variant_id, 'recipe_change', null);
+        end loop;
+        perform app.recalc_product_availability(v_item, null, 'recipe_change', null);
+      end if;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+-- ── 5. Priority management: reallocate only the changed product's group ───
+create or replace function public.set_product_priority(p_menu_item_id uuid, p_priority_level text)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_next_rank int; v_cur_level text;
+begin
+  if not (app.has_perm('availability.update') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_priority_level not in ('critical', 'high', 'medium', 'low') then
+    raise exception 'bad_priority_level' using errcode = 'check_violation';
+  end if;
+  select priority_level into v_cur_level from public.product_priority where menu_item_id = p_menu_item_id;
+  if v_cur_level is null then
+    select coalesce(max(priority_rank), 0) + 1 into v_next_rank from public.product_priority where priority_level = p_priority_level;
+    insert into public.product_priority (menu_item_id, priority_level, priority_rank)
+    values (p_menu_item_id, p_priority_level, v_next_rank);
+  elsif v_cur_level <> p_priority_level then
+    select coalesce(max(priority_rank), 0) + 1 into v_next_rank from public.product_priority where priority_level = p_priority_level;
+    update public.product_priority set priority_level = p_priority_level, priority_rank = v_next_rank, updated_at = now()
+     where menu_item_id = p_menu_item_id;
+  end if;
+  perform app.recalc_priority_allocation('priority_change', p_menu_item_id::text, app.item_ingredients(p_menu_item_id));
+end;
+$fn$;
+
+create or replace function public.remove_product_priority(p_menu_item_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('availability.update') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  delete from public.product_priority where menu_item_id = p_menu_item_id;
+  perform app.recalc_priority_allocation('priority_change', p_menu_item_id::text, app.item_ingredients(p_menu_item_id));
+end;
+$fn$;
+
+create or replace function public.reorder_product_priority(p_priority_level text, p_ordered_menu_item_ids uuid[])
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_id uuid; v_rank int := 1; v_ings uuid[] := '{}';
+begin
+  if not (app.has_perm('availability.update') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_priority_level not in ('critical', 'high', 'medium', 'low') then
+    raise exception 'bad_priority_level' using errcode = 'check_violation';
+  end if;
+  update public.product_priority set priority_rank = priority_rank + 1000000
+   where priority_level = p_priority_level and menu_item_id = any(p_ordered_menu_item_ids);
+  foreach v_id in array p_ordered_menu_item_ids loop
+    update public.product_priority set priority_rank = v_rank, updated_at = now()
+     where menu_item_id = v_id and priority_level = p_priority_level;
+    v_rank := v_rank + 1;
+    v_ings := v_ings || app.item_ingredients(v_id);
+  end loop;
+  perform app.recalc_priority_allocation('priority_change', null, v_ings);
+end;
+$fn$;
+
+-- The ON/OFF switch. availability.update is the same key that already
+-- governs priority configuration.
+create or replace function public.set_priority_allocation(p_enabled boolean)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('availability.update') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.business_settings set priority_allocation_enabled = coalesce(p_enabled, false) where id;
+  perform app.log_action(case when p_enabled then 'availability.allocation_on' else 'availability.allocation_off' end,
+                         'business_settings', 'priority_allocation_enabled');
+  if p_enabled then
+    perform app.recalc_priority_allocation('priority_change', 'allocation_on', null);
+  else
+    -- Back to every product's independent capacity.
+    perform public.recalculate_all_product_availability();
+  end if;
+end;
+$fn$;
+revoke all on function public.set_priority_allocation(boolean) from public;
+grant execute on function public.set_priority_allocation(boolean) to authenticated, service_role;
+
+-- ── 6. Order-time enforcement ─────────────────────────────────────────────
+-- The authoritative allocated quantity, not just raw stock, bounds what a
+-- new order line may take. Runs before the line's own stock deduction (the
+-- line is inserted first in place_order()), so it sees availability as it
+-- was before this line; the row lock serializes two orders racing for the
+-- last portions. A variant without its own recipe uses the item's base row.
+create or replace function app.guard_order_line_availability() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_status text; v_qty numeric; v_found boolean := false; v_name text;
+begin
+  if new.menu_item_id is null then
+    return new;
+  end if;
+  if new.variant_id is not null then
+    select status, producible_qty into v_status, v_qty from public.product_availability
+     where menu_item_id = new.menu_item_id and variant_id = new.variant_id
+     for update;
+    v_found := found;
+  end if;
+  if not v_found then
+    select status, producible_qty into v_status, v_qty from public.product_availability
+     where menu_item_id = new.menu_item_id and variant_id is null
+     for update;
+    v_found := found;
+  end if;
+  if v_found and (v_status = 'unavailable' or (v_qty is not null and v_qty < new.qty)) then
+    v_name := coalesce(new.name_snapshot, new.menu_item_id::text);
+    raise exception 'item_unavailable: % (% available)', v_name, coalesce(floor(v_qty)::int, 0)
+      using errcode = 'check_violation';
+  end if;
+  return new;
+end;
+$fn$;
+drop trigger if exists guard_order_line_availability on public.order_lines;
+create trigger guard_order_line_availability before insert on public.order_lines
+  for each row execute function app.guard_order_line_availability();
+
+-- ── 7. Kitchen actions through the same chain ─────────────────────────────
+-- Waste N portions of a dish: deducts its recipe's ingredients (variant
+-- recipe if it has one, else the base recipe — same rule as place_order()),
+-- which fires the stock trigger and recalculates availability. Never drives
+-- stock below zero.
+create or replace function public.record_dish_waste(
+  p_menu_item_id uuid, p_variant_id uuid, p_qty int, p_reason text
+) returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_has_variant_recipe boolean; v_comp record; v_need numeric; v_cost numeric; v_name text;
+begin
+  if not app.has_perm('kitchen.record_waste') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_qty, 0) <= 0 then raise exception 'bad_qty' using errcode = 'check_violation'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  select name into v_name from public.menu_items where id = p_menu_item_id;
+  if not found then raise exception 'item_not_found' using errcode = 'no_data_found'; end if;
+  select exists(select 1 from public.recipe_components
+                 where menu_item_id = p_menu_item_id and variant_id = p_variant_id)
+    into v_has_variant_recipe;
+  for v_comp in
+    select inventory_item_id, qty_per_unit from public.recipe_components
+     where menu_item_id = p_menu_item_id
+       and variant_id is not distinct from (case when v_has_variant_recipe then p_variant_id else null end)
+  loop
+    v_need := v_comp.qty_per_unit * p_qty;
+    select cost_cents_per_base_unit into v_cost from public.inventory_items where id = v_comp.inventory_item_id;
+    update public.inventory_items set stock_qty = greatest(stock_qty - v_need, 0)
+     where id = v_comp.inventory_item_id;
+    insert into public.stock_ledger (inventory_item_id, delta_qty, reason, note, unit_cost_cents_base)
+    values (v_comp.inventory_item_id, -v_need, 'spoilage',
+            v_name || ' ×' || p_qty || ': ' || trim(p_reason), v_cost);
+  end loop;
+  perform app.log_action('kitchen.dish_waste', 'menu_items', p_menu_item_id::text, null,
+                         jsonb_build_object('variant_id', p_variant_id, 'qty', p_qty, 'reason', p_reason));
+end;
+$fn$;
+revoke all on function public.record_dish_waste(uuid, uuid, int, text) from public;
+grant execute on function public.record_dish_waste(uuid, uuid, int, text) to authenticated, service_role;
+
+-- Manual take-off-sale switch for an item (set_variant_available covers
+-- variants). A kill switch only — it never sets a quantity; the computed
+-- availability keeps updating underneath and both combine at read time.
+create or replace function public.set_item_available(p_menu_item_id uuid, p_available boolean)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('kitchen.manage_availability') or app.has_perm('availability.update')
+          or app.has_perm('menu.update')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.menu_items set is_available = p_available where id = p_menu_item_id;
+  if not found then raise exception 'item_not_found' using errcode = 'no_data_found'; end if;
+  perform app.log_action('kitchen.item_availability', 'menu_items', p_menu_item_id::text, null,
+                         jsonb_build_object('is_available', p_available));
+end;
+$fn$;
+revoke all on function public.set_item_available(uuid, boolean) from public;
+grant execute on function public.set_item_available(uuid, boolean) to authenticated, service_role;
+
+-- Kitchen needs the names that go with the availability rows.
+drop policy if exists kitchen_read_items on public.menu_items;
+create policy kitchen_read_items on public.menu_items for select using (app.has_perm('kitchen.view'));
+drop policy if exists kitchen_read_variants on public.menu_variants;
+create policy kitchen_read_variants on public.menu_variants for select using (app.has_perm('kitchen.view'));
+drop policy if exists kitchen_read_availability on public.product_availability;
+create policy kitchen_read_availability on public.product_availability for select using (app.has_perm('kitchen.view'));
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- 0061_priority_allocation_getter (verbatim from tenant-migrations)
+-- ════════════════════════════════════════════════════════════════════════════
+-- ============================================================================
+-- Tenant delta 0061 — read the Priority Allocation switch without
+-- settings.view.
+--
+-- The Priority Allocation page (availability.view) shows whether allocation
+-- is ON; business_settings itself is only readable with settings.view, and
+-- widening that policy would expose every business setting. This returns
+-- just the one flag.
+-- ============================================================================
+
+create or replace function public.get_priority_allocation_enabled()
+returns boolean language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('availability.view') or app.has_perm('availability.update') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return app.priority_allocation_on();
+end;
+$fn$;
+revoke all on function public.get_priority_allocation_enabled() from public;
+grant execute on function public.get_priority_allocation_enabled() to authenticated, service_role;
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- 0062_priority_level_percentages (verbatim from tenant-migrations)
+-- ════════════════════════════════════════════════════════════════════════════
+-- ============================================================================
+-- Tenant delta 0062 — Priority-level percentage allocation.
+--
+-- Replaces the pure "higher priority takes everything first" waterfall of
+-- 0054/0060 with a percentage split between the four existing priority
+-- levels (product_priority.priority_level). Nothing new is modelled per
+-- product: products keep their level and rank; the restaurant configures one
+-- percentage (and an active flag) per level, validated to total exactly 100.
+--
+-- Calculation order (per connected group of products sharing ingredients —
+-- the same scoped closure 0060 introduced):
+--   1. Usable stock = live inventory_items.stock_qty (never below zero).
+--   2. Each shared ingredient's capacity is split between the ACTIVE levels
+--      that have at least one product needing it, in proportion to their
+--      percentages (a level with no product on that ingredient doesn't hold
+--      a share of it — its percentage goes to the others).
+--   3. Within a level, products take from that level's share in rank order,
+--      each limited by its full recipe (every ingredient), so no product is
+--      ever allocated beyond what its recipe can actually produce.
+--   4. Redistribution: whatever a level couldn't use (a product bottlenecked
+--      on another ingredient, or nothing left to make) is split again, by the
+--      same percentages, among the levels whose products can still make more.
+--      Repeats until nothing more moves (bounded).
+--   5. Final pass: any remainder the percentages couldn't place (rounding to
+--      whole portions, 0% or inactive levels, unprioritized products) goes
+--      by priority order — critical first, unprioritized last — so capacity
+--      is never lost.
+--   6. Each product's total is capped by its independent recipe capacity and
+--      written through the same app.apply_product_availability_result() into
+--      product_availability — the one table every surface reads.
+--
+-- Percentages allocate PRODUCTION CAPACITY only: no stock is reserved, moved
+-- or consumed here. priority_stock_pool is the same scratch pool 0054 uses,
+-- reseeded from live stock on every run. Orders still consume inventory
+-- through place_order(), and 0060's order-line check still enforces the
+-- allocated quantity.
+-- ============================================================================
+
+create table if not exists public.priority_level_allocation (
+  priority_level text primary key check (priority_level in ('critical', 'high', 'medium', 'low')),
+  allocation_pct numeric(5,2) not null check (allocation_pct >= 0 and allocation_pct <= 100),
+  is_active      boolean not null default true,
+  updated_at     timestamptz not null default now()
+);
+insert into public.priority_level_allocation (priority_level, allocation_pct, is_active) values
+  ('critical', 40, true), ('high', 30, true), ('medium', 20, true), ('low', 10, true)
+on conflict (priority_level) do nothing;
+alter table public.priority_level_allocation enable row level security;
+drop policy if exists staff_read on public.priority_level_allocation;
+create policy staff_read on public.priority_level_allocation for select
+  using (app.has_perm('availability.view') or app.has_perm('availability.update') or app.is_staff());
+-- No write policy: changes only through set_priority_level_allocation().
+drop trigger if exists audit on public.priority_level_allocation;
+create trigger audit after insert or update or delete on public.priority_level_allocation
+  for each row execute function app.audit_row();
+do $$
+begin
+  if not exists (select 1 from pg_publication_tables
+                  where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'priority_level_allocation') then
+    alter publication supabase_realtime add table public.priority_level_allocation;
+  end if;
+end $$;
+
+-- Save all four levels at once. Server-side validation: exactly the four
+-- levels, each a number 0–100, total exactly 100. availability.update is
+-- the same key that already governs priorities.
+create or replace function public.set_priority_level_allocation(p_config jsonb)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_total numeric := 0; v_e jsonb; v_levels text[] := '{}'; v_pct numeric;
+begin
+  if not (app.has_perm('availability.update') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if jsonb_typeof(p_config) is distinct from 'array' or jsonb_array_length(p_config) <> 4 then
+    raise exception 'bad_config: provide all four priority levels' using errcode = 'check_violation';
+  end if;
+  for v_e in select * from jsonb_array_elements(p_config) loop
+    if coalesce(v_e->>'priority_level', '') not in ('critical', 'high', 'medium', 'low')
+       or (v_e->>'priority_level') = any(v_levels) then
+      raise exception 'bad_config: each of critical, high, medium, low exactly once' using errcode = 'check_violation';
+    end if;
+    if coalesce(v_e->>'allocation_pct', '') !~ '^\d{1,3}(\.\d{1,2})?$' then
+      raise exception 'bad_percentage: % must be a number from 0 to 100', v_e->>'priority_level' using errcode = 'check_violation';
+    end if;
+    v_pct := (v_e->>'allocation_pct')::numeric;
+    if v_pct < 0 or v_pct > 100 then
+      raise exception 'bad_percentage: % must be a number from 0 to 100', v_e->>'priority_level' using errcode = 'check_violation';
+    end if;
+    v_levels := v_levels || (v_e->>'priority_level');
+    v_total := v_total + v_pct;
+  end loop;
+  if v_total <> 100 then
+    raise exception 'bad_total: percentages add up to % percent, they must total exactly 100 percent', v_total
+      using errcode = 'check_violation';
+  end if;
+
+  update public.priority_level_allocation pla
+     set allocation_pct = (e->>'allocation_pct')::numeric,
+         is_active = coalesce((e->>'is_active')::boolean, true),
+         updated_at = now()
+    from jsonb_array_elements(p_config) e
+   where pla.priority_level = e->>'priority_level';
+
+  perform app.log_action('availability.level_allocation', 'priority_level_allocation', null, null, p_config);
+  perform app.recalc_priority_allocation('priority_change', 'level_percentages', null);
+end;
+$fn$;
+revoke all on function public.set_priority_level_allocation(jsonb) from public;
+grant execute on function public.set_priority_level_allocation(jsonb) to authenticated, service_role;
+
+-- ── The allocation run ────────────────────────────────────────────────────
+create or replace function app.recalc_priority_allocation(
+  p_trigger_type text default 'priority_reallocation',
+  p_trigger_reference text default null,
+  p_ingredient_ids uuid[] default null
+) returns void language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_scope uuid[];
+  v_pass int;
+  v_moved numeric;
+  v_p record;
+  v_r record;
+  v_live record;
+  v_cap numeric;
+  v_claim numeric;
+  v_extra numeric;
+  v_final numeric;
+  v_status text;
+  v_reason text;
+begin
+  if not app.priority_allocation_on() then
+    return;
+  end if;
+  perform pg_advisory_xact_lock(hashtext('app.recalc_priority_allocation'));
+
+  if p_ingredient_ids is null then
+    select coalesce(array_agg(id), '{}'::uuid[]) into v_scope from public.inventory_items;
+  else
+    v_scope := app.availability_scope(p_ingredient_ids);
+  end if;
+  if cardinality(v_scope) = 0 then
+    return;
+  end if;
+
+  -- 1. Usable stock.
+  delete from public.priority_stock_pool where inventory_item_id = any(v_scope);
+  insert into public.priority_stock_pool (inventory_item_id, remaining)
+    select id, greatest(stock_qty, 0) from public.inventory_items where id = any(v_scope);
+
+  -- Products in scope with their level, rank and effective percentage.
+  create temp table if not exists alloc_product (
+    menu_item_id uuid, variant_id uuid, level text, level_rank int, rank_in_level int,
+    item_name text, pct numeric not null default 0, claim numeric not null default 0
+  ) on commit drop;
+  create temp table if not exists alloc_level_pool (
+    level text, inventory_item_id uuid, remaining numeric, primary key (level, inventory_item_id)
+  ) on commit drop;
+  truncate alloc_product;
+
+  insert into alloc_product (menu_item_id, variant_id, level, level_rank, rank_in_level, item_name, pct)
+  select x.menu_item_id, x.variant_id, pp.priority_level,
+         case pp.priority_level when 'critical' then 0 when 'high' then 1 when 'medium' then 2 when 'low' then 3 else 4 end,
+         coalesce(pp.priority_rank, 999999), mi.name,
+         coalesce(case when pla.is_active then pla.allocation_pct end, 0)
+    from (select distinct menu_item_id, variant_id from public.recipe_components
+           where inventory_item_id = any(v_scope)) x
+    join public.menu_items mi on mi.id = x.menu_item_id
+    left join public.product_priority pp on pp.menu_item_id = x.menu_item_id
+    left join public.priority_level_allocation pla on pla.priority_level = pp.priority_level;
+
+  -- 2–4. Percentage rounds, then redistribution rounds of what's left.
+  for v_pass in 1..8 loop
+    truncate alloc_level_pool;
+    insert into alloc_level_pool (level, inventory_item_id, remaining)
+    with hungry as (
+      -- products with a percentage that can still make at least one more
+      select ap.level, ap.pct, ap.menu_item_id, ap.variant_id
+        from alloc_product ap
+       where ap.pct > 0
+         and (select min(floor(ps.remaining / rc.qty_per_unit))
+                from public.recipe_components rc
+                join public.priority_stock_pool ps on ps.inventory_item_id = rc.inventory_item_id
+               where rc.menu_item_id = ap.menu_item_id
+                 and rc.variant_id is not distinct from ap.variant_id) > 0
+    ),
+    level_ing as (
+      select distinct h.level, h.pct, rc.inventory_item_id
+        from hungry h
+        join public.recipe_components rc
+          on rc.menu_item_id = h.menu_item_id and rc.variant_id is not distinct from h.variant_id
+    ),
+    totals as (
+      select inventory_item_id, sum(pct) as total from level_ing group by inventory_item_id
+    )
+    select li.level, li.inventory_item_id, ps.remaining * li.pct / t.total
+      from level_ing li
+      join totals t on t.inventory_item_id = li.inventory_item_id
+      join public.priority_stock_pool ps on ps.inventory_item_id = li.inventory_item_id
+     where t.total > 0;
+
+    v_moved := 0;
+    for v_p in
+      select * from alloc_product where pct > 0
+       order by level_rank, rank_in_level, item_name, variant_id nulls first
+    loop
+      -- whole portions this product can make from its level's share of
+      -- EVERY ingredient in its recipe (a missing share counts as none)
+      select min(floor(coalesce(lp.remaining, 0) / rc.qty_per_unit)) into v_cap
+        from public.recipe_components rc
+        left join alloc_level_pool lp on lp.level = v_p.level and lp.inventory_item_id = rc.inventory_item_id
+       where rc.menu_item_id = v_p.menu_item_id and rc.variant_id is not distinct from v_p.variant_id;
+      v_cap := greatest(coalesce(v_cap, 0), 0);
+      if v_cap > 0 then
+        update alloc_level_pool lp set remaining = lp.remaining - v_cap * rc.qty_per_unit
+          from public.recipe_components rc
+         where rc.menu_item_id = v_p.menu_item_id and rc.variant_id is not distinct from v_p.variant_id
+           and lp.level = v_p.level and lp.inventory_item_id = rc.inventory_item_id;
+        update public.priority_stock_pool ps set remaining = ps.remaining - v_cap * rc.qty_per_unit
+          from public.recipe_components rc
+         where rc.menu_item_id = v_p.menu_item_id and rc.variant_id is not distinct from v_p.variant_id
+           and ps.inventory_item_id = rc.inventory_item_id;
+        update alloc_product set claim = claim + v_cap
+         where menu_item_id = v_p.menu_item_id and variant_id is not distinct from v_p.variant_id;
+        v_moved := v_moved + v_cap;
+      end if;
+    end loop;
+    exit when v_moved = 0;
+  end loop;
+
+  -- 5–6. Final priority pass over every product in scope (including 0% /
+  -- inactive levels, unprioritized products and modifier-only items), then
+  -- write the authoritative result.
+  for v_p in
+    select ap.menu_item_id, ap.variant_id, ap.level_rank, ap.rank_in_level, ap.item_name, ap.claim, true as has_recipe
+      from alloc_product ap
+    union all
+    select mg.menu_item_id, null::uuid,
+           case pp.priority_level when 'critical' then 0 when 'high' then 1 when 'medium' then 2 when 'low' then 3 else 4 end,
+           coalesce(pp.priority_rank, 999999), mi.name, 0, false
+      from public.modifier_groups mg
+      join public.menu_items mi on mi.id = mg.menu_item_id
+      left join public.product_priority pp on pp.menu_item_id = mg.menu_item_id
+     where mg.min_select >= 1
+       and not exists (select 1 from alloc_product ap where ap.menu_item_id = mg.menu_item_id)
+       and (p_ingredient_ids is null or exists (
+             select 1 from public.modifier_options mo
+               join public.modifier_recipe_components mrc on mrc.modifier_option_id = mo.id
+              where mo.group_id = mg.id and mrc.inventory_item_id = any(v_scope)))
+     group by mg.menu_item_id, pp.priority_level, pp.priority_rank, mi.name
+     order by 3, 4, 5, 2 nulls first
+  loop
+    -- independent recipe capacity from live stock: the ceiling, plus the
+    -- status/bottleneck/required-modifier checks
+    select * into v_live from app.compute_product_capacity(v_p.menu_item_id, v_p.variant_id, false);
+
+    if not v_p.has_recipe then
+      perform app.apply_product_availability_result(
+        v_p.menu_item_id, v_p.variant_id, v_live.tracked, v_live.status, v_live.producible_qty,
+        v_live.bottleneck_inventory_item_id, v_live.reason, p_trigger_type, p_trigger_reference, 'system');
+      continue;
+    end if;
+
+    select * into v_r from app.compute_product_capacity(v_p.menu_item_id, v_p.variant_id, true);
+    v_extra := greatest(coalesce(v_r.producible_qty, 0), 0);
+    if v_extra > 0 then
+      update public.priority_stock_pool ps set remaining = ps.remaining - v_extra * rc.qty_per_unit
+        from public.recipe_components rc
+       where rc.menu_item_id = v_p.menu_item_id and rc.variant_id is not distinct from v_p.variant_id
+         and ps.inventory_item_id = rc.inventory_item_id;
+    end if;
+
+    v_claim := coalesce(v_p.claim, 0);
+    v_final := least(v_claim + v_extra, greatest(coalesce(v_live.producible_qty, 0), 0));
+
+    if v_live.status = 'unavailable' then
+      v_final := 0;
+      v_status := 'unavailable';
+      v_reason := v_live.reason;
+    elsif v_final <= 0 then
+      v_final := 0;
+      v_status := 'unavailable';
+      v_reason := 'Allocated to higher-priority items';
+    else
+      v_status := case when v_live.status = 'low_stock' then 'low_stock' else 'available' end;
+      v_reason := case when v_live.status = 'low_stock' then v_live.reason end;
+    end if;
+
+    perform app.apply_product_availability_result(
+      v_p.menu_item_id, v_p.variant_id, true, v_status, v_final,
+      v_live.bottleneck_inventory_item_id, v_reason, p_trigger_type, p_trigger_reference, 'system');
+  end loop;
+end;
+$fn$;
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- 0063_permission_helpers_never_null (verbatim from tenant-migrations)
+-- ════════════════════════════════════════════════════════════════════════════
+-- ============================================================================
+-- Tenant delta 0063 — permission helpers must never return NULL.
+--
+-- SECURITY FIX. app.can_write() was
+--     select app.current_member_role() in ('owner', 'manager')
+-- which is NULL — not false — for any JWT without a member role, i.e. every
+-- custom-portal login. Many SECURITY DEFINER functions guard themselves with
+--     if not (app.has_perm('x') or app.can_write()) then raise 'forbidden'
+-- and for a portal lacking 'x' that is  not (false or NULL)  =  NULL,  which
+-- an IF treats as "don't raise": the check was silently skipped. Examples:
+-- approve_purchase_order, record_supplier_payment, receive_purchase_order,
+-- submit_stock_count, record_ingredient_waste, set_product_priority,
+-- set_priority_allocation, supplier_statement.
+--
+-- Row-level security was NOT affected (a NULL policy result already denies),
+-- and guards that don't OR in can_write() were not affected. Owner/manager
+-- (true) and every other role (false) behave exactly as before; only the
+-- NULL case changes, to false. has_perm() gets the same treatment so a
+-- request with no role claim at all can't produce NULL either.
+-- ============================================================================
+
+create or replace function app.can_write()
+returns boolean language sql stable as $$
+  select coalesce(app.current_member_role() in ('owner', 'manager'), false)
+$$;
+
+create or replace function app.has_perm(p_perm text)
+returns boolean language sql stable as $$
+  select coalesce(
+    app.jwt_role() = 'service_role'
+    or '*' = any(app.jwt_permissions())
+    or p_perm = any(app.jwt_permissions())
+    -- transitional: an owner/manager with no explicit permissions still writes.
+    or (app.jwt_permissions() = '{}'::text[] and app.can_write()),
+    false)
+$$;
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- 0064_deals_workspace (verbatim from tenant-migrations)
+-- ════════════════════════════════════════════════════════════════════════════
+-- ============================================================================
+-- Tenant delta 0064 — Deals & Combos workspace.
+--
+-- Extends the existing deals model (deals / deal_components /
+-- deal_option_groups / deal_option_items, place_order()'s header +
+-- component lines, deal_profitability()) with what the redesigned Deals &
+-- Combos screens need. No second deal model.
+--
+--   * deals gains: type, lifecycle status (draft/active/paused — "scheduled"
+--     and "expired" are derived from starts_at/ends_at), a DEAL-00001
+--     reference, customer display (tagline, badge, show savings), schedule
+--     (days of week + daily time window), rules (min/max per order, total
+--     usage limit) and channels (order types + sales channels).
+--   * status and the existing is_available flag stay in sync both ways, so
+--     every existing reader (storefront, place_order, AI) keeps working.
+--   * The new rules are enforced server-side when an order is placed
+--     (BEFORE INSERT on the deal's header order line) — never only in UI.
+--   * Read-only RPCs for the screens: deal_performance (usage/revenue per
+--     deal + daily series), deal_availability (how many of each deal can
+--     be made right now, from the authoritative product_availability and
+--     the bottleneck item), deal_cost_estimate (food cost of a draft combo),
+--     live_deal_ids (deals sellable right now on a given channel).
+--   * Deal images can be uploaded by deals.create/deals.update holders
+--     into the existing public menu-images bucket, under deals/.
+-- ============================================================================
+
+-- ── Columns ───────────────────────────────────────────────────────────────
+alter table public.deals add column if not exists deal_type text not null default 'combo';
+alter table public.deals add column if not exists status text not null default 'active';
+alter table public.deals add column if not exists ref_code text;
+alter table public.deals add column if not exists tagline text;
+alter table public.deals add column if not exists badge text;
+alter table public.deals add column if not exists show_savings boolean not null default true;
+alter table public.deals add column if not exists active_days int[];
+alter table public.deals add column if not exists start_time time;
+alter table public.deals add column if not exists end_time time;
+alter table public.deals add column if not exists min_qty int not null default 1;
+alter table public.deals add column if not exists max_qty int;
+alter table public.deals add column if not exists usage_limit int;
+alter table public.deals add column if not exists order_types text[] not null default array['dine_in', 'takeaway', 'delivery'];
+alter table public.deals add column if not exists sales_channels text[] not null default array['customer_portal', 'pos'];
+alter table public.deals add column if not exists updated_at timestamptz not null default now();
+
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'deals_deal_type_check') then
+    alter table public.deals add constraint deals_deal_type_check
+      check (deal_type in ('combo', 'meal_deal', 'bucket', 'discount'));
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'deals_status_check') then
+    alter table public.deals add constraint deals_status_check check (status in ('draft', 'active', 'paused'));
+  end if;
+  if not exists (select 1 from pg_constraint where conname = 'deals_rules_check') then
+    alter table public.deals add constraint deals_rules_check check (
+      min_qty >= 1 and (max_qty is null or max_qty >= min_qty) and (usage_limit is null or usage_limit >= 1)
+      and (active_days is null or active_days <@ array[0, 1, 2, 3, 4, 5, 6])
+      and order_types <@ array['dine_in', 'takeaway', 'delivery']
+      and sales_channels <@ array['customer_portal', 'pos']);
+  end if;
+end $$;
+
+create sequence if not exists public.deal_ref_seq;
+update public.deals set status = case when is_available then 'active' else 'paused' end
+ where ref_code is null;
+update public.deals set ref_code = 'DEAL-' || lpad(nextval('public.deal_ref_seq')::text, 5, '0')
+ where ref_code is null;
+create unique index if not exists deals_ref_code_uq on public.deals(ref_code);
+
+-- status ↔ is_available stay in sync; every new deal gets a reference.
+create or replace function app.deals_before_write() returns trigger
+language plpgsql as $$
+begin
+  if new.ref_code is null then
+    new.ref_code := 'DEAL-' || lpad(nextval('public.deal_ref_seq')::text, 5, '0');
+  end if;
+  if tg_op = 'INSERT' then
+    -- An older caller that only sets is_available = false means "paused".
+    if new.status = 'active' and not new.is_available then
+      new.status := 'paused';
+    end if;
+    new.is_available := new.status = 'active';
+  elsif new.status is distinct from old.status then
+    new.is_available := new.status = 'active';
+  elsif new.is_available is distinct from old.is_available then
+    new.status := case when new.is_available then 'active' else 'paused' end;
+  end if;
+  new.updated_at := now();
+  return new;
+end $$;
+drop trigger if exists deals_before_write on public.deals;
+create trigger deals_before_write before insert or update on public.deals
+  for each row execute function app.deals_before_write();
+
+-- ── Is a deal sellable right now on this sales channel? ────────────────────
+create or replace function app.deal_is_live(p_deal public.deals, p_sales_channel text)
+returns boolean language sql stable security definer set search_path = public, app as $$
+  with tz as (
+    select now() at time zone coalesce((select timezone from public.business_settings where id), 'UTC') as local_now
+  )
+  select p_deal.status = 'active'
+     and (p_deal.starts_at is null or p_deal.starts_at <= now())
+     and (p_deal.ends_at is null or p_deal.ends_at >= now())
+     and (p_sales_channel is null or p_sales_channel = any(p_deal.sales_channels))
+     and (p_deal.active_days is null or cardinality(p_deal.active_days) = 0
+          or extract(dow from (select local_now from tz))::int = any(p_deal.active_days))
+     and (p_deal.start_time is null or p_deal.end_time is null
+          or case when p_deal.start_time <= p_deal.end_time
+               then (select local_now from tz)::time between p_deal.start_time and p_deal.end_time
+               else (select local_now from tz)::time >= p_deal.start_time
+                 or (select local_now from tz)::time <= p_deal.end_time  -- window crosses midnight
+             end)
+$$;
+
+-- For the storefront / menu API (anon): which deals can be ordered now.
+create or replace function public.live_deal_ids(p_sales_channel text default 'customer_portal')
+returns uuid[] language sql stable security definer set search_path = public, app as $$
+  select coalesce(array_agg(d.id), '{}'::uuid[]) from public.deals d where app.deal_is_live(d, p_sales_channel)
+$$;
+revoke all on function public.live_deal_ids(text) from public;
+grant execute on function public.live_deal_ids(text) to anon, authenticated, service_role;
+
+-- ── Order-time enforcement (the deal's HEADER line: deal_id set, no item) ──
+create or replace function app.guard_deal_order_line() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_deal public.deals;
+  v_order record;
+  v_source text;
+  v_in_order int;
+  v_used int;
+begin
+  if new.deal_id is null or new.menu_item_id is not null then
+    return new;
+  end if;
+  -- Row lock serializes two orders racing for the last uses of a limit.
+  select * into v_deal from public.deals where id = new.deal_id for update;
+  if not found then return new; end if;
+  select channel::text as channel, session_id into v_order from public.orders where id = new.order_id;
+  v_source := case when v_order.session_id is not null then 'customer_portal' else 'pos' end;
+
+  if not app.deal_is_live(v_deal, v_source) then
+    raise exception 'deal_unavailable: % is not available right now', v_deal.name using errcode = 'check_violation';
+  end if;
+  if v_order.channel is not null and not (v_order.channel = any(v_deal.order_types)) then
+    raise exception 'deal_unavailable: % is not offered for %', v_deal.name, replace(v_order.channel, '_', ' ')
+      using errcode = 'check_violation';
+  end if;
+
+  select coalesce(sum(qty), 0) into v_in_order from public.order_lines
+   where order_id = new.order_id and deal_id = new.deal_id and menu_item_id is null;
+  if new.qty + v_in_order < v_deal.min_qty then
+    raise exception 'deal_rule: order at least % × %', v_deal.min_qty, v_deal.name using errcode = 'check_violation';
+  end if;
+  if v_deal.max_qty is not null and new.qty + v_in_order > v_deal.max_qty then
+    raise exception 'deal_rule: at most % × % per order', v_deal.max_qty, v_deal.name using errcode = 'check_violation';
+  end if;
+  if v_deal.usage_limit is not null then
+    select coalesce(sum(l.qty), 0) into v_used
+      from public.order_lines l join public.orders o on o.id = l.order_id
+     where l.deal_id = new.deal_id and l.menu_item_id is null and o.status <> 'void';
+    if v_used + new.qty > v_deal.usage_limit then
+      raise exception 'deal_rule: % has reached its limit of % orders', v_deal.name, v_deal.usage_limit
+        using errcode = 'check_violation';
+    end if;
+  end if;
+  return new;
+end $fn$;
+drop trigger if exists guard_deal_order_line on public.order_lines;
+create trigger guard_deal_order_line before insert on public.order_lines
+  for each row execute function app.guard_deal_order_line();
+
+-- ── Screens: performance, availability, cost estimate ─────────────────────
+create or replace function public.deal_performance(p_from timestamptz, p_to timestamptz)
+returns table (deal_id uuid, orders bigint, qty bigint, revenue_cents bigint)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('deals.view') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select l.deal_id, count(distinct l.order_id), coalesce(sum(l.qty), 0)::bigint,
+           coalesce(sum(l.line_total_cents), 0)::bigint
+      from public.order_lines l join public.orders o on o.id = l.order_id
+     where l.deal_id is not null and l.menu_item_id is null and o.status <> 'void'
+       and o.created_at >= p_from and o.created_at < p_to
+     group by l.deal_id;
+end $fn$;
+revoke all on function public.deal_performance(timestamptz, timestamptz) from public;
+grant execute on function public.deal_performance(timestamptz, timestamptz) to authenticated, service_role;
+
+create or replace function public.deal_performance_daily(p_from timestamptz, p_to timestamptz)
+returns table (day date, orders bigint, revenue_cents bigint)
+language plpgsql stable security definer set search_path = public, app as $fn$
+declare v_tz text := coalesce((select timezone from public.business_settings where id), 'UTC');
+begin
+  if not (app.has_perm('deals.view') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select g.d::date,
+           coalesce(count(distinct l.order_id) filter (where l.order_id is not null), 0)::bigint,
+           coalesce(sum(l.line_total_cents), 0)::bigint
+      from generate_series((p_from at time zone v_tz)::date, (p_to at time zone v_tz)::date, interval '1 day') g(d)
+      left join public.orders o
+        on (o.created_at at time zone v_tz)::date = g.d::date and o.status <> 'void'
+      left join public.order_lines l
+        on l.order_id = o.id and l.deal_id is not null and l.menu_item_id is null
+     group by g.d
+     order by g.d;
+end $fn$;
+revoke all on function public.deal_performance_daily(timestamptz, timestamptz) from public;
+grant execute on function public.deal_performance_daily(timestamptz, timestamptz) to authenticated, service_role;
+
+-- How many of each deal the kitchen can make now: the minimum over its fixed
+-- components of floor(component availability / qty per deal), from the
+-- same product_availability rows every other surface reads (a variant
+-- without its own recipe uses the item's base row; an untracked component
+-- doesn't limit). The legacy manual counter also caps it when enabled.
+create or replace function public.deal_availability()
+returns table (deal_id uuid, available_qty numeric, bottleneck_name text)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('deals.view') or app.has_perm('availability.view') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    with comp as (
+      select dc.deal_id, dc.qty, mi.name || coalesce(' · ' || v.name, '') as label,
+             coalesce(
+               (select pa.producible_qty from public.product_availability pa
+                 where pa.menu_item_id = dc.menu_item_id and pa.variant_id = dc.variant_id),
+               (select pa.producible_qty from public.product_availability pa
+                 where pa.menu_item_id = dc.menu_item_id and pa.variant_id is null)) as producible,
+             coalesce(
+               (select pa.status from public.product_availability pa
+                 where pa.menu_item_id = dc.menu_item_id and pa.variant_id = dc.variant_id),
+               (select pa.status from public.product_availability pa
+                 where pa.menu_item_id = dc.menu_item_id and pa.variant_id is null)) as status
+        from public.deal_components dc
+        join public.menu_items mi on mi.id = dc.menu_item_id
+        left join public.menu_variants v on v.id = dc.variant_id
+    ),
+    per as (
+      select c.deal_id, c.label,
+             case when c.status = 'unavailable' then 0
+                  when c.producible is null then null
+                  else floor(c.producible / c.qty) end as can_make
+        from comp c
+    ),
+    ranked as (
+      select p.*, row_number() over (partition by p.deal_id order by p.can_make asc nulls last) as rn
+        from per p
+    )
+    select d.id,
+           case
+             when r.can_make is null and not d.track_availability then null
+             when r.can_make is null then d.available_qty::numeric
+             when d.track_availability then least(r.can_make, d.available_qty)
+             else r.can_make
+           end,
+           case when r.can_make is not null then r.label end
+      from public.deals d
+      left join ranked r on r.deal_id = d.id and r.rn = 1;
+end $fn$;
+revoke all on function public.deal_availability() from public;
+grant execute on function public.deal_availability() to authenticated, service_role;
+
+-- Food cost of a (possibly unsaved) combo: [{menu_item_id, variant_id, qty}].
+-- Same recipe resolution as place_order() (variant recipe replaces the
+-- base one). Cost visibility keys only, like deal_profitability().
+create or replace function public.deal_cost_estimate(p_components jsonb)
+returns table (cost_cents int, cost_known boolean)
+language plpgsql stable security definer set search_path = public, app as $fn$
+declare v_e jsonb; v_item uuid; v_var uuid; v_qty int; v_has_var boolean;
+        v_line numeric; v_total numeric := 0; v_known boolean := true; v_any boolean;
+begin
+  if not (app.has_perm('inventory.view_cost') or app.has_perm('finance.view_cogs') or app.has_perm('finance.view_profit')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  for v_e in select value from jsonb_array_elements(coalesce(p_components, '[]'::jsonb)) loop
+    v_item := nullif(v_e->>'menu_item_id', '')::uuid;
+    v_var := nullif(v_e->>'variant_id', '')::uuid;
+    v_qty := greatest(coalesce((v_e->>'qty')::int, 1), 1);
+    continue when v_item is null;
+    select exists(select 1 from public.recipe_components where menu_item_id = v_item and variant_id = v_var)
+      into v_has_var;
+    select sum(rc.qty_per_unit * coalesce(i.cost_cents_per_base_unit, 0)), count(*) > 0
+      into v_line, v_any
+      from public.recipe_components rc join public.inventory_items i on i.id = rc.inventory_item_id
+     where rc.menu_item_id = v_item
+       and rc.variant_id is not distinct from (case when v_has_var then v_var else null end);
+    if not coalesce(v_any, false) then v_known := false; end if;
+    v_total := v_total + coalesce(v_line, 0) * v_qty;
+  end loop;
+  return query select round(v_total)::int, v_known;
+end $fn$;
+revoke all on function public.deal_cost_estimate(jsonb) from public;
+grant execute on function public.deal_cost_estimate(jsonb) to authenticated, service_role;
+
+-- ── Deal images ───────────────────────────────────────────────────────────
+drop policy if exists "menu-images deal write" on storage.objects;
+create policy "menu-images deal write" on storage.objects for all
+  using (bucket_id = 'menu-images' and name like 'deals/%'
+         and (app.has_perm('deals.create') or app.has_perm('deals.update')))
+  with check (bucket_id = 'menu-images' and name like 'deals/%'
+              and (app.has_perm('deals.create') or app.has_perm('deals.update')));
+
+-- deals.create holders can fill in the deal they just created (insert only —
+-- changing or removing contents later still needs deals.update).
+drop policy if exists deals_create_components on public.deal_components;
+create policy deals_create_components on public.deal_components for insert with check (app.has_perm('deals.create'));
+drop policy if exists deals_create_groups on public.deal_option_groups;
+create policy deals_create_groups on public.deal_option_groups for insert with check (app.has_perm('deals.create'));
+drop policy if exists deals_create_group_items on public.deal_option_items;
+create policy deals_create_group_items on public.deal_option_items for insert with check (app.has_perm('deals.create'));
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- 0065_fair_allocation_within_levels (verbatim from tenant-migrations)
+-- ════════════════════════════════════════════════════════════════════════════
+-- ============================================================================
+-- Tenant delta 0065 — fair allocation inside a priority level.
+--
+-- 0062 split a shared ingredient between priority LEVELS by percentage, but
+-- inside a level the first product (or the first SIZE of a product) took the
+-- level's entire share before the next was considered. On a real menu that
+-- showed e.g. Chicken Strips 6 pcs = 148 and Chicken Strips 3 pcs = 0 from
+-- the same 148 packaging boxes, and Chicken Burger Double = 63 while
+-- Chicken Burger Regular = 0 from the same cheese. Products with no priority
+-- were also only ever given leftovers, so French Fries (no priority) showed
+-- 0 despite plenty of stock.
+--
+-- Now:
+--   * A level's share of each ingredient is split EVENLY between the
+--     products (every size counts) in that level that need it; whatever a
+--     product can't use goes back into the next round, same as before.
+--   * A product with no priority counts as Low. Ranked Low products still
+--     come first for any final leftovers.
+--   * Everything else is unchanged: percentages between levels, recipe caps,
+--     redistribution rounds, final priority pass, no stock reserved.
+-- ============================================================================
+
+create or replace function app.recalc_priority_allocation(
+  p_trigger_type text default 'priority_reallocation',
+  p_trigger_reference text default null,
+  p_ingredient_ids uuid[] default null
+) returns void language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_scope uuid[];
+  v_pass int;
+  v_moved numeric;
+  v_p record;
+  v_r record;
+  v_live record;
+  v_cap numeric;
+  v_claim numeric;
+  v_extra numeric;
+  v_final numeric;
+  v_status text;
+  v_reason text;
+begin
+  if not app.priority_allocation_on() then
+    return;
+  end if;
+  perform pg_advisory_xact_lock(hashtext('app.recalc_priority_allocation'));
+
+  if p_ingredient_ids is null then
+    select coalesce(array_agg(id), '{}'::uuid[]) into v_scope from public.inventory_items;
+  else
+    v_scope := app.availability_scope(p_ingredient_ids);
+  end if;
+  if cardinality(v_scope) = 0 then
+    return;
+  end if;
+
+  -- Usable stock.
+  delete from public.priority_stock_pool where inventory_item_id = any(v_scope);
+  insert into public.priority_stock_pool (inventory_item_id, remaining)
+    select id, greatest(stock_qty, 0) from public.inventory_items where id = any(v_scope);
+
+  create temp table if not exists alloc_product (
+    menu_item_id uuid, variant_id uuid, level text, level_rank int, rank_in_level int,
+    item_name text, pct numeric not null default 0, claim numeric not null default 0
+  ) on commit drop;
+  -- Per (level, ingredient): the share EACH product in that level may use this round.
+  create temp table if not exists alloc_share (
+    level text, inventory_item_id uuid, per_product numeric, primary key (level, inventory_item_id)
+  ) on commit drop;
+  create temp table if not exists alloc_hungry (menu_item_id uuid, variant_id uuid, level text) on commit drop;
+  truncate alloc_product;
+
+  -- Products in scope; no priority = Low (after the ranked Low products).
+  insert into alloc_product (menu_item_id, variant_id, level, level_rank, rank_in_level, item_name, pct)
+  select x.menu_item_id, x.variant_id, coalesce(pp.priority_level, 'low'),
+         case coalesce(pp.priority_level, 'low') when 'critical' then 0 when 'high' then 1 when 'medium' then 2 else 3 end,
+         coalesce(pp.priority_rank, 999999), mi.name,
+         coalesce(case when pla.is_active then pla.allocation_pct end, 0)
+    from (select distinct menu_item_id, variant_id from public.recipe_components
+           where inventory_item_id = any(v_scope)) x
+    join public.menu_items mi on mi.id = x.menu_item_id
+    left join public.product_priority pp on pp.menu_item_id = x.menu_item_id
+    left join public.priority_level_allocation pla on pla.priority_level = coalesce(pp.priority_level, 'low');
+
+  -- Percentage rounds, then redistribution rounds of whatever is left.
+  for v_pass in 1..10 loop
+    -- products with a percentage that can still make at least one more
+    truncate alloc_hungry;
+    insert into alloc_hungry (menu_item_id, variant_id, level)
+    select ap.menu_item_id, ap.variant_id, ap.level
+      from alloc_product ap
+     where ap.pct > 0
+       and (select min(floor(ps.remaining / rc.qty_per_unit))
+              from public.recipe_components rc
+              join public.priority_stock_pool ps on ps.inventory_item_id = rc.inventory_item_id
+             where rc.menu_item_id = ap.menu_item_id
+               and rc.variant_id is not distinct from ap.variant_id) > 0;
+    exit when not exists (select 1 from alloc_hungry);
+
+    truncate alloc_share;
+    insert into alloc_share (level, inventory_item_id, per_product)
+    with level_ing as (
+      select h.level, rc.inventory_item_id, count(*) as products
+        from alloc_hungry h
+        join public.recipe_components rc
+          on rc.menu_item_id = h.menu_item_id and rc.variant_id is not distinct from h.variant_id
+       group by h.level, rc.inventory_item_id
+    ),
+    weighted as (
+      select li.*, pla.allocation_pct as pct
+        from level_ing li
+        join public.priority_level_allocation pla on pla.priority_level = li.level
+    ),
+    totals as (
+      select inventory_item_id, sum(pct) as total from weighted group by inventory_item_id
+    )
+    select w.level, w.inventory_item_id, ps.remaining * w.pct / t.total / w.products
+      from weighted w
+      join totals t on t.inventory_item_id = w.inventory_item_id
+      join public.priority_stock_pool ps on ps.inventory_item_id = w.inventory_item_id
+     where t.total > 0;
+
+    v_moved := 0;
+    for v_p in
+      select h.menu_item_id, h.variant_id, h.level from alloc_hungry h
+    loop
+      select min(floor(coalesce(s.per_product, 0) / rc.qty_per_unit)) into v_cap
+        from public.recipe_components rc
+        left join alloc_share s on s.level = v_p.level and s.inventory_item_id = rc.inventory_item_id
+       where rc.menu_item_id = v_p.menu_item_id and rc.variant_id is not distinct from v_p.variant_id;
+      v_cap := greatest(coalesce(v_cap, 0), 0);
+      if v_cap > 0 then
+        update public.priority_stock_pool ps set remaining = ps.remaining - v_cap * rc.qty_per_unit
+          from public.recipe_components rc
+         where rc.menu_item_id = v_p.menu_item_id and rc.variant_id is not distinct from v_p.variant_id
+           and ps.inventory_item_id = rc.inventory_item_id;
+        update alloc_product set claim = claim + v_cap
+         where menu_item_id = v_p.menu_item_id and variant_id is not distinct from v_p.variant_id;
+        v_moved := v_moved + v_cap;
+      end if;
+    end loop;
+    exit when v_moved = 0;
+  end loop;
+
+  -- Final priority pass for any remainder (whole-portion rounding, 0% or
+  -- inactive levels, modifier-only items), then write the result.
+  for v_p in
+    select ap.menu_item_id, ap.variant_id, ap.level_rank, ap.rank_in_level, ap.item_name, ap.claim, true as has_recipe
+      from alloc_product ap
+    union all
+    select mg.menu_item_id, null::uuid,
+           case coalesce(pp.priority_level, 'low') when 'critical' then 0 when 'high' then 1 when 'medium' then 2 else 3 end,
+           coalesce(pp.priority_rank, 999999), mi.name, 0, false
+      from public.modifier_groups mg
+      join public.menu_items mi on mi.id = mg.menu_item_id
+      left join public.product_priority pp on pp.menu_item_id = mg.menu_item_id
+     where mg.min_select >= 1
+       and not exists (select 1 from alloc_product ap where ap.menu_item_id = mg.menu_item_id)
+       and (p_ingredient_ids is null or exists (
+             select 1 from public.modifier_options mo
+               join public.modifier_recipe_components mrc on mrc.modifier_option_id = mo.id
+              where mo.group_id = mg.id and mrc.inventory_item_id = any(v_scope)))
+     group by mg.menu_item_id, pp.priority_level, pp.priority_rank, mi.name
+     order by 3, 4, 5, 2 nulls first
+  loop
+    select * into v_live from app.compute_product_capacity(v_p.menu_item_id, v_p.variant_id, false);
+
+    if not v_p.has_recipe then
+      perform app.apply_product_availability_result(
+        v_p.menu_item_id, v_p.variant_id, v_live.tracked, v_live.status, v_live.producible_qty,
+        v_live.bottleneck_inventory_item_id, v_live.reason, p_trigger_type, p_trigger_reference, 'system');
+      continue;
+    end if;
+
+    select * into v_r from app.compute_product_capacity(v_p.menu_item_id, v_p.variant_id, true);
+    v_extra := greatest(coalesce(v_r.producible_qty, 0), 0);
+    if v_extra > 0 then
+      update public.priority_stock_pool ps set remaining = ps.remaining - v_extra * rc.qty_per_unit
+        from public.recipe_components rc
+       where rc.menu_item_id = v_p.menu_item_id and rc.variant_id is not distinct from v_p.variant_id
+         and ps.inventory_item_id = rc.inventory_item_id;
+    end if;
+
+    v_claim := coalesce(v_p.claim, 0);
+    v_final := least(v_claim + v_extra, greatest(coalesce(v_live.producible_qty, 0), 0));
+
+    if v_live.status = 'unavailable' then
+      v_final := 0;
+      v_status := 'unavailable';
+      v_reason := v_live.reason;
+    elsif v_final <= 0 then
+      v_final := 0;
+      v_status := 'unavailable';
+      v_reason := 'Allocated to higher-priority items';
+    else
+      v_status := case when v_live.status = 'low_stock' then 'low_stock' else 'available' end;
+      v_reason := case when v_live.status = 'low_stock' then v_live.reason end;
+    end if;
+
+    perform app.apply_product_availability_result(
+      v_p.menu_item_id, v_p.variant_id, true, v_status, v_final,
+      v_live.bottleneck_inventory_item_id, v_reason, p_trigger_type, p_trigger_reference, 'system');
+  end loop;
+end;
+$fn$;
+
+-- Recalculate everything once with the fair rule (no-op when allocation is off).
+select app.recalc_priority_allocation('manual_recalculation', 'fair_allocation', null);
+
+-- 0068: recipes first, linked to a menu item by hand.
+--
+-- Before: a dish recipe HAD to name its menu item when it was created, so
+-- the Recipes page created or attached a product on save and AI recipe
+-- import matched every recipe to a dish by name. Now a dish recipe can
+-- exist on its own; whoever designs the menu links it (or unlinks it)
+-- explicitly with link_recipe()/unlink_recipe(). Nothing links itself.
+--
+-- A linked, active recipe is what the dish consumes from stock
+-- (recipe_components); an unlinked one consumes nothing.
+
+-- 1. A dish ('menu_item') recipe may be unlinked. A 'variant' recipe is
+--    by definition linked to a size; batches never point at a product.
+do $$
+declare c record;
+begin
+  for c in
+    select conname from pg_constraint
+     where conrelid = 'public.recipes'::regclass and contype = 'c'
+       and pg_get_constraintdef(oid) ilike '%menu_item_id IS NOT NULL%'
+  loop
+    execute format('alter table public.recipes drop constraint %I', c.conname);
+  end loop;
+end $$;
+alter table public.recipes
+  add constraint recipes_batch_unlinked_check check (recipe_type in ('menu_item', 'variant') or menu_item_id is null),
+  add constraint recipes_variant_linked_check check (recipe_type <> 'variant' or menu_item_id is not null);
+
+-- 2. Writes (or clears) the stock link for one recipe from its current
+--    state: linked + active -> its resolved ingredients; otherwise none.
+create or replace function app.sync_recipe_components(p_recipe_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v public.recipes;
+begin
+  select * into v from public.recipes where id = p_recipe_id;
+  if v.id is null or v.menu_item_id is null then return; end if;
+  delete from public.recipe_components
+   where menu_item_id = v.menu_item_id and variant_id is not distinct from v.variant_id;
+  if v.status = 'active' and v.current_version_id is not null then
+    insert into public.recipe_components (menu_item_id, variant_id, inventory_item_id, qty_per_unit)
+    select v.menu_item_id, v.variant_id, x.inventory_item_id, sum(x.qty_base)
+      from public.resolve_recipe_ingredients(v.current_version_id) x
+     group by x.inventory_item_id;
+  end if;
+end;
+$fn$;
+revoke all on function app.sync_recipe_components(uuid) from public;
+
+-- 3. create_recipe: a dish recipe no longer needs a menu item.
+create or replace function public.create_recipe(
+  p_name text, p_description text, p_notes text, p_recipe_type app.recipe_type,
+  p_menu_item_id uuid, p_variant_id uuid, p_instructions text,
+  p_yield_qty numeric, p_yield_unit text, p_ingredients jsonb
+) returns table (recipe_id uuid, recipe_version_id uuid, cost_cents int)
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_recipe_id uuid; v_version_id uuid; v_ing jsonb; v_cost int;
+begin
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_name), '') = '' then
+    raise exception 'recipe_name_required' using errcode = 'check_violation';
+  end if;
+  if p_ingredients is null or jsonb_typeof(p_ingredients) <> 'array' or jsonb_array_length(p_ingredients) = 0 then
+    raise exception 'recipe_needs_ingredients' using errcode = 'check_violation';
+  end if;
+  if p_recipe_type = 'variant' and (p_menu_item_id is null or p_variant_id is null) then
+    raise exception 'recipe_needs_menu_item' using errcode = 'check_violation';
+  end if;
+
+  insert into public.recipes (name, description, notes, recipe_type, menu_item_id, variant_id, instructions, status, created_by)
+  values (trim(p_name), nullif(trim(coalesce(p_description, '')), ''), nullif(trim(coalesce(p_notes, '')), ''),
+          p_recipe_type,
+          case when p_recipe_type in ('menu_item', 'variant') then p_menu_item_id end,
+          case when p_recipe_type = 'variant' then p_variant_id end,
+          nullif(trim(coalesce(p_instructions, '')), ''), 'draft', app.jwt_sub())
+  returning id into v_recipe_id;
+
+  insert into public.recipe_versions (recipe_id, version, status, yield_qty, yield_unit, created_by)
+  values (v_recipe_id, 1, 'draft', greatest(coalesce(p_yield_qty, 1), 0.0001), nullif(trim(coalesce(p_yield_unit, '')), ''), app.jwt_sub())
+  returning id into v_version_id;
+
+  for v_ing in select * from jsonb_array_elements(p_ingredients) loop
+    insert into public.recipe_ingredients (recipe_version_id, inventory_item_id, sub_recipe_id, qty_base, sort_order)
+    values (
+      v_version_id,
+      nullif(v_ing->>'inventory_item_id', '')::uuid,
+      nullif(v_ing->>'sub_recipe_id', '')::uuid,
+      (v_ing->>'qty_base')::numeric,
+      coalesce((v_ing->>'sort_order')::int, 0)
+    );
+  end loop;
+
+  v_cost := public.recipe_version_total_cost(v_version_id);
+  perform app.log_action('recipe.created', 'recipes', v_recipe_id::text, null,
+    jsonb_build_object('name', p_name, 'version_id', v_version_id, 'cost_cents', v_cost));
+
+  return query select v_recipe_id, v_version_id, v_cost;
+end;
+$fn$;
+revoke all on function public.create_recipe(text, text, text, app.recipe_type, uuid, uuid, text, numeric, text, jsonb) from public;
+grant execute on function public.create_recipe(text, text, text, app.recipe_type, uuid, uuid, text, numeric, text, jsonb) to authenticated, service_role;
+
+-- 4. activate_recipe_version: an unlinked dish recipe can be activated
+--    (ready to link); it only feeds stock once it is linked.
+create or replace function public.activate_recipe_version(p_recipe_version_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_recipe_id uuid; v_recipe public.recipes; v_prev_active uuid; v_cost int;
+begin
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+
+  select recipe_id into v_recipe_id from public.recipe_versions where id = p_recipe_version_id;
+  if v_recipe_id is null then raise exception 'recipe_version_not_found' using errcode = 'no_data_found'; end if;
+  select * into v_recipe from public.recipes where id = v_recipe_id;
+
+  if not exists (select 1 from public.recipe_ingredients where recipe_version_id = p_recipe_version_id) then
+    raise exception 'recipe_needs_ingredients' using errcode = 'check_violation';
+  end if;
+
+  if exists (
+    with recursive dep(recipe_id) as (
+      select ri.sub_recipe_id from public.recipe_ingredients ri
+       where ri.recipe_version_id = p_recipe_version_id and ri.sub_recipe_id is not null
+      union
+      select ri2.sub_recipe_id
+        from dep
+        join public.recipes r2 on r2.id = dep.recipe_id
+        join public.recipe_ingredients ri2
+          on ri2.recipe_version_id = coalesce(r2.current_version_id, '00000000-0000-0000-0000-000000000000'::uuid)
+         and ri2.sub_recipe_id is not null
+    )
+    select 1 from dep where recipe_id = v_recipe_id
+  ) then
+    raise exception 'circular_recipe_dependency' using errcode = 'check_violation';
+  end if;
+
+  select id into v_prev_active from public.recipe_versions where recipe_id = v_recipe_id and status = 'active';
+  if v_prev_active is not null then
+    update public.recipe_versions set status = 'archived', effective_to = now() where id = v_prev_active;
+  end if;
+  update public.recipe_versions set status = 'active', effective_from = now(), effective_to = null where id = p_recipe_version_id;
+  update public.recipes set status = 'active', current_version_id = p_recipe_version_id where id = v_recipe_id;
+
+  perform app.sync_recipe_components(v_recipe_id);
+
+  v_cost := public.recipe_version_total_cost(p_recipe_version_id);
+  insert into public.recipe_cost_log (recipe_version_id, cost_cents) values (p_recipe_version_id, v_cost);
+
+  perform app.log_action('recipe.activated', 'recipes', v_recipe_id::text,
+    jsonb_build_object('previous_version_id', v_prev_active),
+    jsonb_build_object('active_version_id', p_recipe_version_id, 'cost_cents', v_cost));
+end;
+$fn$;
+revoke all on function public.activate_recipe_version(uuid) from public;
+grant execute on function public.activate_recipe_version(uuid) to authenticated, service_role;
+
+-- 5. Link a dish recipe to a menu item (or one of its sizes).
+create or replace function public.link_recipe(p_recipe_id uuid, p_menu_item_id uuid, p_variant_id uuid default null)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v public.recipes; v_item text; v_other text; v_linked text;
+begin
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v from public.recipes where id = p_recipe_id;
+  if v.id is null then raise exception 'recipe_not_found' using errcode = 'no_data_found'; end if;
+  if v.status = 'archived' then
+    raise exception 'This recipe is archived. Restore it with a new version first.' using errcode = 'check_violation';
+  end if;
+  if v.recipe_type not in ('menu_item', 'variant') then
+    raise exception '"%" is a batch recipe. Use it as a sub-recipe inside a dish recipe instead.', v.name using errcode = 'check_violation';
+  end if;
+  select name into v_item from public.menu_items where id = p_menu_item_id;
+  if v_item is null then raise exception 'menu_item_not_found' using errcode = 'no_data_found'; end if;
+  if p_variant_id is not null and not exists (
+    select 1 from public.menu_variants where id = p_variant_id and menu_item_id = p_menu_item_id
+  ) then
+    raise exception 'variant_not_found' using errcode = 'no_data_found';
+  end if;
+  if v.menu_item_id is not null then
+    if v.menu_item_id = p_menu_item_id and v.variant_id is not distinct from p_variant_id then return; end if;
+    select name into v_linked from public.menu_items where id = v.menu_item_id;
+    raise exception '"%" is already linked to "%". Unlink it there first.', v.name, v_linked using errcode = 'check_violation';
+  end if;
+  select r.name into v_other from public.recipes r
+   where r.menu_item_id = p_menu_item_id and r.variant_id is not distinct from p_variant_id
+     and r.status <> 'archived' and r.id <> p_recipe_id
+   limit 1;
+  if v_other is not null then
+    raise exception '"%" already has a recipe ("%"). Unlink it first.', v_item, v_other using errcode = 'unique_violation';
+  end if;
+
+  update public.recipes
+     set menu_item_id = p_menu_item_id,
+         variant_id = p_variant_id,
+         recipe_type = case when p_variant_id is null then 'menu_item' else 'variant' end::app.recipe_type
+   where id = p_recipe_id;
+  perform app.sync_recipe_components(p_recipe_id);
+
+  perform app.log_action('recipe.linked', 'recipes', p_recipe_id::text, null,
+    jsonb_build_object('menu_item_id', p_menu_item_id, 'variant_id', p_variant_id));
+end;
+$fn$;
+revoke all on function public.link_recipe(uuid, uuid, uuid) from public;
+grant execute on function public.link_recipe(uuid, uuid, uuid) to authenticated, service_role;
+
+-- 6. Unlink: the dish stops consuming stock; the recipe itself is kept.
+create or replace function public.unlink_recipe(p_recipe_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v public.recipes;
+begin
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v from public.recipes where id = p_recipe_id;
+  if v.id is null then raise exception 'recipe_not_found' using errcode = 'no_data_found'; end if;
+  if v.menu_item_id is null then return; end if;
+
+  delete from public.recipe_components
+   where menu_item_id = v.menu_item_id and variant_id is not distinct from v.variant_id;
+  update public.recipes set menu_item_id = null, variant_id = null, recipe_type = 'menu_item' where id = p_recipe_id;
+
+  perform app.log_action('recipe.unlinked', 'recipes', p_recipe_id::text,
+    jsonb_build_object('menu_item_id', v.menu_item_id, 'variant_id', v.variant_id), null);
+end;
+$fn$;
+revoke all on function public.unlink_recipe(uuid) from public;
+grant execute on function public.unlink_recipe(uuid) to authenticated, service_role;
+
+-- 0069: recipes outlive the dishes they are linked to; linking turns them on.
+--
+-- 1. recipes.menu_item_id / variant_id were ON DELETE CASCADE, so deleting
+--    a dish (or one of its sizes) silently deleted its recipe too. A recipe
+--    is created first and stands on its own, so deleting the dish now just
+--    UNLINKS it: the recipe stays on the Recipes page, ready to link again.
+--    (The dish's stock link, recipe_components, still goes with the dish.)
+-- 2. link_recipe() activates a draft recipe as it links it, so linking a
+--    recipe to a dish immediately switches on stock deduction, food cost
+--    and automatic availability.
+
+do $$
+declare c record;
+begin
+  for c in
+    select conname from pg_constraint
+     where conrelid = 'public.recipes'::regclass and contype = 'f'
+       and confrelid in ('public.menu_items'::regclass, 'public.menu_variants'::regclass)
+  loop
+    execute format('alter table public.recipes drop constraint %I', c.conname);
+  end loop;
+end $$;
+alter table public.recipes
+  add constraint recipes_menu_item_id_fkey foreign key (menu_item_id) references public.menu_items(id) on delete set null,
+  add constraint recipes_variant_id_fkey foreign key (variant_id) references public.menu_variants(id) on delete set null;
+
+-- Keeps a recipe consistent when its dish or size disappears (the SET NULL
+-- above arrives here as an UPDATE): losing the dish, or losing the one size
+-- a size-specific recipe was for, leaves a plain unlinked dish recipe.
+create or replace function app.recipes_normalize_link() returns trigger
+language plpgsql as $fn$
+begin
+  if new.recipe_type = 'variant' and new.variant_id is null then
+    new.menu_item_id := null;
+  end if;
+  if new.menu_item_id is null then
+    new.variant_id := null;
+    if new.recipe_type = 'variant' then new.recipe_type := 'menu_item'; end if;
+  end if;
+  return new;
+end;
+$fn$;
+drop trigger if exists recipes_normalize_link on public.recipes;
+create trigger recipes_normalize_link before update on public.recipes
+  for each row execute function app.recipes_normalize_link();
+
+create or replace function public.link_recipe(p_recipe_id uuid, p_menu_item_id uuid, p_variant_id uuid default null)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v public.recipes; v_item text; v_other text; v_linked text; v_version uuid;
+begin
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v from public.recipes where id = p_recipe_id;
+  if v.id is null then raise exception 'recipe_not_found' using errcode = 'no_data_found'; end if;
+  if v.status = 'archived' then
+    raise exception 'This recipe is archived. Restore it with a new version first.' using errcode = 'check_violation';
+  end if;
+  if v.recipe_type not in ('menu_item', 'variant') then
+    raise exception '"%" is a batch recipe. Use it as a sub-recipe inside a dish recipe instead.', v.name using errcode = 'check_violation';
+  end if;
+  select name into v_item from public.menu_items where id = p_menu_item_id;
+  if v_item is null then raise exception 'menu_item_not_found' using errcode = 'no_data_found'; end if;
+  if p_variant_id is not null and not exists (
+    select 1 from public.menu_variants where id = p_variant_id and menu_item_id = p_menu_item_id
+  ) then
+    raise exception 'variant_not_found' using errcode = 'no_data_found';
+  end if;
+  if v.menu_item_id is not null then
+    if v.menu_item_id = p_menu_item_id and v.variant_id is not distinct from p_variant_id then return; end if;
+    select name into v_linked from public.menu_items where id = v.menu_item_id;
+    raise exception '"%" is already linked to "%". Unlink it there first.', v.name, v_linked using errcode = 'check_violation';
+  end if;
+  select r.name into v_other from public.recipes r
+   where r.menu_item_id = p_menu_item_id and r.variant_id is not distinct from p_variant_id
+     and r.status <> 'archived' and r.id <> p_recipe_id
+   limit 1;
+  if v_other is not null then
+    raise exception '"%" already has a recipe ("%"). Unlink it first.', v_item, v_other using errcode = 'unique_violation';
+  end if;
+
+  update public.recipes
+     set menu_item_id = p_menu_item_id,
+         variant_id = p_variant_id,
+         recipe_type = case when p_variant_id is null then 'menu_item' else 'variant' end::app.recipe_type
+   where id = p_recipe_id;
+
+  if v.status = 'draft' then
+    -- Linking switches the recipe on: activate its latest version (this
+    -- also writes the dish's stock link and logs the cost).
+    select id into v_version from public.recipe_versions where recipe_id = p_recipe_id order by version desc limit 1;
+    if v_version is not null then
+      perform public.activate_recipe_version(v_version);
+    end if;
+  else
+    perform app.sync_recipe_components(p_recipe_id);
+  end if;
+
+  perform app.log_action('recipe.linked', 'recipes', p_recipe_id::text, null,
+    jsonb_build_object('menu_item_id', p_menu_item_id, 'variant_id', p_variant_id, 'activated', v.status = 'draft'));
+end;
+$fn$;
+revoke all on function public.link_recipe(uuid, uuid, uuid) from public;
+grant execute on function public.link_recipe(uuid, uuid, uuid) to authenticated, service_role;
+
+-- 0070: one recipe can be linked to many dishes / sizes.
+--
+-- Until now a recipe pointed at ONE dish (recipes.menu_item_id/variant_id).
+-- Links now live in recipe_links, so the same recipe (e.g. "Beef Patty")
+-- can be picked for any number of dishes or sizes. Each dish / size still
+-- has at most ONE recipe, which is what decides its stock deduction.
+--
+-- recipe_components (what orders deduct) is still per dish/size and is
+-- rebuilt for every link of a recipe whenever the recipe changes.
+-- Deleting a dish or size deletes only its link; the recipe stays.
+-- recipes.menu_item_id/variant_id are no longer used and are cleared.
+
+create table if not exists public.recipe_links (
+  id            uuid primary key default gen_random_uuid(),
+  recipe_id     uuid not null references public.recipes(id) on delete cascade,
+  menu_item_id  uuid not null references public.menu_items(id) on delete cascade,
+  variant_id    uuid references public.menu_variants(id) on delete cascade,
+  created_at    timestamptz not null default now()
+);
+create unique index if not exists recipe_links_one_per_product_idx
+  on public.recipe_links(menu_item_id, coalesce(variant_id, '00000000-0000-0000-0000-000000000000'::uuid));
+create index if not exists recipe_links_recipe_idx on public.recipe_links(recipe_id);
+
+alter table public.recipe_links enable row level security;
+drop policy if exists staff_read on public.recipe_links;
+create policy staff_read on public.recipe_links for select using (app.has_perm('menu.view') or app.is_staff());
+-- Writes only through link_recipe()/unlink_recipe() (security definer).
+grant select on public.recipe_links to authenticated;
+grant all on public.recipe_links to service_role;
+
+-- Existing links move over; archived recipes keep none.
+insert into public.recipe_links (recipe_id, menu_item_id, variant_id)
+select r.id, r.menu_item_id, r.variant_id
+  from public.recipes r
+ where r.menu_item_id is not null and r.status <> 'archived'
+on conflict do nothing;
+
+update public.recipes
+   set menu_item_id = null, variant_id = null,
+       recipe_type = case when recipe_type = 'variant' then 'menu_item'::app.recipe_type else recipe_type end
+ where menu_item_id is not null or recipe_type = 'variant';
+
+-- Rebuild every link's stock rows from its recipe's active version.
+create or replace function app.sync_recipe_components(p_recipe_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v public.recipes; l record;
+begin
+  select * into v from public.recipes where id = p_recipe_id;
+  if v.id is null then return; end if;
+  for l in select menu_item_id, variant_id from public.recipe_links where recipe_id = p_recipe_id loop
+    delete from public.recipe_components
+     where menu_item_id = l.menu_item_id and variant_id is not distinct from l.variant_id;
+    if v.status = 'active' and v.current_version_id is not null then
+      insert into public.recipe_components (menu_item_id, variant_id, inventory_item_id, qty_per_unit)
+      select l.menu_item_id, l.variant_id, x.inventory_item_id, sum(x.qty_base)
+        from public.resolve_recipe_ingredients(v.current_version_id) x
+       group by x.inventory_item_id;
+    end if;
+  end loop;
+end;
+$fn$;
+revoke all on function app.sync_recipe_components(uuid) from public;
+
+-- Removes one link (or every link) and the stock rows it produced.
+create or replace function app.drop_recipe_links(p_recipe_id uuid, p_menu_item_id uuid default null, p_variant_id uuid default null, p_all boolean default false)
+returns int language plpgsql security definer set search_path = public, app as $fn$
+declare l record; n int := 0;
+begin
+  for l in
+    select id, menu_item_id, variant_id from public.recipe_links
+     where recipe_id = p_recipe_id
+       and (p_all or (menu_item_id = p_menu_item_id and variant_id is not distinct from p_variant_id))
+  loop
+    delete from public.recipe_components
+     where menu_item_id = l.menu_item_id and variant_id is not distinct from l.variant_id;
+    delete from public.recipe_links where id = l.id;
+    n := n + 1;
+  end loop;
+  return n;
+end;
+$fn$;
+revoke all on function app.drop_recipe_links(uuid, uuid, uuid, boolean) from public;
+
+-- create_recipe: a dish given at creation (AI chat "draft a recipe for X")
+-- becomes a link; the recipe row itself no longer names a dish.
+create or replace function public.create_recipe(
+  p_name text, p_description text, p_notes text, p_recipe_type app.recipe_type,
+  p_menu_item_id uuid, p_variant_id uuid, p_instructions text,
+  p_yield_qty numeric, p_yield_unit text, p_ingredients jsonb
+) returns table (recipe_id uuid, recipe_version_id uuid, cost_cents int)
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_recipe_id uuid; v_version_id uuid; v_ing jsonb; v_cost int;
+begin
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_name), '') = '' then
+    raise exception 'recipe_name_required' using errcode = 'check_violation';
+  end if;
+  if p_ingredients is null or jsonb_typeof(p_ingredients) <> 'array' or jsonb_array_length(p_ingredients) = 0 then
+    raise exception 'recipe_needs_ingredients' using errcode = 'check_violation';
+  end if;
+
+  insert into public.recipes (name, description, notes, recipe_type, instructions, status, created_by)
+  values (trim(p_name), nullif(trim(coalesce(p_description, '')), ''), nullif(trim(coalesce(p_notes, '')), ''),
+          case when p_recipe_type = 'variant' then 'menu_item'::app.recipe_type else p_recipe_type end,
+          nullif(trim(coalesce(p_instructions, '')), ''), 'draft', app.jwt_sub())
+  returning id into v_recipe_id;
+
+  insert into public.recipe_versions (recipe_id, version, status, yield_qty, yield_unit, created_by)
+  values (v_recipe_id, 1, 'draft', greatest(coalesce(p_yield_qty, 1), 0.0001), nullif(trim(coalesce(p_yield_unit, '')), ''), app.jwt_sub())
+  returning id into v_version_id;
+
+  for v_ing in select * from jsonb_array_elements(p_ingredients) loop
+    insert into public.recipe_ingredients (recipe_version_id, inventory_item_id, sub_recipe_id, qty_base, sort_order)
+    values (
+      v_version_id,
+      nullif(v_ing->>'inventory_item_id', '')::uuid,
+      nullif(v_ing->>'sub_recipe_id', '')::uuid,
+      (v_ing->>'qty_base')::numeric,
+      coalesce((v_ing->>'sort_order')::int, 0)
+    );
+  end loop;
+
+  if p_menu_item_id is not null and p_recipe_type in ('menu_item', 'variant') then
+    if exists (select 1 from public.recipe_links
+                where menu_item_id = p_menu_item_id and variant_id is not distinct from p_variant_id) then
+      raise exception 'That dish already has a recipe. Unlink it first.' using errcode = 'unique_violation';
+    end if;
+    insert into public.recipe_links (recipe_id, menu_item_id, variant_id) values (v_recipe_id, p_menu_item_id, p_variant_id);
+  end if;
+
+  v_cost := public.recipe_version_total_cost(v_version_id);
+  perform app.log_action('recipe.created', 'recipes', v_recipe_id::text, null,
+    jsonb_build_object('name', p_name, 'version_id', v_version_id, 'cost_cents', v_cost));
+
+  return query select v_recipe_id, v_version_id, v_cost;
+end;
+$fn$;
+revoke all on function public.create_recipe(text, text, text, app.recipe_type, uuid, uuid, text, numeric, text, jsonb) from public;
+grant execute on function public.create_recipe(text, text, text, app.recipe_type, uuid, uuid, text, numeric, text, jsonb) to authenticated, service_role;
+
+-- link_recipe: any dish recipe can be picked, even one already used by
+-- other dishes. Only the target dish/size must not have a different recipe.
+create or replace function public.link_recipe(p_recipe_id uuid, p_menu_item_id uuid, p_variant_id uuid default null)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v public.recipes; v_item text; v_other text; v_version uuid;
+begin
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v from public.recipes where id = p_recipe_id;
+  if v.id is null then raise exception 'recipe_not_found' using errcode = 'no_data_found'; end if;
+  if v.status = 'archived' then
+    raise exception 'This recipe is archived. Restore it with a new version first.' using errcode = 'check_violation';
+  end if;
+  if v.recipe_type not in ('menu_item', 'variant') then
+    raise exception '"%" is a batch recipe. Use it as a sub-recipe inside a dish recipe instead.', v.name using errcode = 'check_violation';
+  end if;
+  select name into v_item from public.menu_items where id = p_menu_item_id;
+  if v_item is null then raise exception 'menu_item_not_found' using errcode = 'no_data_found'; end if;
+  if p_variant_id is not null and not exists (
+    select 1 from public.menu_variants where id = p_variant_id and menu_item_id = p_menu_item_id
+  ) then
+    raise exception 'variant_not_found' using errcode = 'no_data_found';
+  end if;
+
+  if exists (select 1 from public.recipe_links where recipe_id = p_recipe_id
+              and menu_item_id = p_menu_item_id and variant_id is not distinct from p_variant_id) then
+    return;  -- already linked exactly here
+  end if;
+  select r.name into v_other
+    from public.recipe_links l join public.recipes r on r.id = l.recipe_id
+   where l.menu_item_id = p_menu_item_id and l.variant_id is not distinct from p_variant_id;
+  if v_other is not null then
+    raise exception '"%" already has a recipe ("%"). Unlink it first.', v_item, v_other using errcode = 'unique_violation';
+  end if;
+
+  insert into public.recipe_links (recipe_id, menu_item_id, variant_id) values (p_recipe_id, p_menu_item_id, p_variant_id);
+
+  if v.status = 'draft' then
+    -- Linking switches the recipe on (and writes every link's stock rows).
+    select id into v_version from public.recipe_versions where recipe_id = p_recipe_id order by version desc limit 1;
+    if v_version is not null then perform public.activate_recipe_version(v_version); end if;
+  else
+    perform app.sync_recipe_components(p_recipe_id);
+  end if;
+
+  perform app.log_action('recipe.linked', 'recipes', p_recipe_id::text, null,
+    jsonb_build_object('menu_item_id', p_menu_item_id, 'variant_id', p_variant_id, 'activated', v.status = 'draft'));
+end;
+$fn$;
+revoke all on function public.link_recipe(uuid, uuid, uuid) from public;
+grant execute on function public.link_recipe(uuid, uuid, uuid) to authenticated, service_role;
+
+-- unlink_recipe: from one dish/size, or (no dish given) from all of them.
+drop function if exists public.unlink_recipe(uuid);
+create or replace function public.unlink_recipe(p_recipe_id uuid, p_menu_item_id uuid default null, p_variant_id uuid default null)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare n int;
+begin
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if not exists (select 1 from public.recipes where id = p_recipe_id) then
+    raise exception 'recipe_not_found' using errcode = 'no_data_found';
+  end if;
+  n := app.drop_recipe_links(p_recipe_id, p_menu_item_id, p_variant_id, p_menu_item_id is null);
+  if n > 0 then
+    perform app.log_action('recipe.unlinked', 'recipes', p_recipe_id::text,
+      jsonb_build_object('menu_item_id', p_menu_item_id, 'variant_id', p_variant_id, 'links_removed', n), null);
+  end if;
+end;
+$fn$;
+revoke all on function public.unlink_recipe(uuid, uuid, uuid) from public;
+grant execute on function public.unlink_recipe(uuid, uuid, uuid) to authenticated, service_role;
+
+-- archive_recipe: an archived recipe feeds no dish; its links are removed.
+create or replace function public.archive_recipe(p_recipe_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if not exists (select 1 from public.recipes where id = p_recipe_id) then
+    raise exception 'recipe_not_found' using errcode = 'no_data_found';
+  end if;
+  update public.recipes set status = 'archived' where id = p_recipe_id;
+  update public.recipe_versions set status = 'archived', effective_to = coalesce(effective_to, now())
+   where recipe_id = p_recipe_id and status = 'active';
+  perform app.drop_recipe_links(p_recipe_id, null, null, true);
+  perform app.log_action('recipe.archived', 'recipes', p_recipe_id::text, null, null);
+end;
+$fn$;
+revoke all on function public.archive_recipe(uuid) from public;
+grant execute on function public.archive_recipe(uuid) to authenticated, service_role;
+
+-- delete_recipe: same checks as 0067; clears every link's stock rows first.
+create or replace function public.delete_recipe(p_recipe_id uuid)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare v_recipe public.recipes; v_users text;
+begin
+  if not (app.has_perm('inventory.manage_recipes') or app.has_perm('finance.manage_recipes')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v_recipe from public.recipes where id = p_recipe_id;
+  if v_recipe.id is null then raise exception 'recipe_not_found' using errcode = 'no_data_found'; end if;
+
+  select string_agg(distinct r.name, ', ' order by r.name) into v_users
+    from public.recipe_ingredients ri
+    join public.recipe_versions rv on rv.id = ri.recipe_version_id
+    join public.recipes r on r.id = rv.recipe_id
+   where ri.sub_recipe_id = p_recipe_id and r.id <> p_recipe_id;
+  if v_users is not null then
+    raise exception 'This recipe is used as a sub-recipe in: %. Remove it from those recipes first.', v_users
+      using errcode = 'foreign_key_violation';
+  end if;
+
+  perform app.drop_recipe_links(p_recipe_id, null, null, true);
+  perform app.log_action('recipe.deleted', 'recipes', p_recipe_id::text,
+                         jsonb_build_object('name', v_recipe.name, 'status', v_recipe.status, 'recipe_type', v_recipe.recipe_type),
+                         null);
+  delete from public.recipes where id = p_recipe_id;
+end;
+$fn$;
+revoke all on function public.delete_recipe(uuid) from public;
+grant execute on function public.delete_recipe(uuid) to authenticated, service_role;
+
+-- 0071: deleting a size (or dish) that has its own recipe failed.
+--
+-- The size's recipe_components rows are removed by cascade, their trigger
+-- recalculates availability for that size, and the recalculation tried to
+-- write a product_availability row for a size that no longer exists
+-- (foreign-key error), which aborted the delete. A product that is gone now
+-- just has its availability row cleared.
+
+create or replace function app.recalc_product_availability(
+  p_menu_item_id uuid,
+  p_variant_id uuid,
+  p_trigger_type text default 'manual_recalculation',
+  p_trigger_reference text default null,
+  p_actor text default 'system'
+) returns void
+language plpgsql security definer set search_path = public, app as $$
+declare v_r record;
+begin
+  if not exists (select 1 from public.menu_items where id = p_menu_item_id)
+     or (p_variant_id is not null and not exists (select 1 from public.menu_variants where id = p_variant_id)) then
+    delete from public.product_availability
+     where menu_item_id = p_menu_item_id and variant_id is not distinct from p_variant_id;
+    return;
+  end if;
+  select * into v_r from app.compute_product_capacity(p_menu_item_id, p_variant_id, false);
+  perform app.apply_product_availability_result(
+    p_menu_item_id, p_variant_id, v_r.tracked, v_r.status, v_r.producible_qty,
+    v_r.bottleneck_inventory_item_id, v_r.reason, p_trigger_type, p_trigger_reference, p_actor
+  );
+end;
+$$;
+
+-- 0072: Restaurant Performance for finance / analytics portals.
+--
+-- The Dashboard's performance charts read four AGGREGATE reports —
+-- sales_by_day, revenue_by_category, payment_mix, feedback_summary. They
+-- only accepted orders.view (or a staff login), so a portal given
+-- "View analytics" or the Finance permissions, but not "View orders",
+-- got no performance view at all. These reports return totals only (no
+-- individual orders, customers or line items), which is exactly what the
+-- analytics and finance permissions are meant to see, so those
+-- permissions now open them too. Order-level data still needs orders.view.
+
+create or replace function public.sales_by_day(p_from date, p_to date)
+returns table (
+  business_date date, gross_sales_cents int, discount_cents int,
+  refunded_cents int, net_sales_cents int, orders_count int
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.has_perm('analytics.view') or app.has_perm('finance.view')
+          or app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select d.day::date,
+           (x.s->>'gross_sales_cents')::int, (x.s->>'discounts_cents')::int,
+           (x.s->>'refunds_cents')::int, (x.s->>'net_sales_cents')::int, (x.s->>'order_count')::int
+      from generate_series(p_from::timestamp, least(p_to, current_date)::timestamp, interval '1 day') as d(day),
+           lateral (select app.day_sales(d.day::date) as s) x
+     order by d.day;
+end $fn$;
+
+create or replace function public.revenue_by_category(p_from timestamptz, p_to timestamptz)
+returns table (category_id uuid, category_name text, revenue_cents int, qty_sold int)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.has_perm('analytics.view') or app.has_perm('finance.view')
+          or app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select coalesce(mc.id, '00000000-0000-0000-0000-000000000000'::uuid) as cat_id,
+           coalesce(mc.name, 'Uncategorized') as cat_name,
+           sum(l.line_total_cents)::int as cat_revenue,
+           sum(l.qty)::int as cat_qty
+      from public.order_lines l
+      join public.orders o on o.id = l.order_id
+      left join public.menu_items mi on mi.id = l.menu_item_id
+      left join public.menu_categories mc on mc.id = mi.category_id
+     where l.deal_id is null and l.menu_item_id is not null
+       and o.status in ('served','paid')
+       and coalesce(o.paid_at, o.created_at) >= p_from and coalesce(o.paid_at, o.created_at) < p_to
+     group by mc.id, mc.name
+     order by sum(l.line_total_cents) desc;
+end $fn$;
+
+create or replace function public.payment_mix(p_from timestamptz, p_to timestamptz)
+returns table (method text, revenue_cents int, orders_count int)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.has_perm('analytics.view') or app.has_perm('finance.view')
+          or app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select coalesce(o.payment_method, 'unknown') as pm,
+           sum(o.total_cents)::int as pm_revenue,
+           count(*)::int as pm_count
+      from public.orders o
+     where o.status = 'paid'
+       and o.paid_at >= p_from and o.paid_at < p_to
+     group by coalesce(o.payment_method, 'unknown')
+     order by sum(o.total_cents) desc;
+end $fn$;
+
+create or replace function public.feedback_summary(p_from timestamptz, p_to timestamptz)
+returns table (
+  responses int, avg_overall numeric, avg_food numeric, avg_service numeric,
+  avg_cleanliness numeric, avg_speed numeric, avg_ambiance numeric
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.has_perm('analytics.view') or app.has_perm('finance.view')
+          or app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select count(*)::int,
+           round(avg(f.overall)::numeric, 2),
+           round(avg(f.food)::numeric, 2),
+           round(avg(f.service)::numeric, 2),
+           round(avg(f.cleanliness)::numeric, 2),
+           round(avg(f.speed)::numeric, 2),
+           round(avg(f.ambiance)::numeric, 2)
+      from public.feedback f
+     where f.created_at >= p_from and f.created_at < p_to;
+end $fn$;
+
+-- 0073: SECURITY — guests could read every order.
+--
+-- To let a customer track their own order, orders / order_lines /
+-- table_sessions had  guest_read ... using (true), meant as "whoever holds
+-- the order id". But using (true) doesn't require the id: anyone with the
+-- restaurant's public key (it ships in the web page) could list EVERY
+-- order with customer names, notes, totals and payment methods. The
+-- checkout-counter rule on portals likewise exposed those logins' emails
+-- and permission lists.
+--
+-- Tracking now goes through track_order(order_id): it returns that one
+-- order (and the checkout counters' names) only to someone who already
+-- has its id — the unguessable uuid in their tracking link. The open read
+-- rules are removed. Placing orders is unaffected (place_order runs as
+-- security definer).
+
+create or replace function public.track_order(p_order_id uuid)
+returns jsonb language sql stable security definer set search_path = public, app as $fn$
+  select jsonb_build_object(
+    'id', o.id,
+    'order_number', o.order_number,
+    'table_label', o.table_label,
+    'customer_name', o.customer_name,
+    'status', o.status,
+    'subtotal_cents', o.subtotal_cents,
+    'tax_cents', o.tax_cents,
+    'total_cents', o.total_cents,
+    'created_at', o.created_at,
+    'pickup_counter_portal_id', o.pickup_counter_portal_id,
+    'order_lines', coalesce((
+      select jsonb_agg(jsonb_build_object('name_snapshot', l.name_snapshot, 'qty', l.qty, 'line_total_cents', l.line_total_cents)
+                       order by l.id)
+        from public.order_lines l where l.order_id = o.id), '[]'::jsonb),
+    'counters', coalesce((
+      select jsonb_agg(jsonb_build_object('id', p.id, 'name', p.name) order by p.name)
+        from public.portals p where p.type = 'checkout' and p.status = 'active'), '[]'::jsonb)
+  )
+  from public.orders o
+  where o.id = p_order_id;
+$fn$;
+revoke all on function public.track_order(uuid) from public;
+grant execute on function public.track_order(uuid) to anon, authenticated, service_role;
+
+drop policy if exists guest_read on public.orders;
+drop policy if exists guest_read on public.order_lines;
+drop policy if exists guest_read on public.table_sessions;
+drop policy if exists guest_read on public.portals;
+
+-- 0074: deals in Restaurant Performance.
+--
+-- revenue_by_category only counted à-la-carte lines (deal_id is null), so a
+-- restaurant selling mostly combos saw its category chart miss that money
+-- entirely, and nothing on the performance view listed deals at all.
+--
+-- * revenue_by_category now adds one "Deals" row: the deals' own header
+--   lines (the price the customer paid for the combo), never the component
+--   lines inside a deal, so nothing is double counted.
+-- * deal_sales(from, to): units, orders and revenue per deal — totals only,
+--   readable with the same keys as the other performance reports (0072)
+--   plus deals.view. Cost/margin per deal still comes from
+--   deal_profitability(), which needs cost visibility.
+
+create or replace function public.revenue_by_category(p_from timestamptz, p_to timestamptz)
+returns table (category_id uuid, category_name text, revenue_cents int, qty_sold int)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.has_perm('analytics.view') or app.has_perm('finance.view')
+          or app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select x.cat_id, x.cat_name, x.cat_revenue, x.cat_qty from (
+      select coalesce(mc.id, '00000000-0000-0000-0000-000000000000'::uuid) as cat_id,
+             coalesce(mc.name, 'Uncategorized') as cat_name,
+             sum(l.line_total_cents)::int as cat_revenue,
+             sum(l.qty)::int as cat_qty
+        from public.order_lines l
+        join public.orders o on o.id = l.order_id
+        left join public.menu_items mi on mi.id = l.menu_item_id
+        left join public.menu_categories mc on mc.id = mi.category_id
+       where l.deal_id is null and l.menu_item_id is not null
+         and o.status in ('served','paid')
+         and coalesce(o.paid_at, o.created_at) >= p_from and coalesce(o.paid_at, o.created_at) < p_to
+       group by mc.id, mc.name
+      union all
+      select 'dea10000-0000-0000-0000-000000000000'::uuid, 'Deals',
+             sum(l.line_total_cents)::int, sum(l.qty)::int
+        from public.order_lines l
+        join public.orders o on o.id = l.order_id
+       where l.deal_id is not null and l.menu_item_id is null
+         and o.status in ('served','paid')
+         and coalesce(o.paid_at, o.created_at) >= p_from and coalesce(o.paid_at, o.created_at) < p_to
+      having count(*) > 0
+    ) x
+    order by x.cat_revenue desc;
+end $fn$;
+
+create or replace function public.deal_sales(p_from timestamptz, p_to timestamptz)
+returns table (deal_id uuid, name text, orders_count int, qty_sold int, revenue_cents int)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.has_perm('analytics.view') or app.has_perm('finance.view')
+          or app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.has_perm('deals.view')
+          or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select l.deal_id,
+           coalesce(max(d.name), max(l.name_snapshot)) as deal_name,
+           count(distinct l.order_id)::int,
+           sum(l.qty)::int,
+           sum(l.line_total_cents)::int
+      from public.order_lines l
+      join public.orders o on o.id = l.order_id
+      left join public.deals d on d.id = l.deal_id
+     where l.deal_id is not null and l.menu_item_id is null
+       and o.status in ('served','paid')
+       and coalesce(o.paid_at, o.created_at) >= p_from and coalesce(o.paid_at, o.created_at) < p_to
+     group by l.deal_id
+     order by sum(l.line_total_cents) desc;
+end $fn$;
+revoke all on function public.deal_sales(timestamptz, timestamptz) from public;
+grant execute on function public.deal_sales(timestamptz, timestamptz) to authenticated, service_role;
+
+-- ============================================================================
+-- 0075 — staff records without a login
+--
+-- Staff are now added with just a name, a job title typed by the owner
+-- ("Waiter", "Tandoor chef", …) and an optional shift start. No email, no
+-- password and no sign-in account: people reach their screens through
+-- custom portals, and attendance/shifts point at the staff record.
+--
+--   * memberships.email is optional (still unique when given).
+--   * memberships.job_title holds the free-text title shown everywhere.
+--   * role 'staff' — a record with no login and no permissions of its own
+--     (app.role_permissions('staff') is empty; there is no roles row).
+-- ============================================================================
+
+alter type app.member_role add value if not exists 'staff';
+
+alter table public.memberships alter column email drop not null;
+alter table public.memberships add column if not exists job_title text;
+alter table public.memberships drop constraint if exists memberships_job_title_len;
+alter table public.memberships add constraint memberships_job_title_len check (job_title is null or char_length(job_title) between 1 and 60);
+
+-- ============================================================================
+-- 0076 — Restaurant Performance dates follow the restaurant's timezone
+--
+-- expense_date and sales_by_day work in whole dates, but the database runs
+-- in UTC. Converting the dashboard's period bounds with a plain ::date (UTC)
+-- put them a day off for any restaurant east of UTC (e.g. Asia/Karachi):
+-- "Today" also counted yesterday's expenses, and sales_by_day stopped at
+-- the UTC date, so the first hours of a new local day were missing.
+--
+--   * app.local_date(ts): the calendar date of ts in the restaurant's
+--     timezone (business_settings.timezone, UTC if unset).
+--   * period_profitability(): an expense counts when its date falls in
+--     [local date of p_from, local date of the last instant before p_to].
+--     Works for a midnight-exclusive p_to and for p_to = now().
+--   * sales_by_day(): capped at the restaurant's local today.
+--   * expenses joins the realtime publication so the dashboard updates live.
+-- ============================================================================
+
+create or replace function app.local_date(p_ts timestamptz default now())
+returns date language sql stable set search_path = public, app as $fn$
+  select (p_ts at time zone coalesce((select timezone from public.business_settings where id), 'UTC'))::date
+$fn$;
+
+create or replace function public.period_profitability(p_from timestamptz, p_to timestamptz)
+returns table(from_ts timestamptz, to_ts timestamptz, orders_count integer, gross_sales_cents integer, discount_cents integer, refunded_cents integer, net_sales_cents integer, avg_order_cents integer, theoretical_cogs_cents integer, cogs_lines_total integer, cogs_lines_missing integer, gross_profit_cents integer, gross_margin_pct numeric, food_cost_pct numeric, consumption_ledger_cents integer, waste_cents integer, net_adjustment_cents integer, actual_cogs_cents integer, cogs_variance_cents integer, expenses_cents integer, net_profit_cents integer, net_profit_margin_pct numeric)
+language plpgsql stable security definer set search_path = public, app as $function$
+begin
+  if not (app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.has_perm('inventory.view_cost')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    with sales as (
+      select o.id, o.subtotal_cents, o.discount_cents, coalesce(o.refunded_cents,0) as refunded_cents
+        from public.orders o
+       where o.status in ('served','paid')
+         and coalesce(o.paid_at, o.created_at) >= p_from and coalesce(o.paid_at, o.created_at) < p_to
+    ),
+    sales_agg as (
+      select count(*)::int as orders_count,
+             coalesce(sum(sales.subtotal_cents),0)::int as gross_sales_cents,
+             coalesce(sum(sales.discount_cents),0)::int as discount_cents,
+             coalesce(sum(sales.refunded_cents),0)::int as refunded_cents,
+             coalesce(sum(sales.subtotal_cents - sales.discount_cents - sales.refunded_cents),0)::int as net_sales_cents
+        from sales
+    ),
+    cogs_agg as (
+      select coalesce(sum(l.recipe_cost_cents),0)::int as cogs_cents,
+             count(*)::int as lines_total,
+             count(*) filter (where l.recipe_cost_cents is null)::int as lines_missing
+        from public.order_lines l join sales s on s.id = l.order_id
+    ),
+    -- Actual ingredient value moved in the period, read off the ledger's own
+    -- cost-basis snapshot (unit_cost_cents_base) rather than recomputed.
+    ledger_agg as (
+      select
+        coalesce(sum(abs(delta_qty * unit_cost_cents_base)) filter (where reason = 'order_deduction'), 0)::int as consumption_cents,
+        coalesce(sum(abs(delta_qty * unit_cost_cents_base)) filter (where reason = 'spoilage'), 0)::int as waste_cents,
+        coalesce(sum(delta_qty * unit_cost_cents_base) filter (where reason in ('adjustment','stock_take')), 0)::int as net_adjustment_cents
+        from public.stock_ledger
+       where created_at >= p_from and created_at < p_to and unit_cost_cents_base is not null
+    ),
+    exp_agg as (
+      -- expense_date is a plain local date: count it when it falls between
+      -- the local date of p_from and the local date of the last instant
+      -- before p_to (so a midnight p_to excludes the next day, and
+      -- p_to = now() still includes today).
+      select coalesce(sum(amount_cents),0)::int as expenses_cents
+        from public.expenses
+       where expense_date >= app.local_date(p_from)
+         and expense_date <= app.local_date(p_to - interval '1 microsecond')
+    )
+    select
+      p_from, p_to,
+      sales_agg.orders_count, sales_agg.gross_sales_cents, sales_agg.discount_cents, sales_agg.refunded_cents,
+      sales_agg.net_sales_cents,
+      case when sales_agg.orders_count > 0 then round(sales_agg.net_sales_cents::numeric / sales_agg.orders_count)::int else 0 end,
+      cogs_agg.cogs_cents, cogs_agg.lines_total, cogs_agg.lines_missing,
+      (sales_agg.net_sales_cents - cogs_agg.cogs_cents),
+      case when sales_agg.net_sales_cents > 0 then round((sales_agg.net_sales_cents - cogs_agg.cogs_cents)::numeric / sales_agg.net_sales_cents * 1000) / 10 else null end,
+      case when sales_agg.net_sales_cents > 0 then round(cogs_agg.cogs_cents::numeric / sales_agg.net_sales_cents * 1000) / 10 else null end,
+      ledger_agg.consumption_cents, ledger_agg.waste_cents, ledger_agg.net_adjustment_cents,
+      (ledger_agg.consumption_cents + ledger_agg.waste_cents - ledger_agg.net_adjustment_cents),
+      (ledger_agg.consumption_cents + ledger_agg.waste_cents - ledger_agg.net_adjustment_cents - cogs_agg.cogs_cents),
+      exp_agg.expenses_cents,
+      (sales_agg.net_sales_cents - cogs_agg.cogs_cents - exp_agg.expenses_cents),
+      case when sales_agg.net_sales_cents > 0 then round((sales_agg.net_sales_cents - cogs_agg.cogs_cents - exp_agg.expenses_cents)::numeric / sales_agg.net_sales_cents * 1000) / 10 else null end
+      from sales_agg, cogs_agg, ledger_agg, exp_agg;
+end $function$;
+
+create or replace function public.sales_by_day(p_from date, p_to date)
+returns table(business_date date, gross_sales_cents integer, discount_cents integer, refunded_cents integer, net_sales_cents integer, orders_count integer)
+language plpgsql stable security definer set search_path = public, app as $function$
+begin
+  if not (app.has_perm('orders.view') or app.has_perm('analytics.view') or app.has_perm('finance.view')
+          or app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select d.day::date,
+           (x.s->>'gross_sales_cents')::int, (x.s->>'discounts_cents')::int,
+           (x.s->>'refunds_cents')::int, (x.s->>'net_sales_cents')::int, (x.s->>'order_count')::int
+      from generate_series(p_from::timestamp, least(p_to, app.local_date())::timestamp, interval '1 day') as d(day),
+           lateral (select app.day_sales(d.day::date) as s) x
+     order by d.day;
+end $function$;
+
+-- Live dashboard: the Restaurant Performance panel re-reads its figures when
+-- orders, payments or expenses change (orders/payments are already published).
+do $$
+begin
+  if not exists (select 1 from pg_publication_tables
+                  where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = 'expenses') then
+    alter publication supabase_realtime add table public.expenses;
+  end if;
+end $$;
+
+-- ============================================================================
+-- 0077 — net profit subtracts all expenses to date
+--
+-- period_profitability() used to count only expenses dated inside the
+-- period, so "Today" subtracted just today's expenses. The owner wants net
+-- profit to subtract every expense recorded up to the end of the period
+-- being viewed (all earlier expenses included). Everything else in the
+-- function is unchanged from 0076.
+-- ============================================================================
+
+create or replace function public.period_profitability(p_from timestamptz, p_to timestamptz)
+returns table(from_ts timestamptz, to_ts timestamptz, orders_count integer, gross_sales_cents integer, discount_cents integer, refunded_cents integer, net_sales_cents integer, avg_order_cents integer, theoretical_cogs_cents integer, cogs_lines_total integer, cogs_lines_missing integer, gross_profit_cents integer, gross_margin_pct numeric, food_cost_pct numeric, consumption_ledger_cents integer, waste_cents integer, net_adjustment_cents integer, actual_cogs_cents integer, cogs_variance_cents integer, expenses_cents integer, net_profit_cents integer, net_profit_margin_pct numeric)
+language plpgsql stable security definer set search_path = public, app as $function$
+begin
+  if not (app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.has_perm('inventory.view_cost')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    with sales as (
+      select o.id, o.subtotal_cents, o.discount_cents, coalesce(o.refunded_cents,0) as refunded_cents
+        from public.orders o
+       where o.status in ('served','paid')
+         and coalesce(o.paid_at, o.created_at) >= p_from and coalesce(o.paid_at, o.created_at) < p_to
+    ),
+    sales_agg as (
+      select count(*)::int as orders_count,
+             coalesce(sum(sales.subtotal_cents),0)::int as gross_sales_cents,
+             coalesce(sum(sales.discount_cents),0)::int as discount_cents,
+             coalesce(sum(sales.refunded_cents),0)::int as refunded_cents,
+             coalesce(sum(sales.subtotal_cents - sales.discount_cents - sales.refunded_cents),0)::int as net_sales_cents
+        from sales
+    ),
+    cogs_agg as (
+      select coalesce(sum(l.recipe_cost_cents),0)::int as cogs_cents,
+             count(*)::int as lines_total,
+             count(*) filter (where l.recipe_cost_cents is null)::int as lines_missing
+        from public.order_lines l join sales s on s.id = l.order_id
+    ),
+    -- Actual ingredient value moved in the period, read off the ledger's own
+    -- cost-basis snapshot (unit_cost_cents_base) rather than recomputed.
+    ledger_agg as (
+      select
+        coalesce(sum(abs(delta_qty * unit_cost_cents_base)) filter (where reason = 'order_deduction'), 0)::int as consumption_cents,
+        coalesce(sum(abs(delta_qty * unit_cost_cents_base)) filter (where reason = 'spoilage'), 0)::int as waste_cents,
+        coalesce(sum(delta_qty * unit_cost_cents_base) filter (where reason in ('adjustment','stock_take')), 0)::int as net_adjustment_cents
+        from public.stock_ledger
+       where created_at >= p_from and created_at < p_to and unit_cost_cents_base is not null
+    ),
+    exp_agg as (
+      -- Net profit subtracts EVERY expense recorded up to the end of the
+      -- period (the owner's choice): today/this week/this month include all
+      -- earlier expenses too; a past period never counts later expenses.
+      -- expense_date is a local date; the end is the local date of the last
+      -- instant before p_to (a midnight p_to excludes the next day,
+      -- p_to = now() includes today).
+      select coalesce(sum(amount_cents),0)::int as expenses_cents
+        from public.expenses
+       where expense_date <= app.local_date(p_to - interval '1 microsecond')
+    )
+    select
+      p_from, p_to,
+      sales_agg.orders_count, sales_agg.gross_sales_cents, sales_agg.discount_cents, sales_agg.refunded_cents,
+      sales_agg.net_sales_cents,
+      case when sales_agg.orders_count > 0 then round(sales_agg.net_sales_cents::numeric / sales_agg.orders_count)::int else 0 end,
+      cogs_agg.cogs_cents, cogs_agg.lines_total, cogs_agg.lines_missing,
+      (sales_agg.net_sales_cents - cogs_agg.cogs_cents),
+      case when sales_agg.net_sales_cents > 0 then round((sales_agg.net_sales_cents - cogs_agg.cogs_cents)::numeric / sales_agg.net_sales_cents * 1000) / 10 else null end,
+      case when sales_agg.net_sales_cents > 0 then round(cogs_agg.cogs_cents::numeric / sales_agg.net_sales_cents * 1000) / 10 else null end,
+      ledger_agg.consumption_cents, ledger_agg.waste_cents, ledger_agg.net_adjustment_cents,
+      (ledger_agg.consumption_cents + ledger_agg.waste_cents - ledger_agg.net_adjustment_cents),
+      (ledger_agg.consumption_cents + ledger_agg.waste_cents - ledger_agg.net_adjustment_cents - cogs_agg.cogs_cents),
+      exp_agg.expenses_cents,
+      (sales_agg.net_sales_cents - cogs_agg.cogs_cents - exp_agg.expenses_cents),
+      case when sales_agg.net_sales_cents > 0 then round((sales_agg.net_sales_cents - cogs_agg.cogs_cents - exp_agg.expenses_cents)::numeric / sales_agg.net_sales_cents * 1000) / 10 else null end
+      from sales_agg, cogs_agg, ledger_agg, exp_agg;
+end $function$;
+
+-- ============================================================================
+-- 0078 — tax settings
+--
+-- The tax rate was hard-coded (8%) in five places in the apps and passed to
+-- place_order() by the caller — so the rate was whatever the device sent,
+-- including a guest's browser. It is now a restaurant setting:
+--
+--   * business_settings.tax_enabled / tax_rate_bps (basis points, 800 = 8%).
+--     Defaults keep today's behaviour (on, 8%).
+--   * app.tax_rate_bps(): the rate to charge now (0 when tax is off).
+--   * public.get_tax_settings(): readable by guests too, so the storefront
+--     can show the same tax the database will charge.
+--   * place_order() charges app.tax_rate_bps() and ignores p_tax_rate_bps
+--     (kept only so existing callers keep working). Each order still stores
+--     the rate it was charged, so changing the setting never alters
+--     orders already placed.
+-- ============================================================================
+
+alter table public.business_settings add column if not exists tax_enabled boolean not null default true;
+alter table public.business_settings add column if not exists tax_rate_bps integer not null default 800;
+alter table public.business_settings drop constraint if exists business_settings_tax_rate_range;
+alter table public.business_settings add constraint business_settings_tax_rate_range check (tax_rate_bps between 0 and 5000);
+
+create or replace function app.tax_rate_bps() returns integer
+language sql stable security definer set search_path = public, app as $fn$
+  select coalesce((select case when tax_enabled then tax_rate_bps else 0 end from public.business_settings where id), 0)
+$fn$;
+
+create or replace function public.get_tax_settings()
+returns table (tax_enabled boolean, tax_rate_bps integer)
+language sql stable security definer set search_path = public, app as $fn$
+  select coalesce(b.tax_enabled, true), coalesce(b.tax_rate_bps, 0)
+    from (select 1) one left join public.business_settings b on b.id
+$fn$;
+revoke all on function public.get_tax_settings() from public;
+grant execute on function public.get_tax_settings() to anon, authenticated, service_role;
+
+-- place_order(): swap the caller-supplied rate for the restaurant's setting.
+-- Patched in place (the function is long and has been redefined by several
+-- migrations) and refuses to run if the expected lines aren't there.
+do $$
+declare
+  v_def text;
+  v_new text;
+begin
+  v_def := pg_get_functiondef('public.place_order(text,text,text,integer,jsonb,integer,text,text)'::regprocedure);
+  v_new := replace(v_def, 'coalesce(p_tax_rate_bps,0)', 'app.tax_rate_bps()');
+  v_new := replace(v_new, 'tax_rate_bps = coalesce(p_tax_rate_bps, 0)', 'tax_rate_bps = app.tax_rate_bps()');
+  if v_new = v_def then
+    if position('app.tax_rate_bps()' in v_def) > 0 then
+      return; -- already patched
+    end if;
+    raise exception 'place_order(): tax lines not found — not patched';
+  end if;
+  if position('p_tax_rate_bps,0' in v_new) > 0 or position('coalesce(p_tax_rate_bps' in v_new) > 0 then
+    raise exception 'place_order(): a caller-supplied tax rate is still used';
+  end if;
+  execute v_new;
+end $$;
+
+-- ============================================================================
+-- 0079 — tax collected per period
+--
+-- Restaurant Performance shows net sales before tax. period_tax() gives the
+-- tax collected on the same orders (served/paid, by paid time or else
+-- creation time, exactly like period_profitability) and the sales total
+-- including tax, so the dashboard can show both. Tax is money owed to the
+-- tax authority, not income: it is never part of net sales or profit.
+-- ============================================================================
+
+create or replace function public.period_tax(p_from timestamptz, p_to timestamptz)
+returns table (tax_cents integer, sales_incl_tax_cents integer, orders_count integer)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('orders.view') or app.has_perm('analytics.view') or app.has_perm('finance.view')
+          or app.has_perm('finance.view_profit') or app.has_perm('finance.view_cogs') or app.is_staff()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select coalesce(sum(o.tax_cents), 0)::int,
+           coalesce(sum(o.subtotal_cents - o.discount_cents - coalesce(o.refunded_cents, 0) + o.tax_cents), 0)::int,
+           count(*)::int
+      from public.orders o
+     where o.status in ('served', 'paid')
+       and coalesce(o.paid_at, o.created_at) >= p_from and coalesce(o.paid_at, o.created_at) < p_to;
+end $fn$;
+revoke all on function public.period_tax(timestamptz, timestamptz) from public;
+grant execute on function public.period_tax(timestamptz, timestamptz) to authenticated, service_role;
+
+-- ============================================================================
+-- 0080 — files attached to the AI Assistant chat
+--
+-- Chat attachments (PDFs, images, CSV/text) are uploaded to a private
+-- 'ai-chat' bucket instead of riding inside the chat request (Vercel caps a
+-- request at 4.5 MB). Each person can only upload and read files in their
+-- own folder (<user id>/…), and only if they may use the assistant. The API
+-- reads the file with the service role after checking the path belongs to
+-- the caller. Files stay so follow-up questions about them keep working.
+-- ============================================================================
+
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('ai-chat', 'ai-chat', false, 10485760,
+        array['application/pdf', 'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'text/plain', 'text/csv'])
+on conflict (id) do update
+  set public = false,
+      file_size_limit = excluded.file_size_limit,
+      allowed_mime_types = excluded.allowed_mime_types;
+
+drop policy if exists "ai-chat own files" on storage.objects;
+create policy "ai-chat own files" on storage.objects for all
+  using (bucket_id = 'ai-chat' and app.has_perm('ai.view') and (storage.foldername(name))[1] = auth.uid()::text)
+  with check (bucket_id = 'ai-chat' and app.has_perm('ai.view') and (storage.foldername(name))[1] = auth.uid()::text);
+
+-- ============================================================================
+-- 0081 — saved AI chats
+--
+-- Every conversation with the staff AI Assistant and with the customer
+-- ordering assistant is stored, so staff can reopen earlier chats (like
+-- ChatGPT's history) and the owner can read what guests asked.
+--
+--   ai_conversations  one chat. kind 'staff' belongs to user_id (the login
+--                     that had it); kind 'customer' is keyed by guest_session
+--                     (a random id the guest's browser keeps).
+--   ai_messages       its messages in order; `extras` keeps what the chat
+--                     showed with a reply (tools used, cards, a PDF document,
+--                     a proposed action) and `attachment` a user's file.
+--
+-- Only the API writes (service role). Staff read and delete their OWN staff
+-- chats; customer chats are readable by staff who may view customers.
+-- ============================================================================
+
+create table if not exists public.ai_conversations (
+  id            uuid primary key default gen_random_uuid(),
+  kind          text not null check (kind in ('staff', 'customer')),
+  user_id       uuid,
+  guest_session text,
+  title         text not null default 'New chat',
+  message_count int not null default 0,
+  created_at    timestamptz not null default now(),
+  updated_at    timestamptz not null default now(),
+  check ((kind = 'staff' and user_id is not null) or (kind = 'customer' and guest_session is not null))
+);
+create index if not exists ai_conversations_user_idx on public.ai_conversations (user_id, updated_at desc) where kind = 'staff';
+create index if not exists ai_conversations_customer_idx on public.ai_conversations (updated_at desc) where kind = 'customer';
+create index if not exists ai_conversations_guest_idx on public.ai_conversations (guest_session) where kind = 'customer';
+
+create table if not exists public.ai_messages (
+  id              uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null references public.ai_conversations(id) on delete cascade,
+  role            text not null check (role in ('user', 'assistant')),
+  content         text not null,
+  attachment      jsonb,
+  extras          jsonb,
+  created_at      timestamptz not null default now()
+);
+create index if not exists ai_messages_conversation_idx on public.ai_messages (conversation_id, created_at);
+
+alter table public.ai_conversations enable row level security;
+alter table public.ai_messages enable row level security;
+
+drop policy if exists own_staff_chats_read on public.ai_conversations;
+create policy own_staff_chats_read on public.ai_conversations for select
+  using (kind = 'staff' and user_id = auth.uid() and app.has_perm('ai.view'));
+drop policy if exists own_staff_chats_delete on public.ai_conversations;
+create policy own_staff_chats_delete on public.ai_conversations for delete
+  using (kind = 'staff' and user_id = auth.uid() and app.has_perm('ai.view'));
+drop policy if exists customer_chats_read on public.ai_conversations;
+create policy customer_chats_read on public.ai_conversations for select
+  using (kind = 'customer' and app.has_perm('customers.view'));
+
+drop policy if exists chat_messages_read on public.ai_messages;
+create policy chat_messages_read on public.ai_messages for select
+  using (exists (select 1 from public.ai_conversations c where c.id = conversation_id));
+-- (the subquery runs with the caller's rights, so it only sees conversations
+--  the policies above already allow them to read)
+
+-- ── 0082: Low-stock automation fix ──────────────────────────────────────────
+create or replace function app.sync_low_stock_event() returns trigger
+language plpgsql set search_path = public, app as $fn$
+declare v_open_id uuid;
+begin
+  select id into v_open_id from public.low_stock_events
+   where inventory_item_id = new.id and status = 'open';
+  if new.stock_qty <= new.min_threshold then
+    if v_open_id is null then
+      insert into public.low_stock_events (inventory_item_id, stock_at_open, threshold_at_open)
+      values (new.id, new.stock_qty, new.min_threshold);
+    end if;
+  elsif v_open_id is not null then
+    update public.low_stock_events set status = 'resolved', resolved_at = now() where id = v_open_id;
+  end if;
+  return new;
+end $fn$;
+
+drop trigger if exists sync_low_stock_event on public.inventory_items;
+create trigger sync_low_stock_event after insert or update of stock_qty, min_threshold on public.inventory_items
+  for each row execute function app.sync_low_stock_event();
+
+create or replace function public.pending_low_stock_reorders()
+returns table (
+  low_stock_event_id uuid, inventory_item_id uuid, item_name text, unit text,
+  stock_qty numeric, min_threshold numeric, target_stock_qty numeric, suggested_qty numeric,
+  supplier_id uuid, supplier_name text, supplier_email text
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('supplier.view') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+    select lse.id, ii.id, ii.name, ii.unit,
+           ii.stock_qty, ii.min_threshold, ii.target_stock_qty,
+           greatest(1, coalesce(ii.target_stock_qty, greatest(ceil(ii.min_threshold * 2), ceil(ii.min_threshold + 5))) - ii.stock_qty),
+           sup.supplier_id, sup.supplier_name, sup.supplier_email
+      from public.low_stock_events lse
+      join public.inventory_items ii on ii.id = lse.inventory_item_id
+      cross join lateral (
+        select si.supplier_id, s.name as supplier_name, s.email as supplier_email
+          from public.supplier_items si
+          join public.suppliers s on s.id = si.supplier_id and s.is_active
+         where si.inventory_item_id = ii.id and si.is_active
+         order by si.is_preferred desc, si.created_at asc
+         limit 1
+      ) sup
+      cross join public.purchasing_settings ps
+     where lse.status = 'open'
+       and coalesce(ii.auto_reorder_email, true)
+       and ps.low_stock_email_enabled
+       and sup.supplier_email is not null and sup.supplier_email <> ''
+       and not exists (
+         select 1 from public.supplier_communications sc
+          where sc.low_stock_event_id = lse.id and sc.status = 'sent'
+       );
+end $fn$;
+revoke all on function public.pending_low_stock_reorders() from public;
+grant execute on function public.pending_low_stock_reorders() to authenticated, service_role;
+
+
+-- ============================================================================
+-- 0083_finance_hardening.sql — Finance Phase A (security hardening)
+--
+-- 1. Supplier invoice status and amounts can no longer be changed by a direct
+--    table write. Status moves only through the security-definer workflow
+--    functions (match / resolve hold / approve / record payment), and an
+--    approved or paid invoice's amounts are locked. Editing a matched or
+--    on-hold invoice (or its lines) sends it back to 'received' for re-match.
+-- 2. Supplier payments, payment allocations, payment holds and credit notes
+--    are read-only to the app; they are written only by their functions.
+-- 3. Reading supplier invoices, payments, holds, credit notes and daily
+--    closings needs a finance/purchasing permission — not just "is staff".
+-- 4. Approving an invoice is its own permission (invoices.approve), separate
+--    from running the match, and records who approved it and when.
+-- 5. All of these tables (and cash counts) are now in the audit log.
+--
+-- The guard tells app writes from workflow writes by current_user: PostgREST
+-- runs app requests as 'authenticated'/'anon', while a security-definer
+-- function runs as its owner and the API server as 'service_role'.
+-- ============================================================================
+
+-- ── 4. Approval permission + who/when ──────────────────────────────────────
+alter table public.supplier_invoices
+  add column if not exists approved_by uuid,
+  add column if not exists approved_at timestamptz;
+
+insert into public.permission_catalog (key, grp, label, type, risk_level) values
+  ('invoices.approve', 'Invoices', 'Approve matched supplier invoices for payment', 'approval', 'high')
+on conflict (key) do update set grp = excluded.grp, label = excluded.label,
+  type = excluded.type, risk_level = excluded.risk_level;
+update public.permission_catalog set label = 'Run invoice matching (3-way match)' where key = 'invoices.match';
+
+-- The default Manager could approve before (via invoices.match); keep that.
+update public.roles
+   set permissions = array_append(permissions, 'invoices.approve')
+ where key = 'manager' and 'invoices.match' = any(permissions)
+   and not ('invoices.approve' = any(permissions));
+
+create or replace function public.approve_supplier_invoice(p_invoice_id uuid) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_row public.supplier_invoices;
+begin
+  if not (app.has_perm('invoices.approve') or app.has_perm('payables.manage') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.supplier_invoices
+     set status = 'approved', approved_by = app.jwt_sub(), approved_at = now()
+   where id = p_invoice_id and status = 'matched'
+  returning * into v_row;
+  if not found then raise exception 'not_approvable' using errcode = 'check_violation'; end if;
+  perform app.log_action('invoice.approved', 'supplier_invoices', p_invoice_id::text, null,
+    jsonb_build_object('total_cents', v_row.total_cents, 'supplier_id', v_row.supplier_id));
+end $fn$;
+revoke all on function public.approve_supplier_invoice(uuid) from public;
+grant execute on function public.approve_supplier_invoice(uuid) to authenticated, service_role;
+
+-- ── 1. Invoice guard ────────────────────────────────────────────────────────
+-- Owner-only helper so a line edit can send its invoice back for re-match.
+create or replace function app.invoice_needs_rematch(p_invoice_id uuid) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  update public.supplier_invoices set status = 'received'
+   where id = p_invoice_id and status in ('matched', 'on_hold');
+end $fn$;
+revoke all on function app.invoice_needs_rematch(uuid) from public;
+
+create or replace function app.guard_supplier_invoice() returns trigger
+language plpgsql set search_path = public, app as $fn$
+begin
+  if current_user not in ('authenticated', 'anon') then return coalesce(new, old); end if;
+
+  if tg_op = 'INSERT' then
+    if new.status <> 'received' or new.approved_by is not null or new.approved_at is not null then
+      raise exception 'invoice_status_via_workflow' using errcode = 'insufficient_privilege',
+        hint = 'New invoices start as received; matching and approval set the status.';
+    end if;
+    return new;
+  end if;
+
+  if tg_op = 'DELETE' then
+    if old.status not in ('received', 'on_hold', 'matched')
+       or exists (select 1 from public.supplier_payment_allocations a where a.invoice_id = old.id) then
+      raise exception 'invoice_locked' using errcode = 'insufficient_privilege',
+        hint = 'Approved, paid or part-paid invoices cannot be deleted.';
+    end if;
+    return old;
+  end if;
+
+  -- UPDATE
+  if new.status is distinct from old.status
+     or new.approved_by is distinct from old.approved_by
+     or new.approved_at is distinct from old.approved_at
+     or new.invoice_ref is distinct from old.invoice_ref then
+    raise exception 'invoice_status_via_workflow' using errcode = 'insufficient_privilege',
+      hint = 'Use matching, hold resolution, approval or payment to change an invoice''s status.';
+  end if;
+  if (new.supplier_id, new.purchase_order_id, new.supplier_invoice_number, new.invoice_date, new.due_date,
+      new.currency, new.subtotal_cents, new.tax_cents, new.discount_cents, new.delivery_fee_cents, new.total_cents)
+     is distinct from
+     (old.supplier_id, old.purchase_order_id, old.supplier_invoice_number, old.invoice_date, old.due_date,
+      old.currency, old.subtotal_cents, old.tax_cents, old.discount_cents, old.delivery_fee_cents, old.total_cents) then
+    if old.status in ('approved', 'partially_paid', 'paid', 'cancelled') then
+      raise exception 'invoice_locked' using errcode = 'insufficient_privilege',
+        hint = 'An approved or paid invoice cannot be edited.';
+    end if;
+    if old.status in ('matched', 'on_hold') then
+      new.status := 'received';  -- changed amounts must be matched again
+    end if;
+  end if;
+  return new;
+end $fn$;
+
+drop trigger if exists guard_supplier_invoice on public.supplier_invoices;
+create trigger guard_supplier_invoice before insert or update or delete on public.supplier_invoices
+  for each row execute function app.guard_supplier_invoice();
+
+create or replace function app.guard_supplier_invoice_line() returns trigger
+language plpgsql set search_path = public, app as $fn$
+declare v_invoice uuid := coalesce(new.invoice_id, old.invoice_id); v_status app.invoice_status;
+begin
+  if current_user not in ('authenticated', 'anon') then return coalesce(new, old); end if;
+  select status into v_status from public.supplier_invoices where id = v_invoice;
+  if v_status in ('approved', 'partially_paid', 'paid', 'cancelled') then
+    raise exception 'invoice_locked' using errcode = 'insufficient_privilege',
+      hint = 'Lines of an approved or paid invoice cannot be changed.';
+  end if;
+  if tg_op = 'UPDATE' and new.invoice_id is distinct from old.invoice_id then
+    raise exception 'invoice_line_move_not_allowed' using errcode = 'insufficient_privilege';
+  end if;
+  if v_status in ('matched', 'on_hold') then
+    perform app.invoice_needs_rematch(v_invoice);
+  end if;
+  return coalesce(new, old);
+end $fn$;
+
+drop trigger if exists guard_supplier_invoice_line on public.supplier_invoice_lines;
+create trigger guard_supplier_invoice_line before insert or update or delete on public.supplier_invoice_lines
+  for each row execute function app.guard_supplier_invoice_line();
+
+-- ── 2 + 3. Access rules ─────────────────────────────────────────────────────
+drop policy if exists staff_read on public.supplier_invoices;
+create policy staff_read on public.supplier_invoices for select using (
+  app.has_perm('invoices.view') or app.has_perm('invoices.create') or app.has_perm('invoices.match')
+  or app.has_perm('invoices.approve') or app.has_perm('purchases.view') or app.has_perm('payables.view')
+  or app.has_perm('finance.view') or app.can_write());
+
+drop policy if exists staff_read on public.supplier_invoice_lines;
+create policy staff_read on public.supplier_invoice_lines for select using (
+  app.has_perm('invoices.view') or app.has_perm('invoices.create') or app.has_perm('invoices.match')
+  or app.has_perm('invoices.approve') or app.has_perm('purchases.view') or app.has_perm('payables.view')
+  or app.has_perm('finance.view') or app.can_write());
+
+drop policy if exists staff_read on public.supplier_payments;
+drop policy if exists mgr_write on public.supplier_payments;
+create policy staff_read on public.supplier_payments for select using (
+  app.has_perm('payables.view') or app.has_perm('payables.record_payment') or app.has_perm('payables.manage')
+  or app.has_perm('finance.view') or app.can_write());
+
+drop policy if exists staff_read on public.supplier_payment_allocations;
+drop policy if exists mgr_write on public.supplier_payment_allocations;
+create policy staff_read on public.supplier_payment_allocations for select using (
+  app.has_perm('payables.view') or app.has_perm('payables.record_payment') or app.has_perm('payables.manage')
+  or app.has_perm('finance.view') or app.can_write());
+
+drop policy if exists staff_read on public.supplier_payment_holds;
+drop policy if exists mgr_write on public.supplier_payment_holds;
+create policy staff_read on public.supplier_payment_holds for select using (
+  app.has_perm('payables.view') or app.has_perm('payables.manage') or app.has_perm('invoices.view')
+  or app.has_perm('invoices.match') or app.has_perm('invoices.approve') or app.has_perm('purchases.view')
+  or app.has_perm('finance.view') or app.can_write());
+
+drop policy if exists staff_read on public.supplier_credit_notes;
+drop policy if exists mgr_write on public.supplier_credit_notes;
+create policy staff_read on public.supplier_credit_notes for select using (
+  app.has_perm('payables.view') or app.has_perm('payables.manage') or app.has_perm('finance.view') or app.can_write());
+
+drop policy if exists staff_read on public.daily_closings;
+create policy staff_read on public.daily_closings for select using (
+  app.has_perm('finance.view') or app.has_perm('finance.close_day') or app.has_perm('finance.reopen_day')
+  or app.has_perm('finance.reconcile') or app.can_write());
+
+-- ── 5. Audit coverage ───────────────────────────────────────────────────────
+do $$
+declare tbl text;
+begin
+  foreach tbl in array array[
+    'supplier_invoices', 'supplier_invoice_lines', 'supplier_payments', 'supplier_payment_allocations',
+    'supplier_payment_holds', 'supplier_credit_notes', 'cash_counts'
+  ] loop
+    execute format('drop trigger if exists audit on public.%I', tbl);
+    execute format(
+      'create trigger audit after insert or update or delete on public.%I for each row execute function app.audit_row()',
+      tbl);
+  end loop;
+end $$;
+
+-- ============================================================================
+-- 0084_invoice_rematch_grant.sql — follow-up to 0083
+-- The invoice-line guard runs as the app user, so it needs EXECUTE on the
+-- owner-only re-match helper. The helper re-checks the caller may edit
+-- invoices, so the grant gives nothing beyond what the line edit already had.
+-- ============================================================================
+create or replace function app.invoice_needs_rematch(p_invoice_id uuid) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('invoices.create') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  update public.supplier_invoices set status = 'received'
+   where id = p_invoice_id and status in ('matched', 'on_hold');
+end $fn$;
+revoke all on function app.invoice_needs_rematch(uuid) from public;
+grant execute on function app.invoice_needs_rematch(uuid) to authenticated, service_role;
+
+-- ============================================================================
+-- 0085_financial_ledger.sql — Finance Phase B (financial ledger)
+--
+-- public.financial_events is an append-only journal of every money event,
+-- written ONLY by triggers on the source tables (and one permission-checked
+-- manual-adjustment function). Nothing in it is ever updated or deleted:
+-- a change to a source row is recorded as a new adjustment/reversal event.
+--
+-- Each event has a category and a sign (+1 increases that category's
+-- balance, -1 decreases it, 0 = informational):
+--   revenue   net sales = subtotal - discount - refunds of served/paid orders
+--   cogs      recipe cost snapshot on the order lines of those orders
+--             (exactly what period_profitability() reports as COGS)
+--   payment   customer money held = payment amount - refunds, 0 if voided
+--   expense   operating expenses
+--   payable   approved supplier invoices (+), supplier payments and credit notes (-)
+--   inventory goods received (+) and stock adjustments (±) at cost
+--   waste     spoilage at cost
+--   cash / close / purchasing   informational (sign 0)
+--
+-- Revenue, COGS, payments, expenses and invoices are kept in step with their
+-- source by "sync" functions: they compare what the source says now with the
+-- ledger balance for that source row and post only the difference, so the
+-- ledger always converges to the source and every step stays traceable.
+-- Raw order stock deductions are NOT posted (they are the same cost as the
+-- recipe snapshot and would double-count COGS).
+-- ============================================================================
+
+create table if not exists public.financial_events (
+  id             bigint generated always as identity primary key,
+  event_type     text not null,
+  category       text not null check (category in
+                   ('revenue','cogs','payment','expense','payable','inventory','waste','cash','close','purchasing','adjustment')),
+  sign           smallint not null check (sign in (-1, 0, 1)),
+  amount_cents   bigint not null check (amount_cents >= 0),
+  signed_cents   bigint generated always as (sign * amount_cents) stored,
+  currency       text not null,
+  occurred_at    timestamptz not null,
+  business_date  date not null,
+  source_table   text not null,
+  source_id      uuid,
+  order_id       uuid,
+  supplier_id    uuid,
+  payment_method text,
+  actor_id       uuid,
+  actor_role     text,
+  portal_id      uuid,
+  details        jsonb not null default '{}'::jsonb,
+  created_at     timestamptz not null default now()
+);
+create index if not exists financial_events_cat_date_idx on public.financial_events (category, business_date);
+create index if not exists financial_events_source_idx on public.financial_events (source_table, source_id);
+create index if not exists financial_events_order_idx on public.financial_events (order_id) where order_id is not null;
+create index if not exists financial_events_date_idx on public.financial_events (business_date desc, id desc);
+
+alter table public.financial_events enable row level security;
+drop policy if exists finance_read on public.financial_events;
+create policy finance_read on public.financial_events for select using (
+  app.has_perm('finance.view') or app.has_perm('finance.view_profit') or app.can_write());
+revoke insert, update, delete, truncate on public.financial_events from anon, authenticated;
+
+-- Immutable: no update / delete / truncate, for anyone.
+create or replace function app.ledger_immutable() returns trigger
+language plpgsql as $fn$
+begin
+  raise exception 'ledger_immutable' using errcode = 'insufficient_privilege',
+    hint = 'Financial events are never changed; post an adjustment instead.';
+end $fn$;
+drop trigger if exists ledger_no_update on public.financial_events;
+create trigger ledger_no_update before update or delete on public.financial_events
+  for each row execute function app.ledger_immutable();
+drop trigger if exists ledger_no_truncate on public.financial_events;
+create trigger ledger_no_truncate before truncate on public.financial_events
+  for each statement execute function app.ledger_immutable();
+
+-- ── Posting ─────────────────────────────────────────────────────────────────
+create or replace function app.ledger_post(
+  p_type text, p_category text, p_sign smallint, p_amount bigint, p_at timestamptz,
+  p_source_table text, p_source_id uuid,
+  p_business_date date default null, p_order_id uuid default null, p_supplier_id uuid default null,
+  p_method text default null, p_details jsonb default '{}'::jsonb
+) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_at timestamptz := coalesce(p_at, now());
+begin
+  if p_amount = 0 and p_sign <> 0 then return; end if;
+  insert into public.financial_events (
+    event_type, category, sign, amount_cents, currency, occurred_at, business_date,
+    source_table, source_id, order_id, supplier_id, payment_method,
+    actor_id, actor_role, portal_id, details
+  ) values (
+    p_type, p_category, p_sign, abs(p_amount),
+    coalesce((select currency_code from public.business_settings limit 1), 'USD'),
+    v_at,
+    coalesce(p_business_date, app.business_day(v_at), (v_at at time zone 'UTC')::date),
+    p_source_table, p_source_id, p_order_id, p_supplier_id, p_method,
+    app.jwt_sub(), app.current_member_role(), app.current_portal_id(),
+    coalesce(p_details, '{}'::jsonb)
+  );
+end $fn$;
+revoke all on function app.ledger_post(text, text, smallint, bigint, timestamptz, text, uuid, date, uuid, uuid, text, jsonb) from public;
+
+-- Revenue + COGS for one order, posted as the difference from the ledger.
+create or replace function app.ledger_sync_order(p_order_id uuid, p_cause text default 'update', p_at timestamptz default null)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare
+  o public.orders; v_done boolean := false;
+  v_rev bigint := 0; v_cogs bigint := 0; v_missing int := 0;
+  v_rev_bal bigint; v_cogs_bal bigint; v_delta bigint; v_type text; v_at timestamptz;
+begin
+  select * into o from public.orders where id = p_order_id;
+  v_done := found and o.status in ('served', 'paid');
+  select coalesce(sum(signed_cents) filter (where category = 'revenue'), 0),
+         coalesce(sum(signed_cents) filter (where category = 'cogs'), 0)
+    into v_rev_bal, v_cogs_bal
+    from public.financial_events where order_id = p_order_id;
+  if not v_done and v_rev_bal = 0 and v_cogs_bal = 0 then return; end if;
+
+  if v_done then
+    v_rev := o.subtotal_cents - o.discount_cents - o.refunded_cents;
+    select coalesce(sum(recipe_cost_cents), 0), count(*) filter (where recipe_cost_cents is null)
+      into v_cogs, v_missing from public.order_lines where order_id = p_order_id;
+  end if;
+  v_at := coalesce(p_at, now());
+
+  v_delta := v_rev - v_rev_bal;
+  if v_delta <> 0 then
+    v_type := case when not v_done then 'ORDER_REVERSED'
+                   when v_rev_bal = 0 then 'ORDER_COMPLETED'
+                   when p_cause = 'refund' then 'REVENUE_REFUNDED'
+                   else 'ORDER_ADJUSTED' end;
+    perform app.ledger_post(v_type, 'revenue', sign(v_delta)::smallint, v_delta, v_at, 'orders', p_order_id,
+      null, p_order_id, null, o.payment_method,
+      jsonb_build_object('order_number', o.order_number, 'status', o.status, 'channel', o.channel,
+        'gross_cents', o.subtotal_cents, 'discount_cents', o.discount_cents, 'refunded_cents', o.refunded_cents,
+        'tax_cents', o.tax_cents, 'total_cents', o.total_cents, 'cause', p_cause));
+  end if;
+
+  v_delta := v_cogs - v_cogs_bal;
+  if v_delta <> 0 then
+    v_type := case when not v_done then 'COGS_REVERSED' when v_cogs_bal = 0 then 'COGS_RECORDED' else 'COGS_ADJUSTED' end;
+    perform app.ledger_post(v_type, 'cogs', sign(v_delta)::smallint, v_delta, v_at, 'orders', p_order_id,
+      null, p_order_id, null, null,
+      jsonb_build_object('order_number', o.order_number, 'lines_missing_recipe', v_missing));
+  end if;
+end $fn$;
+revoke all on function app.ledger_sync_order(uuid, text, timestamptz) from public;
+
+-- Customer money held for one payment.
+create or replace function app.ledger_sync_payment(p_payment_id uuid, p_cause text default 'update', p_at timestamptz default null)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+declare p public.payments; v_target bigint := 0; v_bal bigint; v_n int; v_delta bigint; v_type text;
+begin
+  select * into p from public.payments where id = p_payment_id;
+  select coalesce(sum(signed_cents), 0), count(*) into v_bal, v_n
+    from public.financial_events where source_table = 'payments' and source_id = p_payment_id;
+  if found and p.id is not null and v_n = 0 then
+    perform app.ledger_post('PAYMENT_RECEIVED', 'payment', 1::smallint, p.amount_cents, coalesce(p_at, p.created_at),
+      'payments', p.id, null, p.order_id, null, p.method,
+      jsonb_build_object('reference', p.reference, 'tendered_cents', p.tendered_cents, 'change_cents', p.change_cents));
+    v_bal := p.amount_cents;
+  end if;
+  if p.id is not null and p.status <> 'voided' then v_target := p.amount_cents - p.refunded_cents; end if;
+  v_delta := v_target - v_bal;
+  if v_delta = 0 then return; end if;
+  v_type := case when p.id is null then 'PAYMENT_REMOVED'
+                 when p.status = 'voided' then 'PAYMENT_VOIDED'
+                 when p_cause = 'refund' then 'REFUND_ISSUED'
+                 else 'PAYMENT_ADJUSTED' end;
+  perform app.ledger_post(v_type, 'payment', sign(v_delta)::smallint, v_delta, coalesce(p_at, now()),
+    'payments', p_payment_id, null, p.order_id, null, p.method,
+    jsonb_build_object('status', p.status, 'refunded_cents', p.refunded_cents));
+end $fn$;
+revoke all on function app.ledger_sync_payment(uuid, text, timestamptz) from public;
+
+-- ── Source triggers ─────────────────────────────────────────────────────────
+create or replace function app.ledger_on_order() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if tg_op = 'DELETE' then
+    perform app.ledger_sync_order(old.id, 'deleted');
+  elsif tg_op = 'INSERT'
+     or new.status is distinct from old.status or new.subtotal_cents is distinct from old.subtotal_cents
+     or new.discount_cents is distinct from old.discount_cents or new.refunded_cents is distinct from old.refunded_cents then
+    perform app.ledger_sync_order(new.id,
+      case when tg_op = 'UPDATE' and new.refunded_cents is distinct from old.refunded_cents
+                and new.status = old.status and new.subtotal_cents = old.subtotal_cents
+                and new.discount_cents = old.discount_cents then 'refund'
+           else lower(tg_op) end);
+  end if;
+  return null;
+end $fn$;
+drop trigger if exists ledger_sync on public.orders;
+create trigger ledger_sync after insert or update or delete on public.orders
+  for each row execute function app.ledger_on_order();
+
+create or replace function app.ledger_on_order_line() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  perform app.ledger_sync_order(coalesce(new.order_id, old.order_id), 'lines');
+  if tg_op = 'UPDATE' and new.order_id is distinct from old.order_id then
+    perform app.ledger_sync_order(old.order_id, 'lines');
+  end if;
+  return null;
+end $fn$;
+drop trigger if exists ledger_sync on public.order_lines;
+create trigger ledger_sync after insert or delete or update of recipe_cost_cents, order_id on public.order_lines
+  for each row execute function app.ledger_on_order_line();
+
+create or replace function app.ledger_on_payment() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  perform app.ledger_sync_payment(coalesce(new.id, old.id),
+    case when tg_op = 'UPDATE' and new.refunded_cents is distinct from old.refunded_cents
+              and new.status is not distinct from old.status then 'refund' else lower(tg_op) end);
+  return null;
+end $fn$;
+drop trigger if exists ledger_sync on public.payments;
+create trigger ledger_sync after insert or delete or update of amount_cents, refunded_cents, status on public.payments
+  for each row execute function app.ledger_on_payment();
+
+create or replace function app.ledger_on_expense() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_bal bigint;
+begin
+  if tg_op = 'INSERT' then
+    perform app.ledger_post('EXPENSE_RECORDED', 'expense', 1::smallint, new.amount_cents, now(), 'expenses', new.id,
+      new.expense_date, null, new.supplier_id, null,
+      jsonb_build_object('category', new.category, 'description', new.description));
+    return null;
+  end if;
+  select coalesce(sum(signed_cents), 0) into v_bal
+    from public.financial_events where source_table = 'expenses' and source_id = old.id;
+  if tg_op = 'DELETE' then
+    perform app.ledger_post('EXPENSE_REVERSED', 'expense', (-1)::smallint, v_bal, now(), 'expenses', old.id,
+      old.expense_date, null, old.supplier_id, null,
+      jsonb_build_object('category', old.category, 'description', old.description));
+  elsif new.expense_date is distinct from old.expense_date then
+    perform app.ledger_post('EXPENSE_REVERSED', 'expense', (-1)::smallint, v_bal, now(), 'expenses', old.id,
+      old.expense_date, null, old.supplier_id, null, jsonb_build_object('cause', 'date_changed', 'new_date', new.expense_date));
+    perform app.ledger_post('EXPENSE_RECORDED', 'expense', 1::smallint, new.amount_cents, now(), 'expenses', new.id,
+      new.expense_date, null, new.supplier_id, null,
+      jsonb_build_object('category', new.category, 'description', new.description, 'cause', 'date_changed'));
+  elsif new.amount_cents <> v_bal then
+    perform app.ledger_post('EXPENSE_ADJUSTED', 'expense', sign(new.amount_cents - v_bal)::smallint,
+      new.amount_cents - v_bal, now(), 'expenses', new.id, new.expense_date, null, new.supplier_id, null,
+      jsonb_build_object('from_cents', v_bal, 'to_cents', new.amount_cents));
+  end if;
+  return null;
+end $fn$;
+drop trigger if exists ledger_sync on public.expenses;
+create trigger ledger_sync after insert or update or delete on public.expenses
+  for each row execute function app.ledger_on_expense();
+
+create or replace function app.ledger_on_supplier_invoice() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_target bigint := 0; v_bal bigint;
+begin
+  if new.status in ('approved', 'partially_paid', 'paid') then v_target := new.total_cents; end if;
+  select coalesce(sum(signed_cents), 0) into v_bal
+    from public.financial_events where source_table = 'supplier_invoices' and source_id = new.id;
+  if v_target <> v_bal then
+    perform app.ledger_post(case when v_target > v_bal then 'SUPPLIER_INVOICE_APPROVED' else 'SUPPLIER_INVOICE_REVERSED' end,
+      'payable', sign(v_target - v_bal)::smallint, v_target - v_bal, coalesce(new.approved_at, now()),
+      'supplier_invoices', new.id, null, null, new.supplier_id, null,
+      jsonb_build_object('invoice_number', new.supplier_invoice_number, 'invoice_ref', new.invoice_ref,
+        'status', new.status, 'due_date', new.due_date, 'purchase_order_id', new.purchase_order_id));
+  end if;
+  return null;
+end $fn$;
+drop trigger if exists ledger_sync on public.supplier_invoices;
+create trigger ledger_sync after insert or update of status, total_cents on public.supplier_invoices
+  for each row execute function app.ledger_on_supplier_invoice();
+
+create or replace function app.ledger_on_simple() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  case tg_table_name
+  when 'supplier_payments' then
+    perform app.ledger_post('SUPPLIER_PAYMENT_MADE', 'payable', (-1)::smallint, new.amount_cents, new.paid_at,
+      'supplier_payments', new.id, null, null, new.supplier_id, new.method,
+      jsonb_build_object('reference', new.reference, 'note', new.note));
+  when 'supplier_credit_notes' then
+    perform app.ledger_post('SUPPLIER_CREDIT_NOTE', 'payable', (-1)::smallint, new.amount_cents, now(),
+      'supplier_credit_notes', new.id, new.credit_date, null, new.supplier_id, null,
+      jsonb_build_object('reason', new.reason, 'invoice_id', new.invoice_id));
+  when 'cash_counts' then
+    perform app.ledger_post('CASH_COUNTED', 'cash', 0::smallint, new.counted_cents, new.created_at,
+      'cash_counts', new.id, new.business_date, null, null, 'cash',
+      jsonb_build_object('opening_cents', new.opening_cents, 'expected_cents', new.expected_cents,
+        'difference_cents', new.difference_cents, 'note', new.note));
+  when 'stock_ledger' then
+    if new.reason <> 'order_deduction' then
+      perform app.ledger_post(
+        case new.reason when 'restock' then 'GOODS_RECEIVED' when 'spoilage' then 'WASTE_RECORDED' else 'STOCK_ADJUSTED' end,
+        case new.reason when 'spoilage' then 'waste' else 'inventory' end,
+        case when new.reason = 'spoilage' then 1 else sign(new.delta_qty) end::smallint,
+        round(abs(new.delta_qty) * coalesce(new.unit_cost_cents_base,
+          (select cost_cents_per_base_unit from public.inventory_items where id = new.inventory_item_id), 0))::bigint,
+        new.created_at, 'stock_ledger', new.id, null, new.order_id, null, null,
+        jsonb_build_object('inventory_item_id', new.inventory_item_id, 'qty', new.delta_qty,
+          'reason', new.reason, 'note', new.note, 'cost_estimated', new.unit_cost_cents_base is null));
+    end if;
+  end case;
+  return null;
+end $fn$;
+do $$
+declare t text;
+begin
+  foreach t in array array['supplier_payments', 'supplier_credit_notes', 'cash_counts', 'stock_ledger'] loop
+    execute format('drop trigger if exists ledger_sync on public.%I', t);
+    execute format('create trigger ledger_sync after insert on public.%I for each row execute function app.ledger_on_simple()', t);
+  end loop;
+end $$;
+
+create or replace function app.ledger_on_close() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if new.status = 'closed' and (tg_op = 'INSERT' or old.status is distinct from 'closed' or new.closed_at is distinct from old.closed_at) then
+    perform app.ledger_post('BUSINESS_DAY_CLOSED', 'close', 0::smallint, new.net_sales_cents, coalesce(new.closed_at, now()),
+      'daily_closings', new.id, new.business_date, null, null, null,
+      jsonb_build_object('gross_sales_cents', new.gross_sales_cents, 'expected_cash_cents', new.expected_cash_cents,
+        'closing_cash_cents', new.closing_cash_cents, 'difference_cents', new.difference_cents, 'order_count', new.order_count));
+  elsif tg_op = 'UPDATE' and new.status = 'open' and old.status = 'closed' then
+    perform app.ledger_post('BUSINESS_DAY_REOPENED', 'close', 0::smallint, 0, coalesce(new.reopened_at, now()),
+      'daily_closings', new.id, new.business_date, null, null, null, jsonb_build_object('reason', new.note));
+  end if;
+  return null;
+end $fn$;
+drop trigger if exists ledger_sync on public.daily_closings;
+create trigger ledger_sync after insert or update on public.daily_closings
+  for each row execute function app.ledger_on_close();
+
+create or replace function app.ledger_on_purchase_order() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if new.approved_at is not null and (tg_op = 'INSERT' or old.approved_at is null) then
+    perform app.ledger_post('PURCHASE_ORDER_APPROVED', 'purchasing', 0::smallint, new.subtotal_cents, new.approved_at,
+      'purchase_orders', new.id, null, null, new.supplier_id, null,
+      jsonb_build_object('po_number', new.po_number, 'expected_at', new.expected_at));
+  end if;
+  return null;
+end $fn$;
+drop trigger if exists ledger_sync on public.purchase_orders;
+create trigger ledger_sync after insert or update of approved_at on public.purchase_orders
+  for each row execute function app.ledger_on_purchase_order();
+
+-- ── Controlled manual adjustment ────────────────────────────────────────────
+insert into public.permission_catalog (key, grp, label, type, risk_level) values
+  ('finance.adjust_ledger', 'Finance', 'Post manual financial ledger adjustments', 'approval', 'high')
+on conflict (key) do update set grp = excluded.grp, label = excluded.label,
+  type = excluded.type, risk_level = excluded.risk_level;
+
+create or replace function public.post_ledger_adjustment(
+  p_category text, p_amount_cents bigint, p_reason text, p_business_date date default null
+) returns bigint
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_id bigint;
+begin
+  if not app.has_perm('finance.adjust_ledger') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  if coalesce(p_amount_cents, 0) = 0 then raise exception 'bad_amount' using errcode = 'check_violation'; end if;
+  if p_category not in ('revenue','cogs','payment','expense','payable','inventory','waste','cash') then
+    raise exception 'bad_category' using errcode = 'check_violation';
+  end if;
+  perform app.ledger_post('MANUAL_ADJUSTMENT', p_category, sign(p_amount_cents)::smallint, p_amount_cents, now(),
+    'manual', null, p_business_date, null, null, null, jsonb_build_object('reason', trim(p_reason)));
+  select max(id) into v_id from public.financial_events where event_type = 'MANUAL_ADJUSTMENT';
+  perform app.log_action('ledger.adjusted', 'financial_events', v_id::text, null,
+    jsonb_build_object('category', p_category, 'amount_cents', p_amount_cents, 'reason', p_reason, 'business_date', p_business_date));
+  return v_id;
+end $fn$;
+revoke all on function public.post_ledger_adjustment(text, bigint, text, date) from public;
+grant execute on function public.post_ledger_adjustment(text, bigint, text, date) to authenticated, service_role;
+
+-- ── Reading (RLS applies: needs finance.view / view_profit or owner/manager) ─
+create or replace function public.ledger_summary(p_from date, p_to date)
+returns table (category text, net_cents bigint, increase_cents bigint, decrease_cents bigint, events bigint)
+language sql stable security invoker set search_path = public, app as $fn$
+  select e.category,
+         sum(e.signed_cents)::bigint,
+         coalesce(sum(e.amount_cents) filter (where e.sign = 1), 0)::bigint,
+         coalesce(sum(e.amount_cents) filter (where e.sign = -1), 0)::bigint,
+         count(*)::bigint
+    from public.financial_events e
+   where e.business_date between p_from and p_to
+   group by e.category
+   order by e.category
+$fn$;
+grant execute on function public.ledger_summary(date, date) to authenticated, service_role;
+
+create or replace function public.ledger_events(
+  p_from date, p_to date, p_category text default null, p_limit int default 200
+) returns setof public.financial_events
+language sql stable security invoker set search_path = public, app as $fn$
+  select * from public.financial_events e
+   where e.business_date between p_from and p_to
+     and (p_category is null or e.category = p_category)
+   order by e.occurred_at desc, e.id desc
+   limit least(greatest(coalesce(p_limit, 200), 1), 1000)
+$fn$;
+grant execute on function public.ledger_events(date, date, text, int) to authenticated, service_role;
+
+-- ── Backfill existing history (once, when the ledger is empty) ─────────────
+do $$
+declare r record;
+begin
+  if exists (select 1 from public.financial_events) then return; end if;
+
+  for r in select id, coalesce(paid_at, created_at) as at from public.orders where status in ('served', 'paid') loop
+    perform app.ledger_sync_order(r.id, 'backfill', r.at);
+  end loop;
+  for r in select id, created_at from public.payments loop
+    perform app.ledger_sync_payment(r.id, 'backfill', r.created_at);
+  end loop;
+  insert into public.financial_events (event_type, category, sign, amount_cents, currency, occurred_at, business_date,
+      source_table, source_id, supplier_id, actor_id, details)
+    select 'EXPENSE_RECORDED', 'expense', 1, e.amount_cents,
+           coalesce((select currency_code from public.business_settings limit 1), 'USD'),
+           e.created_at, e.expense_date, 'expenses', e.id, e.supplier_id, e.recorded_by,
+           jsonb_build_object('category', e.category, 'description', e.description, 'backfill', true)
+      from public.expenses e;
+  insert into public.financial_events (event_type, category, sign, amount_cents, currency, occurred_at, business_date,
+      source_table, source_id, supplier_id, actor_id, details)
+    select 'SUPPLIER_INVOICE_APPROVED', 'payable', 1, i.total_cents,
+           coalesce((select currency_code from public.business_settings limit 1), 'USD'),
+           coalesce(i.approved_at, i.created_at),
+           coalesce(app.business_day(coalesce(i.approved_at, i.created_at)), i.invoice_date),
+           'supplier_invoices', i.id, i.supplier_id, i.approved_by,
+           jsonb_build_object('invoice_number', i.supplier_invoice_number, 'status', i.status, 'backfill', true)
+      from public.supplier_invoices i
+     where i.status in ('approved', 'partially_paid', 'paid') and i.total_cents > 0;
+  insert into public.financial_events (event_type, category, sign, amount_cents, currency, occurred_at, business_date,
+      source_table, source_id, supplier_id, payment_method, actor_id, details)
+    select 'SUPPLIER_PAYMENT_MADE', 'payable', -1, p.amount_cents,
+           coalesce((select currency_code from public.business_settings limit 1), 'USD'),
+           p.paid_at, coalesce(app.business_day(p.paid_at), p.paid_at::date),
+           'supplier_payments', p.id, p.supplier_id, p.method, p.created_by,
+           jsonb_build_object('reference', p.reference, 'backfill', true)
+      from public.supplier_payments p;
+  insert into public.financial_events (event_type, category, sign, amount_cents, currency, occurred_at, business_date,
+      source_table, source_id, supplier_id, actor_id, details)
+    select 'SUPPLIER_CREDIT_NOTE', 'payable', -1, c.amount_cents,
+           coalesce((select currency_code from public.business_settings limit 1), 'USD'),
+           c.created_at, c.credit_date, 'supplier_credit_notes', c.id, c.supplier_id, c.created_by,
+           jsonb_build_object('reason', c.reason, 'backfill', true)
+      from public.supplier_credit_notes c;
+  insert into public.financial_events (event_type, category, sign, amount_cents, currency, occurred_at, business_date,
+      source_table, source_id, order_id, details)
+    select case s.reason when 'restock' then 'GOODS_RECEIVED' when 'spoilage' then 'WASTE_RECORDED' else 'STOCK_ADJUSTED' end,
+           case s.reason when 'spoilage' then 'waste' else 'inventory' end,
+           case when s.reason = 'spoilage' then 1 else sign(s.delta_qty) end,
+           round(abs(s.delta_qty) * coalesce(s.unit_cost_cents_base, ii.cost_cents_per_base_unit, 0))::bigint,
+           coalesce((select currency_code from public.business_settings limit 1), 'USD'),
+           s.created_at, coalesce(app.business_day(s.created_at), s.created_at::date),
+           'stock_ledger', s.id, s.order_id,
+           jsonb_build_object('inventory_item_id', s.inventory_item_id, 'qty', s.delta_qty, 'reason', s.reason,
+             'cost_estimated', s.unit_cost_cents_base is null, 'backfill', true)
+      from public.stock_ledger s left join public.inventory_items ii on ii.id = s.inventory_item_id
+     where s.reason <> 'order_deduction' and s.delta_qty <> 0;
+  insert into public.financial_events (event_type, category, sign, amount_cents, currency, occurred_at, business_date,
+      source_table, source_id, payment_method, actor_id, details)
+    select 'CASH_COUNTED', 'cash', 0, c.counted_cents,
+           coalesce((select currency_code from public.business_settings limit 1), 'USD'),
+           c.created_at, c.business_date, 'cash_counts', c.id, 'cash', c.counted_by,
+           jsonb_build_object('expected_cents', c.expected_cents, 'difference_cents', c.difference_cents, 'backfill', true)
+      from public.cash_counts c;
+  insert into public.financial_events (event_type, category, sign, amount_cents, currency, occurred_at, business_date,
+      source_table, source_id, actor_id, details)
+    select 'BUSINESS_DAY_CLOSED', 'close', 0, d.net_sales_cents,
+           coalesce((select currency_code from public.business_settings limit 1), 'USD'),
+           coalesce(d.closed_at, d.created_at), d.business_date, 'daily_closings', d.id, d.closed_by,
+           jsonb_build_object('difference_cents', d.difference_cents, 'backfill', true)
+      from public.daily_closings d where d.status = 'closed';
+  insert into public.financial_events (event_type, category, sign, amount_cents, currency, occurred_at, business_date,
+      source_table, source_id, supplier_id, actor_id, details)
+    select 'PURCHASE_ORDER_APPROVED', 'purchasing', 0, po.subtotal_cents,
+           coalesce((select currency_code from public.business_settings limit 1), 'USD'),
+           po.approved_at, coalesce(app.business_day(po.approved_at), po.approved_at::date),
+           'purchase_orders', po.id, po.supplier_id, po.approved_by,
+           jsonb_build_object('po_number', po.po_number, 'backfill', true)
+      from public.purchase_orders po where po.approved_at is not null;
+end $$;
+
+-- ============================================================================
+-- 0086_ledger_refund_cause.sql — follow-up to 0085
+-- refund_payment() changes refunded_cents AND status (captured →
+-- partially_refunded/refunded) in one update, so the payment trigger must
+-- treat any refunded_cents change as a refund, not a generic adjustment.
+-- ============================================================================
+create or replace function app.ledger_on_payment() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  perform app.ledger_sync_payment(coalesce(new.id, old.id),
+    case when tg_op = 'UPDATE' and new.refunded_cents is distinct from old.refunded_cents
+              and new.status <> 'voided' then 'refund' else lower(tg_op) end);
+  return null;
+end $fn$;
+
+-- ============================================================================
+-- 0087_expense_workflow.sql — Finance Phase C (expense workflow)
+--
+-- Expenses get a controlled lifecycle:
+--   draft → submitted → approved → paid        (rejected / void on the side)
+-- Only APPROVED and PAID expenses are operating costs: they count in
+-- period_profitability() and post to the financial ledger. Drafts, submitted,
+-- rejected and void expenses don't affect profit.
+--
+-- Status and the who/when fields move only through the workflow functions
+-- below (a guard blocks direct edits from the app). An expense can be edited
+-- or deleted only before approval; an approved or paid one is corrected by
+-- voiding it with a reason (the ledger posts a reversal).
+--
+-- Existing expenses were real recorded spend, so they become 'paid' and
+-- today's profit figures don't change. New ones default to 'submitted'.
+--
+-- Also: a private 'expense-receipts' bucket for receipt attachments, and the
+-- supplier-invoices bucket no longer lets every staff member read files.
+-- ============================================================================
+
+alter table public.expenses
+  add column if not exists status            text not null default 'paid',
+  add column if not exists vendor            text,
+  add column if not exists payment_method    text,
+  add column if not exists payment_reference text,
+  add column if not exists attachment_path   text,
+  add column if not exists submitted_by      uuid,
+  add column if not exists submitted_at      timestamptz,
+  add column if not exists approved_by       uuid,
+  add column if not exists approved_at       timestamptz,
+  add column if not exists rejected_by       uuid,
+  add column if not exists rejected_at       timestamptz,
+  add column if not exists rejection_reason  text,
+  add column if not exists paid_by           uuid,
+  add column if not exists paid_at           timestamptz,
+  add column if not exists voided_by         uuid,
+  add column if not exists voided_at         timestamptz,
+  add column if not exists void_reason       text;
+
+update public.expenses
+   set submitted_by = coalesce(submitted_by, recorded_by),
+       submitted_at = coalesce(submitted_at, created_at),
+       approved_at  = coalesce(approved_at, created_at),
+       paid_at      = coalesce(paid_at, created_at)
+ where status = 'paid';
+
+alter table public.expenses alter column status set default 'submitted';
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'expenses_status_check') then
+    alter table public.expenses add constraint expenses_status_check
+      check (status in ('draft', 'submitted', 'approved', 'rejected', 'paid', 'void'));
+  end if;
+end $$;
+create index if not exists expenses_status_date_idx on public.expenses (status, expense_date desc);
+
+insert into public.permission_catalog (key, grp, label, type, risk_level) values
+  ('finance.approve_expense', 'Finance', 'Approve, reject or void expenses', 'approval', 'high'),
+  ('finance.pay_expense',     'Finance', 'Mark approved expenses as paid',  'write',    'high')
+on conflict (key) do update set grp = excluded.grp, label = excluded.label,
+  type = excluded.type, risk_level = excluded.risk_level;
+
+-- ── Guard: status moves only through the workflow functions ─────────────────
+create or replace function app.guard_expense() returns trigger
+language plpgsql set search_path = public, app as $fn$
+begin
+  if current_user not in ('authenticated', 'anon') then return coalesce(new, old); end if;
+
+  if tg_op = 'INSERT' then
+    if new.status not in ('draft', 'submitted') then
+      raise exception 'expense_status_via_workflow' using errcode = 'insufficient_privilege',
+        hint = 'New expenses start as a draft or submitted; approval and payment set the rest.';
+    end if;
+    new.recorded_by := coalesce(new.recorded_by, app.jwt_sub());
+    new.submitted_by := case when new.status = 'submitted' then app.jwt_sub() end;
+    new.submitted_at := case when new.status = 'submitted' then now() end;
+    new.approved_by := null; new.approved_at := null; new.rejected_by := null; new.rejected_at := null;
+    new.rejection_reason := null; new.paid_by := null; new.paid_at := null;
+    new.voided_by := null; new.voided_at := null; new.void_reason := null;
+    return new;
+  end if;
+
+  if tg_op = 'DELETE' then
+    if old.status not in ('draft', 'submitted', 'rejected') then
+      raise exception 'expense_locked' using errcode = 'insufficient_privilege',
+        hint = 'Approved or paid expenses cannot be deleted; void them with a reason instead.';
+    end if;
+    return old;
+  end if;
+
+  if (new.status, new.submitted_by, new.submitted_at, new.approved_by, new.approved_at, new.rejected_by,
+      new.rejected_at, new.rejection_reason, new.paid_by, new.paid_at, new.voided_by, new.voided_at,
+      new.void_reason, new.recorded_by, new.payment_method, new.payment_reference)
+     is distinct from
+     (old.status, old.submitted_by, old.submitted_at, old.approved_by, old.approved_at, old.rejected_by,
+      old.rejected_at, old.rejection_reason, old.paid_by, old.paid_at, old.voided_by, old.voided_at,
+      old.void_reason, old.recorded_by, old.payment_method, old.payment_reference) then
+    raise exception 'expense_status_via_workflow' using errcode = 'insufficient_privilege',
+      hint = 'Use submit, approve, reject, pay or void to change an expense''s status.';
+  end if;
+  if (new.category, new.description, new.amount_cents, new.expense_date, new.supplier_id, new.vendor)
+     is distinct from
+     (old.category, old.description, old.amount_cents, old.expense_date, old.supplier_id, old.vendor)
+     and old.status not in ('draft', 'submitted', 'rejected') then
+    raise exception 'expense_locked' using errcode = 'insufficient_privilege',
+      hint = 'Approved or paid expenses cannot be edited; void them with a reason instead.';
+  end if;
+  if new.attachment_path is distinct from old.attachment_path and old.status = 'void' then
+    raise exception 'expense_locked' using errcode = 'insufficient_privilege';
+  end if;
+  return new;
+end $fn$;
+drop trigger if exists guard_expense on public.expenses;
+create trigger guard_expense before insert or update or delete on public.expenses
+  for each row execute function app.guard_expense();
+
+-- ── Workflow functions ──────────────────────────────────────────────────────
+create or replace function app.expense_transition(
+  p_id uuid, p_from text[], p_to text, p_action text, p_extra jsonb default '{}'::jsonb
+) returns public.expenses
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_old public.expenses; v_row public.expenses;
+begin
+  select * into v_old from public.expenses where id = p_id for update;
+  if not found then raise exception 'expense_not_found' using errcode = 'no_data_found'; end if;
+  if not (v_old.status = any(p_from)) then
+    raise exception 'expense_wrong_status: % cannot be %', v_old.status, p_action using errcode = 'check_violation';
+  end if;
+  update public.expenses set
+    status = p_to,
+    submitted_by = case when p_to = 'submitted' then app.jwt_sub() else submitted_by end,
+    submitted_at = case when p_to = 'submitted' then now() else submitted_at end,
+    approved_by = case when p_to = 'approved' then app.jwt_sub() when p_to = 'submitted' then null else approved_by end,
+    approved_at = case when p_to = 'approved' then now() when p_to = 'submitted' then null else approved_at end,
+    rejected_by = case when p_to = 'rejected' then app.jwt_sub() when p_to = 'submitted' then null else rejected_by end,
+    rejected_at = case when p_to = 'rejected' then now() when p_to = 'submitted' then null else rejected_at end,
+    rejection_reason = case when p_to = 'rejected' then p_extra->>'reason' when p_to = 'submitted' then null else rejection_reason end,
+    paid_by = case when p_to = 'paid' then app.jwt_sub() else paid_by end,
+    paid_at = case when p_to = 'paid' then coalesce((p_extra->>'paid_at')::timestamptz, now()) else paid_at end,
+    payment_method = case when p_to = 'paid' then p_extra->>'method' else payment_method end,
+    payment_reference = case when p_to = 'paid' then nullif(p_extra->>'reference', '') else payment_reference end,
+    voided_by = case when p_to = 'void' then app.jwt_sub() else voided_by end,
+    voided_at = case when p_to = 'void' then now() else voided_at end,
+    void_reason = case when p_to = 'void' then p_extra->>'reason' else void_reason end
+  where id = p_id
+  returning * into v_row;
+  perform app.log_action('expense.' || p_action, 'expenses', p_id::text,
+    jsonb_build_object('status', v_old.status),
+    jsonb_build_object('status', v_row.status, 'amount_cents', v_row.amount_cents) || coalesce(p_extra, '{}'::jsonb));
+  return v_row;
+end $fn$;
+revoke all on function app.expense_transition(uuid, text[], text, text, jsonb) from public;
+
+create or replace function public.submit_expense(p_id uuid) returns public.expenses
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('finance.create_expense') or app.has_perm('finance.update_expense')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return app.expense_transition(p_id, array['draft', 'rejected'], 'submitted', 'submitted');
+end $fn$;
+
+create or replace function public.approve_expense(p_id uuid) returns public.expenses
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not app.has_perm('finance.approve_expense') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return app.expense_transition(p_id, array['submitted'], 'approved', 'approved');
+end $fn$;
+
+create or replace function public.reject_expense(p_id uuid, p_reason text) returns public.expenses
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not app.has_perm('finance.approve_expense') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  return app.expense_transition(p_id, array['submitted', 'approved'], 'rejected', 'rejected',
+    jsonb_build_object('reason', trim(p_reason)));
+end $fn$;
+
+create or replace function public.pay_expense(
+  p_id uuid, p_method text, p_reference text default null, p_paid_on date default null
+) returns public.expenses
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not app.has_perm('finance.pay_expense') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_method, '') not in ('cash', 'card', 'bank_transfer', 'cheque', 'digital_wallet', 'other') then
+    raise exception 'bad_payment_method' using errcode = 'check_violation';
+  end if;
+  return app.expense_transition(p_id, array['approved'], 'paid', 'paid',
+    jsonb_build_object('method', p_method, 'reference', coalesce(p_reference, ''),
+      'paid_at', case when p_paid_on is null then null else (p_paid_on::timestamp + interval '12 hours')::timestamptz end));
+end $fn$;
+
+create or replace function public.void_expense(p_id uuid, p_reason text) returns public.expenses
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not app.has_perm('finance.approve_expense') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  return app.expense_transition(p_id, array['approved', 'paid'], 'void', 'voided',
+    jsonb_build_object('reason', trim(p_reason)));
+end $fn$;
+
+do $$
+declare f text;
+begin
+  foreach f in array array['submit_expense(uuid)', 'approve_expense(uuid)', 'reject_expense(uuid,text)',
+                           'pay_expense(uuid,text,text,date)', 'void_expense(uuid,text)'] loop
+    execute format('revoke all on function public.%s from public', f);
+    execute format('grant execute on function public.%s to authenticated, service_role', f);
+  end loop;
+end $$;
+
+-- ── Ledger: only approved / paid expenses are operating costs ──────────────
+create or replace function app.ledger_on_expense() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_row public.expenses := coalesce(new, old);
+  v_target bigint := 0; v_bal bigint; v_old_date date; v_type text;
+begin
+  if tg_op <> 'DELETE' and new.status in ('approved', 'paid') then v_target := new.amount_cents; end if;
+  select coalesce(sum(signed_cents), 0) into v_bal
+    from public.financial_events where source_table = 'expenses' and source_id = v_row.id and category = 'expense';
+  v_old_date := case when tg_op = 'INSERT' then null else old.expense_date end;
+
+  -- A posted expense whose date moved: take it off the old day, then post on the new one.
+  if tg_op = 'UPDATE' and v_bal <> 0 and new.expense_date is distinct from old.expense_date then
+    perform app.ledger_post('EXPENSE_REVERSED', 'expense', (-1)::smallint, v_bal, now(), 'expenses', old.id,
+      old.expense_date, null, old.supplier_id, null, jsonb_build_object('cause', 'date_changed', 'new_date', new.expense_date));
+    v_bal := 0;
+  end if;
+
+  if v_target <> v_bal then
+    v_type := case
+      when v_target = 0 and tg_op = 'DELETE' then 'EXPENSE_REVERSED'
+      when v_target = 0 and new.status = 'void' then 'EXPENSE_VOIDED'
+      when v_target = 0 and new.status = 'rejected' then 'EXPENSE_REJECTED'
+      when v_target = 0 then 'EXPENSE_REVERSED'
+      when v_bal = 0 then 'EXPENSE_APPROVED'
+      else 'EXPENSE_ADJUSTED' end;
+    perform app.ledger_post(v_type, 'expense', sign(v_target - v_bal)::smallint, v_target - v_bal, now(),
+      'expenses', v_row.id, v_row.expense_date, null, v_row.supplier_id, v_row.payment_method,
+      jsonb_build_object('category', v_row.category, 'description', v_row.description, 'status', v_row.status,
+        'vendor', v_row.vendor, 'reason', coalesce(v_row.void_reason, v_row.rejection_reason)));
+  end if;
+
+  if tg_op = 'UPDATE' and new.status = 'paid' and old.status is distinct from 'paid' then
+    perform app.ledger_post('EXPENSE_PAID', 'expense', 0::smallint, new.amount_cents, coalesce(new.paid_at, now()),
+      'expenses', new.id, null, null, new.supplier_id, new.payment_method,
+      jsonb_build_object('reference', new.payment_reference, 'category', new.category));
+  end if;
+  return null;
+end $fn$;
+
+-- ── Profit counts only approved / paid expenses ─────────────────────────────
+do $$
+declare v_def text; v_new text;
+begin
+  v_def := pg_get_functiondef('public.period_profitability(timestamptz, timestamptz)'::regprocedure);
+  v_new := replace(v_def,
+    'where expense_date <= app.local_date(p_to - interval ''1 microsecond'')',
+    'where expense_date <= app.local_date(p_to - interval ''1 microsecond'') and status in (''approved'', ''paid'')');
+  if v_new = v_def then
+    if position('status in (''approved'', ''paid'')' in v_def) = 0 then
+      raise exception 'period_profitability expense filter not found — patch it by hand';
+    end if;
+  else
+    execute v_new;
+  end if;
+end $$;
+
+-- ── Receipts storage ────────────────────────────────────────────────────────
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('expense-receipts', 'expense-receipts', false, 10485760,
+        array['application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/heic'])
+on conflict (id) do update set public = false, file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
+
+drop policy if exists "expense-receipts read" on storage.objects;
+create policy "expense-receipts read" on storage.objects for select
+  using (bucket_id = 'expense-receipts' and (app.has_perm('finance.view') or app.has_perm('finance.create_expense')
+    or app.has_perm('finance.approve_expense') or app.can_write()));
+drop policy if exists "expense-receipts upload" on storage.objects;
+create policy "expense-receipts upload" on storage.objects for insert
+  with check (bucket_id = 'expense-receipts' and (app.has_perm('finance.create_expense')
+    or app.has_perm('finance.update_expense') or app.can_write()));
+
+drop policy if exists "supplier-invoices staff read" on storage.objects;
+create policy "supplier-invoices staff read" on storage.objects for select
+  using (bucket_id = 'supplier-invoices' and (app.has_perm('invoices.view') or app.has_perm('invoices.create')
+    or app.has_perm('invoices.match') or app.has_perm('invoices.approve') or app.has_perm('payables.view')
+    or app.has_perm('finance.view') or app.can_write()));
+
+-- ============================================================================
+-- 0088_expense_read_for_approvers.sql — follow-up to 0087
+-- A portal granted only "Approve expenses" or "Mark expenses paid" must be
+-- able to see the expenses it acts on (and the person who records them must
+-- see their own list). Read access only; writes are unchanged.
+-- ============================================================================
+drop policy if exists staff_read on public.expenses;
+create policy staff_read on public.expenses for select using (
+  app.has_perm('finance.view') or app.has_perm('finance.create_expense') or app.has_perm('finance.update_expense')
+  or app.has_perm('finance.approve_expense') or app.has_perm('finance.pay_expense'));
+
+-- ============================================================================
+-- 0089_invoice_matching_v2.sql — Finance Phase D (matching, rejection, history)
+--
+-- match_supplier_invoice() now checks, and raises a separate typed hold for
+-- every problem it finds (previously a quantity problem hid a price problem):
+--   total         invoice total ≠ lines + tax + delivery − discount
+--   missing_po    line not linked to a purchase-order line
+--   supplier      PO belongs to a different supplier than the invoice
+--   po_mismatch   line belongs to a different PO than the invoice header
+--   missing_grn   nothing received yet against the PO line
+--   quantity      billed qty ≠ accepted qty (received − rejected), beyond tolerance
+--   price         billed unit price ≠ PO price, beyond tolerance
+--   duplicate     this line + other invoices bill more than was accepted
+-- The result is stored on the invoice (match_result, matched_at, matched_by).
+--
+-- reject_supplier_invoice() cancels an unpaid invoice with a reason (an
+-- approved one is taken back out of payables by the ledger trigger).
+-- supplier_invoice_history() gives the invoice's full trail for the detail
+-- screen, to anyone who may view invoices.
+-- ============================================================================
+
+alter table public.supplier_invoices
+  add column if not exists matched_at       timestamptz,
+  add column if not exists matched_by       uuid,
+  add column if not exists match_result     jsonb,
+  add column if not exists rejected_by      uuid,
+  add column if not exists rejected_at      timestamptz,
+  add column if not exists rejection_reason text;
+
+alter table public.supplier_payment_holds
+  add column if not exists kind text not null default 'other';
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'supplier_payment_holds_kind_check') then
+    alter table public.supplier_payment_holds add constraint supplier_payment_holds_kind_check
+      check (kind in ('total','missing_po','supplier','po_mismatch','missing_grn','quantity','price','duplicate','other'));
+  end if;
+end $$;
+
+-- Extend the Phase A guard to the new workflow columns.
+create or replace function app.guard_supplier_invoice() returns trigger
+language plpgsql set search_path = public, app as $fn$
+begin
+  if current_user not in ('authenticated', 'anon') then return coalesce(new, old); end if;
+
+  if tg_op = 'INSERT' then
+    if new.status <> 'received' or new.approved_by is not null or new.approved_at is not null
+       or new.matched_at is not null or new.match_result is not null or new.rejected_at is not null then
+      raise exception 'invoice_status_via_workflow' using errcode = 'insufficient_privilege',
+        hint = 'New invoices start as received; matching and approval set the status.';
+    end if;
+    return new;
+  end if;
+
+  if tg_op = 'DELETE' then
+    if old.status not in ('received', 'on_hold', 'matched')
+       or exists (select 1 from public.supplier_payment_allocations a where a.invoice_id = old.id) then
+      raise exception 'invoice_locked' using errcode = 'insufficient_privilege',
+        hint = 'Approved, paid or part-paid invoices cannot be deleted.';
+    end if;
+    return old;
+  end if;
+
+  if (new.status, new.approved_by, new.approved_at, new.invoice_ref, new.matched_at, new.matched_by,
+      new.match_result, new.rejected_by, new.rejected_at, new.rejection_reason)
+     is distinct from
+     (old.status, old.approved_by, old.approved_at, old.invoice_ref, old.matched_at, old.matched_by,
+      old.match_result, old.rejected_by, old.rejected_at, old.rejection_reason) then
+    raise exception 'invoice_status_via_workflow' using errcode = 'insufficient_privilege',
+      hint = 'Use matching, hold resolution, approval, rejection or payment to change an invoice''s status.';
+  end if;
+  if (new.supplier_id, new.purchase_order_id, new.supplier_invoice_number, new.invoice_date, new.due_date,
+      new.currency, new.subtotal_cents, new.tax_cents, new.discount_cents, new.delivery_fee_cents, new.total_cents)
+     is distinct from
+     (old.supplier_id, old.purchase_order_id, old.supplier_invoice_number, old.invoice_date, old.due_date,
+      old.currency, old.subtotal_cents, old.tax_cents, old.discount_cents, old.delivery_fee_cents, old.total_cents) then
+    if old.status in ('approved', 'partially_paid', 'paid', 'cancelled') then
+      raise exception 'invoice_locked' using errcode = 'insufficient_privilege',
+        hint = 'An approved, paid or cancelled invoice cannot be edited.';
+    end if;
+    if old.status in ('matched', 'on_hold') then
+      new.status := 'received';
+    end if;
+  end if;
+  return new;
+end $fn$;
+
+-- ── Matching v2 ─────────────────────────────────────────────────────────────
+create or replace function public.match_supplier_invoice(p_invoice_id uuid) returns jsonb
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_inv public.supplier_invoices; v_qty_tol numeric; v_price_tol numeric;
+  v_line record; v_po_supplier uuid; v_hdr_po_supplier uuid;
+  v_lines_total bigint; v_expected bigint; v_line_count int;
+  v_accepted numeric; v_qty_diff numeric; v_price_diff numeric; v_other_billed numeric;
+  v_holds jsonb := '[]'::jsonb; v_line_ok boolean; v_sitem_id uuid; v_old_price int;
+  v_result jsonb;
+begin
+  if not (app.has_perm('invoices.match') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select * into v_inv from public.supplier_invoices where id = p_invoice_id for update;
+  if not found then raise exception 'invoice_not_found' using errcode = 'no_data_found'; end if;
+  if v_inv.status not in ('received', 'on_hold', 'matched') then
+    raise exception 'not_matchable: invoice is %', v_inv.status using errcode = 'check_violation';
+  end if;
+
+  select qty_tolerance_pct, price_tolerance_pct into v_qty_tol, v_price_tol from public.purchasing_settings;
+  v_qty_tol := coalesce(v_qty_tol, 2); v_price_tol := coalesce(v_price_tol, 1);
+
+  update public.supplier_payment_holds
+     set status = 'resolved', resolved_at = now(), resolved_by = app.jwt_sub(), resolution_note = 'superseded by re-match'
+   where invoice_id = p_invoice_id and status = 'open';
+
+  -- Header: total arithmetic and PO supplier.
+  select coalesce(sum(line_total_cents), 0), count(*) into v_lines_total, v_line_count
+    from public.supplier_invoice_lines where invoice_id = p_invoice_id;
+  v_expected := v_lines_total + v_inv.tax_cents + v_inv.delivery_fee_cents - v_inv.discount_cents;
+  if v_line_count = 0 then
+    v_holds := v_holds || jsonb_build_object('kind', 'other', 'amount_cents', v_inv.total_cents,
+      'reason', 'Invoice has no lines to check');
+  elsif abs(v_inv.total_cents - v_expected) > greatest(1, round(v_expected * 0.001)) then
+    v_holds := v_holds || jsonb_build_object('kind', 'total', 'amount_cents', abs(v_inv.total_cents - v_expected),
+      'reason', format('Invoice total %s ≠ lines %s + tax %s + delivery %s − discount %s = %s',
+        v_inv.total_cents, v_lines_total, v_inv.tax_cents, v_inv.delivery_fee_cents, v_inv.discount_cents, v_expected));
+  end if;
+  if v_inv.purchase_order_id is not null then
+    select supplier_id into v_hdr_po_supplier from public.purchase_orders where id = v_inv.purchase_order_id;
+    if v_hdr_po_supplier is distinct from v_inv.supplier_id then
+      v_holds := v_holds || jsonb_build_object('kind', 'supplier', 'amount_cents', v_inv.total_cents,
+        'reason', 'The purchase order on this invoice belongs to a different supplier');
+    end if;
+  end if;
+
+  -- Lines.
+  for v_line in
+    select sil.id, sil.description, sil.qty, sil.unit_cost_cents, sil.line_total_cents, sil.po_line_id,
+           sil.inventory_item_id, pol.purchase_order_id as pol_po, pol.qty as po_qty, pol.received_qty,
+           pol.rejected_qty, pol.unit_cost_cents as po_price
+      from public.supplier_invoice_lines sil
+      left join public.purchase_order_lines pol on pol.id = sil.po_line_id
+     where sil.invoice_id = p_invoice_id
+     order by sil.description
+  loop
+    v_line_ok := true;
+    if v_line.po_line_id is null then
+      v_holds := v_holds || jsonb_build_object('kind', 'missing_po', 'amount_cents', v_line.line_total_cents,
+        'reason', format('%s: not linked to a purchase order line', v_line.description));
+      continue;
+    end if;
+
+    select po.supplier_id into v_po_supplier from public.purchase_orders po where po.id = v_line.pol_po;
+    if v_po_supplier is distinct from v_inv.supplier_id then
+      v_line_ok := false;
+      v_holds := v_holds || jsonb_build_object('kind', 'supplier', 'amount_cents', v_line.line_total_cents,
+        'reason', format('%s: its purchase order is with a different supplier', v_line.description));
+    end if;
+    if v_inv.purchase_order_id is not null and v_line.pol_po is distinct from v_inv.purchase_order_id then
+      v_line_ok := false;
+      v_holds := v_holds || jsonb_build_object('kind', 'po_mismatch', 'amount_cents', v_line.line_total_cents,
+        'reason', format('%s: belongs to a different purchase order than this invoice', v_line.description));
+    end if;
+
+    v_accepted := coalesce(v_line.received_qty, 0) - coalesce(v_line.rejected_qty, 0);
+    if coalesce(v_line.received_qty, 0) = 0 then
+      v_line_ok := false;
+      v_holds := v_holds || jsonb_build_object('kind', 'missing_grn', 'amount_cents', v_line.line_total_cents,
+        'reason', format('%s: nothing has been received yet (billed %s)', v_line.description, v_line.qty));
+    else
+      v_qty_diff := case when v_accepted > 0 then abs(v_line.qty - v_accepted) / v_accepted * 100 else 100 end;
+      if v_qty_diff > v_qty_tol then
+        v_line_ok := false;
+        v_holds := v_holds || jsonb_build_object('kind', 'quantity', 'amount_cents', v_line.line_total_cents,
+          'reason', format('%s: billed %s, accepted %s%s (%s%% difference)', v_line.description, v_line.qty, v_accepted,
+            case when coalesce(v_line.rejected_qty, 0) > 0 then format(' after %s rejected', v_line.rejected_qty) else '' end,
+            round(v_qty_diff, 1)));
+      end if;
+      select coalesce(sum(o.qty), 0) into v_other_billed
+        from public.supplier_invoice_lines o join public.supplier_invoices oi on oi.id = o.invoice_id
+       where o.po_line_id = v_line.po_line_id and o.invoice_id <> p_invoice_id and oi.status <> 'cancelled';
+      if v_other_billed > 0 and v_other_billed + v_line.qty > v_accepted * (1 + v_qty_tol / 100) then
+        v_line_ok := false;
+        v_holds := v_holds || jsonb_build_object('kind', 'duplicate', 'amount_cents', v_line.line_total_cents,
+          'reason', format('%s: %s already billed on other invoices; with this one %s of %s accepted',
+            v_line.description, v_other_billed, v_other_billed + v_line.qty, v_accepted));
+      end if;
+    end if;
+
+    v_price_diff := case when coalesce(v_line.po_price, 0) > 0
+      then abs(v_line.unit_cost_cents - v_line.po_price) / v_line.po_price::numeric * 100 else 100 end;
+    if v_price_diff > v_price_tol then
+      v_line_ok := false;
+      v_holds := v_holds || jsonb_build_object('kind', 'price', 'amount_cents', v_line.line_total_cents,
+        'reason', format('%s: billed %s per unit, PO price %s (%s%% difference)', v_line.description,
+          v_line.unit_cost_cents, coalesce(v_line.po_price, 0), round(v_price_diff, 1)));
+    end if;
+
+    -- A clean line confirms the supplier's current price.
+    if v_line_ok and v_line.inventory_item_id is not null then
+      select si.id, si.current_price_cents into v_sitem_id, v_old_price
+        from public.supplier_items si
+       where si.supplier_id = v_inv.supplier_id and si.inventory_item_id = v_line.inventory_item_id;
+      if v_sitem_id is not null and v_old_price is distinct from v_line.unit_cost_cents then
+        perform public.set_supplier_item_price(v_sitem_id, v_line.unit_cost_cents, 'invoice', p_invoice_id);
+      end if;
+    end if;
+  end loop;
+
+  insert into public.supplier_payment_holds (invoice_id, kind, reason, amount_cents, created_by)
+  select p_invoice_id, h->>'kind', h->>'reason', (h->>'amount_cents')::int, app.jwt_sub()
+    from jsonb_array_elements(v_holds) h;
+
+  v_result := jsonb_build_object(
+    'matched', jsonb_array_length(v_holds) = 0,
+    'holds', v_holds,
+    'lines_checked', v_line_count,
+    'invoice_total_cents', v_inv.total_cents,
+    'expected_total_cents', v_expected,
+    'unmatched_amount_cents', coalesce((select sum((h->>'amount_cents')::bigint) from jsonb_array_elements(v_holds) h), 0),
+    'qty_tolerance_pct', v_qty_tol, 'price_tolerance_pct', v_price_tol);
+
+  update public.supplier_invoices
+     set status = case when jsonb_array_length(v_holds) = 0 then 'matched'::app.invoice_status else 'on_hold'::app.invoice_status end,
+         matched_at = now(), matched_by = app.jwt_sub(), match_result = v_result
+   where id = p_invoice_id;
+
+  perform app.log_action('invoice.matched', 'supplier_invoices', p_invoice_id::text, null,
+    jsonb_build_object('matched', jsonb_array_length(v_holds) = 0, 'holds', jsonb_array_length(v_holds)));
+  return v_result;
+end $fn$;
+revoke all on function public.match_supplier_invoice(uuid) from public;
+grant execute on function public.match_supplier_invoice(uuid) to authenticated, service_role;
+
+-- ── Rejection ───────────────────────────────────────────────────────────────
+create or replace function public.reject_supplier_invoice(p_invoice_id uuid, p_reason text) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_inv public.supplier_invoices;
+begin
+  if not (app.has_perm('invoices.approve') or app.has_perm('payables.manage') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  select * into v_inv from public.supplier_invoices where id = p_invoice_id for update;
+  if not found then raise exception 'invoice_not_found' using errcode = 'no_data_found'; end if;
+  if v_inv.status not in ('received', 'on_hold', 'matched', 'approved')
+     or exists (select 1 from public.supplier_payment_allocations where invoice_id = p_invoice_id)
+     or exists (select 1 from public.supplier_credit_notes where invoice_id = p_invoice_id) then
+    raise exception 'not_rejectable: invoice has payments or credits, or is already %', v_inv.status
+      using errcode = 'check_violation';
+  end if;
+  update public.supplier_payment_holds
+     set status = 'resolved', resolved_at = now(), resolved_by = app.jwt_sub(), resolution_note = 'invoice rejected'
+   where invoice_id = p_invoice_id and status = 'open';
+  update public.supplier_invoices
+     set status = 'cancelled', rejected_by = app.jwt_sub(), rejected_at = now(), rejection_reason = trim(p_reason)
+   where id = p_invoice_id;
+  perform app.log_action('invoice.rejected', 'supplier_invoices', p_invoice_id::text,
+    jsonb_build_object('status', v_inv.status), jsonb_build_object('status', 'cancelled', 'reason', trim(p_reason)));
+end $fn$;
+revoke all on function public.reject_supplier_invoice(uuid, text) from public;
+grant execute on function public.reject_supplier_invoice(uuid, text) to authenticated, service_role;
+
+-- ── History for the detail screen ───────────────────────────────────────────
+create or replace function public.supplier_invoice_history(p_invoice_id uuid)
+returns table (at timestamptz, kind text, actor text, amount_cents bigint, detail text)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('invoices.view') or app.has_perm('invoices.create') or app.has_perm('invoices.match')
+          or app.has_perm('invoices.approve') or app.has_perm('payables.view') or app.has_perm('purchases.view')
+          or app.has_perm('finance.view') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+  with who as (select user_id, coalesce(nullif(full_name, ''), email) as name from public.memberships where user_id is not null),
+  ev as (
+    select i.created_at as at, 'created'::text as kind, i.created_by as by, i.total_cents::bigint as amt,
+           format('Invoice %s recorded', i.supplier_invoice_number) as detail
+      from public.supplier_invoices i where i.id = p_invoice_id
+    union all
+    select i.matched_at, case when i.status = 'on_hold' or (i.match_result->>'matched')::boolean is false then 'match_failed' else 'matched' end,
+           i.matched_by, null, format('%s line(s) checked, %s problem(s)', i.match_result->>'lines_checked',
+             jsonb_array_length(coalesce(i.match_result->'holds', '[]'::jsonb)))
+      from public.supplier_invoices i where i.id = p_invoice_id and i.matched_at is not null
+    union all
+    select h.created_at, 'hold', h.created_by, h.amount_cents::bigint, h.reason
+      from public.supplier_payment_holds h where h.invoice_id = p_invoice_id and coalesce(h.resolution_note, '') <> 'superseded by re-match'
+    union all
+    select h.resolved_at, 'hold_resolved', h.resolved_by, null, coalesce(h.resolution_note, 'resolved') || ' — ' || h.reason
+      from public.supplier_payment_holds h
+     where h.invoice_id = p_invoice_id and h.status = 'resolved' and h.resolution_note not in ('superseded by re-match', 'invoice rejected')
+    union all
+    select i.approved_at, 'approved', i.approved_by, i.total_cents::bigint, 'Approved for payment'
+      from public.supplier_invoices i where i.id = p_invoice_id and i.approved_at is not null
+    union all
+    select i.rejected_at, 'rejected', i.rejected_by, null, i.rejection_reason
+      from public.supplier_invoices i where i.id = p_invoice_id and i.rejected_at is not null
+    union all
+    select sp.paid_at, 'payment', sp.created_by, a.amount_cents::bigint,
+           concat_ws(' · ', replace(sp.method, '_', ' '), nullif(sp.reference, ''))
+      from public.supplier_payment_allocations a join public.supplier_payments sp on sp.id = a.payment_id
+     where a.invoice_id = p_invoice_id
+    union all
+    select c.created_at, 'credit_note', c.created_by, c.amount_cents::bigint, c.reason
+      from public.supplier_credit_notes c where c.invoice_id = p_invoice_id
+  )
+  select ev.at, ev.kind, coalesce(w.name, case when ev.by is null then 'System' else 'Staff member' end), ev.amt, ev.detail
+    from ev left join who w on w.user_id = ev.by
+   where ev.at is not null
+   order by ev.at, ev.kind;
+end $fn$;
+revoke all on function public.supplier_invoice_history(uuid) from public;
+grant execute on function public.supplier_invoice_history(uuid) to authenticated, service_role;
+
+-- ============================================================================
+-- 0090_match_duplicate_scope.sql — follow-up to 0089
+-- "Already billed" counts only invoices that were accepted (matched, approved,
+-- part-paid or paid). Counting unchecked or on-hold invoices too meant the
+-- first, legitimate invoice was flagged as a duplicate as soon as a second
+-- one for the same goods was keyed in.
+-- ============================================================================
+do $$
+declare v_def text; v_new text;
+begin
+  v_def := pg_get_functiondef('public.match_supplier_invoice(uuid)'::regprocedure);
+  v_new := replace(v_def,
+    'where o.po_line_id = v_line.po_line_id and o.invoice_id <> p_invoice_id and oi.status <> ''cancelled'';',
+    'where o.po_line_id = v_line.po_line_id and o.invoice_id <> p_invoice_id
+         and oi.status in (''matched'', ''approved'', ''partially_paid'', ''paid'');');
+  if v_new = v_def then
+    if position('oi.status in (''matched''' in v_def) = 0 then
+      raise exception 'match_supplier_invoice duplicate filter not found — patch it by hand';
+    end if;
+  else
+    execute v_new;
+  end if;
+end $$;
+
+-- ============================================================================
+-- 0091_supplier_invoice_import.sql — Finance Phase E (AI invoice reading)
+-- Drafts produced when the AI reads a supplier's invoice (PDF, scan, photo
+-- or text). A draft is only a proposal: a person reviews and corrects it,
+-- and creating the invoice from it is a separate step that lands the
+-- invoice as 'received' — it still has to pass the 3-way match and approval.
+-- The API writes drafts with the service role; the app may only read them.
+-- ============================================================================
+create table if not exists public.supplier_invoice_import_drafts (
+  id              uuid primary key default gen_random_uuid(),
+  source_filename text not null,
+  storage_path    text not null,
+  extracted_json  jsonb not null,
+  draft_json      jsonb not null,
+  status          text not null default 'ready_for_review'
+                    check (status in ('ready_for_review', 'applied', 'rejected', 'failed')),
+  error           text,
+  invoice_id      uuid references public.supplier_invoices(id) on delete set null,
+  created_by      uuid,
+  created_at      timestamptz not null default now(),
+  applied_at      timestamptz,
+  applied_by      uuid
+);
+create index if not exists supplier_invoice_import_drafts_created_idx
+  on public.supplier_invoice_import_drafts (created_at desc);
+
+alter table public.supplier_invoice_import_drafts enable row level security;
+drop policy if exists staff_read on public.supplier_invoice_import_drafts;
+create policy staff_read on public.supplier_invoice_import_drafts for select using (
+  app.has_perm('invoices.create') or app.has_perm('invoices.view') or app.can_write());
+revoke insert, update, delete on public.supplier_invoice_import_drafts from anon, authenticated;
+
+-- ============================================================================
+-- 0092_cash_and_day_close.sql — Finance Phase F (cash management, day close)
+--
+-- 1. cash_movements: pay-ins, pay-outs, bank drops and adjustments to the
+--    drawer, each with a reason. Written only by record_cash_movement();
+--    never edited — a mistake is corrected with an adjustment.
+-- 2. Expected cash = opening float + cash sales (net of refunds) + movements,
+--    used by cash counts and by the day close.
+-- 3. day_close_preview(): everything the close screen shows — sales, tax,
+--    payments by method, the cash drawer, expenses and supplier payments of
+--    the day, and unresolved exceptions.
+-- 4. close_business_day(): refuses future days and already-closed days,
+--    needs a reason when counted cash differs from expected, and stores the
+--    full summary. reopen_business_day() needs a reason.
+-- 5. A closed day is locked: no new/edited expenses, cash counts or cash
+--    movements dated that day, and no voids, price changes or deletions of
+--    that day's completed sales or their payments. Refunds stay possible
+--    (they are recorded on the day they happen); workflow steps on expenses
+--    (approve / pay / void) stay possible and are audited.
+-- ============================================================================
+
+-- ── 1. Cash movements ───────────────────────────────────────────────────────
+create table if not exists public.cash_movements (
+  id            uuid primary key default gen_random_uuid(),
+  business_date date not null,
+  kind          text not null check (kind in ('pay_in', 'pay_out', 'bank_drop', 'adjustment')),
+  amount_cents  int not null,
+  signed_cents  int generated always as (
+                  case when kind in ('pay_out', 'bank_drop') then -abs(amount_cents)
+                       when kind = 'pay_in' then abs(amount_cents)
+                       else amount_cents end) stored,
+  reason        text not null check (length(trim(reason)) > 0),
+  reference     text,
+  created_by    uuid,
+  created_at    timestamptz not null default now(),
+  check ((kind = 'adjustment' and amount_cents <> 0) or (kind <> 'adjustment' and amount_cents > 0))
+);
+create index if not exists cash_movements_date_idx on public.cash_movements (business_date desc, created_at desc);
+alter table public.cash_movements enable row level security;
+drop policy if exists staff_read on public.cash_movements;
+create policy staff_read on public.cash_movements for select using (
+  app.has_perm('finance.view') or app.has_perm('finance.reconcile') or app.has_perm('cash.manage')
+  or app.has_perm('finance.close_day') or app.can_write());
+revoke insert, update, delete, truncate on public.cash_movements from anon, authenticated;
+drop trigger if exists audit on public.cash_movements;
+create trigger audit after insert or update or delete on public.cash_movements
+  for each row execute function app.audit_row();
+drop trigger if exists ledger_no_update on public.cash_movements;
+create trigger ledger_no_update before update or delete on public.cash_movements
+  for each row execute function app.ledger_immutable();
+
+insert into public.permission_catalog (key, grp, label, type, risk_level) values
+  ('cash.manage', 'Finance', 'Record cash drawer pay-ins, pay-outs and bank drops', 'write', 'high')
+on conflict (key) do update set grp = excluded.grp, label = excluded.label, type = excluded.type, risk_level = excluded.risk_level;
+
+create or replace function app.day_cash_movements(p_date date) returns int
+language sql stable set search_path = public, app as $fn$
+  select coalesce(sum(signed_cents), 0)::int from public.cash_movements where business_date = p_date
+$fn$;
+
+create or replace function app.is_day_closed(p_date date) returns boolean
+language sql stable set search_path = public, app as $fn$
+  select p_date is not null and exists (select 1 from public.daily_closings where business_date = p_date and status = 'closed')
+$fn$;
+
+create or replace function public.record_cash_movement(
+  p_business_date date, p_kind text, p_amount_cents int, p_reason text, p_reference text default null
+) returns public.cash_movements
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_row public.cash_movements;
+begin
+  if not (app.has_perm('cash.manage') or app.has_perm('finance.reconcile')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  if p_business_date > app.business_day(now()) then raise exception 'future_day' using errcode = 'check_violation'; end if;
+  insert into public.cash_movements (business_date, kind, amount_cents, reason, reference, created_by)
+  values (coalesce(p_business_date, app.business_day(now())), p_kind, p_amount_cents, trim(p_reason), nullif(trim(p_reference), ''), app.jwt_sub())
+  returning * into v_row;
+  perform app.log_action('cash.movement', 'cash_movements', v_row.id::text, null,
+    jsonb_build_object('kind', p_kind, 'amount_cents', v_row.signed_cents, 'reason', trim(p_reason), 'business_date', v_row.business_date));
+  return v_row;
+end $fn$;
+revoke all on function public.record_cash_movement(date, text, int, text, text) from public;
+grant execute on function public.record_cash_movement(date, text, int, text, text) to authenticated, service_role;
+
+create or replace function app.ledger_on_cash_movement() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  perform app.ledger_post('CASH_MOVEMENT', 'cash', sign(new.signed_cents)::smallint, abs(new.signed_cents)::bigint, new.created_at,
+    'cash_movements', new.id, new.business_date, null, null, 'cash',
+    jsonb_build_object('kind', new.kind, 'reason', new.reason, 'reference', new.reference));
+  return null;
+end $fn$;
+drop trigger if exists ledger_sync on public.cash_movements;
+create trigger ledger_sync after insert on public.cash_movements
+  for each row execute function app.ledger_on_cash_movement();
+
+-- ── 2. Expected cash includes movements ─────────────────────────────────────
+create or replace function public.record_cash_count(
+  p_business_date date, p_opening_cents int, p_counted_cents int, p_note text default null
+) returns public.cash_counts language plpgsql security definer set search_path = public, app as $fn$
+declare v_expected int; v_row public.cash_counts;
+begin
+  if not app.has_perm('finance.reconcile') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_counted_cents, -1) < 0 or coalesce(p_opening_cents, 0) < 0 then
+    raise exception 'bad_amount' using errcode = 'check_violation';
+  end if;
+  v_expected := coalesce(p_opening_cents, 0)
+              + coalesce((app.day_sales(p_business_date)->>'cash_in_cents')::int, 0)
+              + app.day_cash_movements(p_business_date);
+  insert into public.cash_counts
+    (business_date, opening_cents, counted_cents, expected_cents, difference_cents, note, counted_by, counted_by_email)
+  values
+    (p_business_date, coalesce(p_opening_cents, 0), p_counted_cents, v_expected, p_counted_cents - v_expected,
+     nullif(trim(p_note), ''), app.jwt_sub(),
+     nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'email')
+  returning * into v_row;
+  perform app.log_action('cash.counted', 'cash_counts', v_row.id::text, null,
+                         jsonb_build_object('counted', p_counted_cents, 'expected', v_expected));
+  return v_row;
+end $fn$;
+revoke all on function public.record_cash_count(date, int, int, text) from public;
+grant execute on function public.record_cash_count(date, int, int, text) to authenticated, service_role;
+
+-- ── 3. Close preview ────────────────────────────────────────────────────────
+alter table public.daily_closings
+  add column if not exists cash_movements_cents int not null default 0,
+  add column if not exists summary jsonb;
+
+create or replace function public.day_close_preview(p_business_date date, p_opening_cents int default 0)
+returns jsonb language plpgsql stable security definer set search_path = public, app as $fn$
+declare
+  v_s jsonb; v_mov int; v_tax bigint; v_mix jsonb; v_exp jsonb; v_supp jsonb; v_count jsonb;
+  v_open_orders int; v_unpaid jsonb; v_awaiting int; v_holds int; v_closing public.daily_closings;
+begin
+  if not (app.has_perm('finance.close_day') or app.has_perm('finance.view') or app.has_perm('finance.reconcile')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  v_s := app.day_sales(p_business_date);
+  v_mov := app.day_cash_movements(p_business_date);
+
+  with o as (
+    select * from public.orders
+     where status in ('served', 'paid') and app.business_day(coalesce(paid_at, created_at)) = p_business_date
+  )
+  select coalesce(sum(tax_cents), 0) into v_tax from o;
+
+  with o as (
+    select id from public.orders
+     where status in ('served', 'paid') and app.business_day(coalesce(paid_at, created_at)) = p_business_date
+  )
+  select coalesce(jsonb_object_agg(method, cents), '{}'::jsonb) into v_mix
+    from (select p.method, sum(p.amount_cents - p.refunded_cents)::bigint as cents
+            from public.payments p join o on o.id = p.order_id
+           where p.status <> 'voided' group by p.method) x;
+
+  select jsonb_build_object('count', count(*), 'cents', coalesce(sum(amount_cents), 0)) into v_exp
+    from public.expenses where expense_date = p_business_date and status in ('approved', 'paid');
+  select jsonb_build_object('count', count(*), 'cents', coalesce(sum(amount_cents), 0)) into v_supp
+    from public.supplier_payments where app.business_day(paid_at) = p_business_date;
+  select to_jsonb(c) - 'counted_by' into v_count from public.cash_counts c
+   where c.business_date = p_business_date order by c.created_at desc limit 1;
+
+  select count(*) into v_open_orders from public.orders
+   where status in ('pending', 'in_kitchen', 'ready') and app.business_day(created_at) = p_business_date;
+  select jsonb_build_object('count', count(*), 'cents', coalesce(sum(due), 0)) into v_unpaid
+    from (select o.total_cents - coalesce((select sum(p.amount_cents - p.refunded_cents) from public.payments p
+                                            where p.order_id = o.id and p.status <> 'voided'), 0) as due
+            from public.orders o
+           where o.status = 'served' and app.business_day(coalesce(o.paid_at, o.created_at)) = p_business_date) u
+   where due > 0;
+  select count(*) into v_awaiting from public.expenses where expense_date = p_business_date and status in ('draft', 'submitted');
+  select count(*) into v_holds from public.supplier_payment_holds where status = 'open';
+  select * into v_closing from public.daily_closings where business_date = p_business_date;
+
+  return jsonb_build_object(
+    'business_date', p_business_date,
+    'status', coalesce(v_closing.status, 'open'),
+    'is_future', p_business_date > app.business_day(now()),
+    'sales', v_s || jsonb_build_object('tax_cents', v_tax),
+    'payments_by_method', v_mix,
+    'cash', jsonb_build_object(
+      'opening_cents', coalesce(p_opening_cents, 0),
+      'cash_sales_cents', coalesce((v_s->>'cash_in_cents')::int, 0),
+      'movements_cents', v_mov,
+      'expected_cents', coalesce(p_opening_cents, 0) + coalesce((v_s->>'cash_in_cents')::int, 0) + v_mov,
+      'last_count', v_count),
+    'expenses', v_exp,
+    'supplier_payments', v_supp,
+    'exceptions', jsonb_build_object(
+      'open_orders', v_open_orders,
+      'unpaid_served_orders', v_unpaid,
+      'expenses_awaiting_approval', v_awaiting,
+      'invoice_holds_open', v_holds)
+  );
+end $fn$;
+revoke all on function public.day_close_preview(date, int) from public;
+grant execute on function public.day_close_preview(date, int) to authenticated, service_role;
+
+-- ── 4. Close / reopen ───────────────────────────────────────────────────────
+create or replace function public.close_business_day(
+  p_business_date date, p_opening_cash int default 0,
+  p_closing_cash int default null, p_note text default null
+) returns public.daily_closings
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_p jsonb; v_s jsonb; v_mov int; v_expected int; v_diff int; v_row public.daily_closings;
+begin
+  if not app.has_perm('finance.close_day') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_business_date > app.business_day(now()) then
+    raise exception 'future_day: % has not happened yet', p_business_date using errcode = 'check_violation';
+  end if;
+  if app.is_day_closed(p_business_date) then
+    raise exception 'already_closed: reopen % first', p_business_date using errcode = 'check_violation';
+  end if;
+  if coalesce(p_opening_cash, 0) < 0 or coalesce(p_closing_cash, 0) < 0 then
+    raise exception 'bad_amount' using errcode = 'check_violation';
+  end if;
+
+  v_p := public.day_close_preview(p_business_date, coalesce(p_opening_cash, 0));
+  v_s := app.day_sales(p_business_date);
+  v_mov := app.day_cash_movements(p_business_date);
+  v_expected := coalesce(p_opening_cash, 0) + (v_s->>'cash_in_cents')::int + v_mov;
+  v_diff := case when p_closing_cash is null then null else p_closing_cash - v_expected end;
+  if v_diff is not null and v_diff <> 0 and coalesce(trim(p_note), '') = '' then
+    raise exception 'variance_reason_required: counted cash differs from expected by %', v_diff using errcode = 'check_violation';
+  end if;
+
+  insert into public.daily_closings (
+    business_date, status, opening_cash_cents, closing_cash_cents, expected_cash_cents,
+    difference_cents, gross_sales_cents, discounts_cents, refunds_cents, net_sales_cents,
+    order_count, cash_movements_cents, summary, note, closed_by, closed_at
+  ) values (
+    p_business_date, 'closed', coalesce(p_opening_cash, 0), p_closing_cash, v_expected, v_diff,
+    (v_s->>'gross_sales_cents')::int, (v_s->>'discounts_cents')::int, (v_s->>'refunds_cents')::int,
+    (v_s->>'net_sales_cents')::int, (v_s->>'order_count')::int, v_mov, v_p,
+    nullif(trim(p_note), ''), app.jwt_sub(), now()
+  )
+  on conflict (business_date) do update set
+    status = 'closed', opening_cash_cents = excluded.opening_cash_cents,
+    closing_cash_cents = excluded.closing_cash_cents, expected_cash_cents = excluded.expected_cash_cents,
+    difference_cents = excluded.difference_cents, gross_sales_cents = excluded.gross_sales_cents,
+    discounts_cents = excluded.discounts_cents, refunds_cents = excluded.refunds_cents,
+    net_sales_cents = excluded.net_sales_cents, order_count = excluded.order_count,
+    cash_movements_cents = excluded.cash_movements_cents, summary = excluded.summary,
+    note = coalesce(excluded.note, public.daily_closings.note),
+    closed_by = excluded.closed_by, closed_at = now()
+  returning * into v_row;
+
+  perform app.log_action('day.closed', 'daily_closings', p_business_date::text, null,
+    to_jsonb(v_row) - 'summary');
+  return v_row;
+end $fn$;
+revoke all on function public.close_business_day(date, int, int, text) from public;
+grant execute on function public.close_business_day(date, int, int, text) to authenticated, service_role;
+
+create or replace function public.reopen_business_day(p_business_date date, p_reason text)
+returns void language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not app.has_perm('finance.reopen_day') then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  update public.daily_closings
+     set status = 'open', reopened_by = app.jwt_sub(), reopened_at = now(),
+         note = trim(p_reason)
+   where business_date = p_business_date and status = 'closed';
+  if not found then raise exception 'not_closed' using errcode = 'no_data_found'; end if;
+  perform app.log_action('day.reopened', 'daily_closings', p_business_date::text, null,
+                         jsonb_build_object('reason', trim(p_reason)));
+end $fn$;
+revoke all on function public.reopen_business_day(date, text) from public;
+grant execute on function public.reopen_business_day(date, text) to authenticated, service_role;
+
+-- ── 5. Closed days are locked ───────────────────────────────────────────────
+create or replace function app.guard_closed_day() returns trigger
+language plpgsql set search_path = public, app as $fn$
+declare v_day date;
+begin
+  case tg_table_name
+  when 'expenses' then
+    if tg_op = 'INSERT' and app.is_day_closed(new.expense_date) then v_day := new.expense_date;
+    elsif tg_op = 'DELETE' and app.is_day_closed(old.expense_date) then v_day := old.expense_date;
+    elsif tg_op = 'UPDATE'
+      and (new.category, new.description, new.amount_cents, new.expense_date, new.supplier_id, new.vendor)
+          is distinct from (old.category, old.description, old.amount_cents, old.expense_date, old.supplier_id, old.vendor) then
+      if app.is_day_closed(old.expense_date) then v_day := old.expense_date;
+      elsif app.is_day_closed(new.expense_date) then v_day := new.expense_date; end if;
+    end if;
+  when 'cash_counts' then
+    if app.is_day_closed(new.business_date) then v_day := new.business_date; end if;
+  when 'cash_movements' then
+    if app.is_day_closed(new.business_date) then v_day := new.business_date; end if;
+  when 'payments' then
+    if tg_op = 'INSERT' then
+      if app.is_day_closed(app.business_day(new.created_at)) then v_day := app.business_day(new.created_at); end if;
+    elsif tg_op = 'DELETE' then
+      if app.is_day_closed(app.business_day(old.created_at)) then v_day := app.business_day(old.created_at); end if;
+    elsif (new.amount_cents is distinct from old.amount_cents
+           or (new.status = 'voided' and old.status is distinct from 'voided'))
+          and app.is_day_closed(app.business_day(old.created_at)) then
+      v_day := app.business_day(old.created_at);
+    end if;
+  when 'orders' then
+    if tg_op = 'DELETE' then
+      if old.status in ('served', 'paid') and app.is_day_closed(app.business_day(coalesce(old.paid_at, old.created_at))) then
+        v_day := app.business_day(coalesce(old.paid_at, old.created_at));
+      end if;
+    elsif old.status in ('served', 'paid')
+          and (new.status = 'void' or new.subtotal_cents is distinct from old.subtotal_cents
+               or new.discount_cents is distinct from old.discount_cents or new.total_cents is distinct from old.total_cents)
+          and app.is_day_closed(app.business_day(coalesce(old.paid_at, old.created_at))) then
+      v_day := app.business_day(coalesce(old.paid_at, old.created_at));
+    end if;
+  end case;
+  if v_day is not null then
+    raise exception 'day_closed: % is closed', v_day using errcode = 'insufficient_privilege',
+      hint = 'Reopen the day with a reason, or record the correction on an open day (a refund is always allowed).';
+  end if;
+  return coalesce(new, old);
+end $fn$;
+
+do $$
+declare t text;
+begin
+  foreach t in array array['expenses', 'cash_counts', 'cash_movements', 'payments', 'orders'] loop
+    execute format('drop trigger if exists guard_closed_day on public.%I', t);
+    execute format(
+      'create trigger guard_closed_day before insert or update or delete on public.%I for each row execute function app.guard_closed_day()', t);
+  end loop;
+end $$;
+
+-- ============================================================================
+-- 0093_day_close_cash_access.sql — follow-up to 0092
+-- A portal granted only "Record cash drawer pay-ins, pay-outs and bank drops"
+-- (cash.manage) needs the day's expected cash and the closing history to do
+-- that job, so it may read the close preview and daily closings too.
+-- ============================================================================
+do $$
+declare v_def text; v_new text;
+begin
+  v_def := pg_get_functiondef('public.day_close_preview(date, integer)'::regprocedure);
+  v_new := replace(v_def,
+    'if not (app.has_perm(''finance.close_day'') or app.has_perm(''finance.view'') or app.has_perm(''finance.reconcile'')) then',
+    'if not (app.has_perm(''finance.close_day'') or app.has_perm(''finance.view'') or app.has_perm(''finance.reconcile'') or app.has_perm(''cash.manage'')) then');
+  if v_new = v_def then
+    if position('app.has_perm(''cash.manage'')' in v_def) = 0 then
+      raise exception 'day_close_preview permission check not found — patch it by hand';
+    end if;
+  else
+    execute v_new;
+  end if;
+end $$;
+
+drop policy if exists staff_read on public.daily_closings;
+create policy staff_read on public.daily_closings for select using (
+  app.has_perm('finance.view') or app.has_perm('finance.close_day') or app.has_perm('finance.reopen_day')
+  or app.has_perm('finance.reconcile') or app.has_perm('cash.manage') or app.can_write());
+
+-- ── 0094_finance_overview.sql ──
+-- ============================================================================
+-- 0094_finance_overview.sql — Finance Phase G (overview, food cost, aging)
+--   food_cost_target_bps   the restaurant's target food cost (default 30%)
+--   set_food_cost_target() change it (finance.manage_costs / owner-manager)
+--   food_cost_watch()      every menu recipe: price, current cost, food cost
+--                          %, the cost N days ago, change in points, and
+--                          whether it is over target or rising
+--   payables_aging()       outstanding approved supplier invoices by supplier
+--                          in current / 1-30 / 31-60 / 61-90 / 90+ days overdue
+-- ============================================================================
+
+alter table public.business_settings
+  add column if not exists food_cost_target_bps int not null default 3000;
+do $$ begin
+  if not exists (select 1 from pg_constraint where conname = 'business_settings_food_cost_target_check') then
+    alter table public.business_settings add constraint business_settings_food_cost_target_check
+      check (food_cost_target_bps between 100 and 9000);
+  end if;
+end $$;
+
+create or replace function public.set_food_cost_target(p_pct numeric) returns int
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_old int; v_new int := round(coalesce(p_pct, 0) * 100);
+begin
+  if not (app.has_perm('finance.manage_costs') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if v_new < 100 or v_new > 9000 then
+    raise exception 'bad_target: use a percentage between 1 and 90' using errcode = 'check_violation';
+  end if;
+  select food_cost_target_bps into v_old from public.business_settings limit 1;
+  update public.business_settings set food_cost_target_bps = v_new where id;
+  perform app.log_action('finance.food_cost_target', 'business_settings', 'food_cost_target_bps',
+    jsonb_build_object('pct', v_old / 100.0), jsonb_build_object('pct', v_new / 100.0));
+  return v_new;
+end $fn$;
+revoke all on function public.set_food_cost_target(numeric) from public;
+grant execute on function public.set_food_cost_target(numeric) to authenticated, service_role;
+
+create or replace function public.food_cost_watch(p_days int default 30)
+returns table (
+  recipe_id uuid, name text, menu_item_id uuid, variant_id uuid,
+  price_cents int, cost_cents int, food_cost_pct numeric,
+  previous_cost_cents int, previous_food_cost_pct numeric, change_pts numeric,
+  target_pct numeric, over_target boolean, rising boolean
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+declare v_target numeric;
+begin
+  if not (app.has_perm('finance.view_cogs') or app.has_perm('finance.view_profit') or app.has_perm('inventory.view_cost')
+          or app.has_perm('finance.manage_costs')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  select coalesce(food_cost_target_bps, 3000) / 100.0 into v_target from public.business_settings limit 1;
+  v_target := coalesce(v_target, 30);
+  return query
+  with r as (
+    select rc.id, rc.name, rc.menu_item_id, rc.variant_id, rc.current_version_id,
+           coalesce(
+             (select mv.price_cents from public.menu_variants mv where mv.id = rc.variant_id),
+             (select mv.price_cents from public.menu_variants mv where mv.menu_item_id = rc.menu_item_id
+               order by mv.sort_order, mv.created_at limit 1),
+             (select mi.price_cents from public.menu_items mi where mi.id = rc.menu_item_id)
+           ) as price,
+           public.recipe_version_cost_per_yield_unit(rc.current_version_id) as cost_now,
+           coalesce(
+             (select l.cost_cents from public.recipe_cost_log l
+               where l.recipe_version_id = rc.current_version_id and l.recorded_at <= now() - make_interval(days => greatest(p_days, 1))
+               order by l.recorded_at desc limit 1),
+             (select l.cost_cents from public.recipe_cost_log l
+               where l.recipe_version_id = rc.current_version_id order by l.recorded_at limit 1)
+           ) as cost_then
+      from public.recipes rc
+     where rc.recipe_type in ('menu_item', 'variant') and rc.status = 'active' and rc.current_version_id is not null
+  )
+  select r.id, r.name, r.menu_item_id, r.variant_id, r.price::int, r.cost_now::int,
+         case when r.price > 0 then round(r.cost_now::numeric / r.price * 1000) / 10 end,
+         r.cost_then::int,
+         case when r.price > 0 and r.cost_then is not null then round(r.cost_then::numeric / r.price * 1000) / 10 end,
+         case when r.price > 0 and r.cost_then is not null then round((r.cost_now - r.cost_then)::numeric / r.price * 1000) / 10 end,
+         v_target,
+         r.price > 0 and r.cost_now::numeric / r.price * 100 > v_target,
+         r.cost_then is not null and r.cost_now > r.cost_then
+    from r
+   order by case when r.price > 0 then r.cost_now::numeric / r.price else 0 end desc;
+end $fn$;
+revoke all on function public.food_cost_watch(int) from public;
+grant execute on function public.food_cost_watch(int) to authenticated, service_role;
+
+create or replace function public.payables_aging()
+returns table (
+  supplier_id uuid, supplier_name text, invoices int,
+  current_cents bigint, d1_30_cents bigint, d31_60_cents bigint, d61_90_cents bigint, d90_plus_cents bigint,
+  total_cents bigint
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('payables.view') or app.has_perm('payables.manage') or app.has_perm('finance.view') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+  with o as (
+    select i.supplier_id as sid, app.invoice_outstanding_cents(i.id)::bigint as amt,
+           (app.business_day(now()) - coalesce(i.due_date, i.invoice_date)) as late
+      from public.supplier_invoices i
+     where i.status in ('approved', 'partially_paid')
+  )
+  select s.id, s.name, count(*)::int,
+         coalesce(sum(o.amt) filter (where o.late <= 0), 0)::bigint,
+         coalesce(sum(o.amt) filter (where o.late between 1 and 30), 0)::bigint,
+         coalesce(sum(o.amt) filter (where o.late between 31 and 60), 0)::bigint,
+         coalesce(sum(o.amt) filter (where o.late between 61 and 90), 0)::bigint,
+         coalesce(sum(o.amt) filter (where o.late > 90), 0)::bigint,
+         coalesce(sum(o.amt), 0)::bigint
+    from o join public.suppliers s on s.id = o.sid
+   where o.amt > 0
+   group by s.id, s.name
+   order by sum(o.amt) desc;
+end $fn$;
+revoke all on function public.payables_aging() from public;
+grant execute on function public.payables_aging() to authenticated, service_role;
+
+-- ── 0095_invoice_approval_only.sql ──
+-- ============================================================================
+-- 0095 — Approving (or rejecting) a supplier invoice needs invoices.approve.
+--
+-- 0083 / 0089 also let payables.manage approve and reject, for compatibility.
+-- That let the person who pays suppliers approve their own bills. Now only
+-- invoices.approve (or an owner / manager, via app.can_write()) can; paying
+-- stays payables.record_payment. The function bodies are otherwise unchanged
+-- — only the permission line is rewritten.
+--
+-- Affected on 2026-10-08: the built-in Accountant role (payables.manage, no
+-- invoices.approve) in every reachable restaurant — accountants still record
+-- payments; approval moves to owners, managers or an explicit grant.
+-- ============================================================================
+
+do $mig$
+declare
+  fn text;
+  def text;
+  old_check constant text := $c$app.has_perm('invoices.approve') or app.has_perm('payables.manage') or app.can_write()$c$;
+  new_check constant text := $c$app.has_perm('invoices.approve') or app.can_write()$c$;
+begin
+  foreach fn in array array['public.approve_supplier_invoice(uuid)', 'public.reject_supplier_invoice(uuid, text)'] loop
+    def := pg_get_functiondef(fn::regprocedure);
+    if position(old_check in def) > 0 then
+      execute replace(def, old_check, new_check);
+    elsif position(new_check in def) = 0 then
+      raise exception '0095: unexpected permission check in %', fn;
+    end if;
+  end loop;
+end $mig$;
+
+update public.permission_catalog
+   set label = 'Approve or reject matched supplier invoices (separate from paying them)'
+ where key = 'invoices.approve';
+
+-- ── 0096_low_stock_reorder_fix.sql ──
+-- ============================================================================
+-- 0096 — Low-stock reorder emails stopped sending.
+--
+-- 0082 rewrote pending_low_stock_reorders() to pick each item's supplier
+-- "order by si.is_preferred desc, si.created_at asc", but supplier_items has
+-- no created_at column. The function raised "column si.created_at does not
+-- exist" on every call, the cron sweep logged it and moved on, and no reorder
+-- email has been sent since. Order by updated_at (then id, for a stable pick)
+-- instead; nothing else in the function changes.
+-- ============================================================================
+
+do $mig$
+declare
+  def text := pg_get_functiondef('public.pending_low_stock_reorders()'::regprocedure);
+  old_order constant text := 'order by si.is_preferred desc, si.created_at asc';
+  new_order constant text := 'order by si.is_preferred desc, si.updated_at asc, si.id';
+begin
+  if position(old_order in def) > 0 then
+    execute replace(def, old_order, new_order);
+  elsif position(new_order in def) = 0 then
+    raise exception '0096: unexpected supplier ordering in pending_low_stock_reorders()';
+  end if;
+end $mig$;
+
+-- ── 0097_restaurant_currency.sql ──
+-- ============================================================================
+-- 0097 — The restaurant's currency.
+--
+-- business_settings.currency_code has existed since the start (default USD)
+-- and the ledger already copies it onto every financial_events row, but no
+-- screen let anyone change it and nothing read it. This adds:
+--   • get_currency()  — the code, readable by anyone (the guest menu and the
+--     login page format prices too; a currency code is not sensitive)
+--   • set_currency()  — settings.update (or owner/manager), from the same list
+--     the app offers, audited. It changes how amounts are SHOWN; nothing is
+--     converted. Only two-decimal currencies, because amounts are stored in
+--     hundredths.
+-- ============================================================================
+
+update public.business_settings set currency_code = upper(trim(currency_code))
+ where currency_code is distinct from upper(trim(currency_code));
+
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'business_settings_currency_code_format') then
+    alter table public.business_settings
+      add constraint business_settings_currency_code_format check (currency_code ~ '^[A-Z]{3}$');
+  end if;
+end $$;
+
+create or replace function public.get_currency() returns text
+language sql stable security definer set search_path = public as $fn$
+  select coalesce((select currency_code from public.business_settings where id = true), 'USD')
+$fn$;
+revoke all on function public.get_currency() from public;
+grant execute on function public.get_currency() to anon, authenticated, service_role;
+
+create or replace function public.set_currency(p_code text) returns text
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_code text := upper(trim(coalesce(p_code, '')));
+  v_old text;
+begin
+  if not (app.has_perm('settings.update') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  -- Keep in step with packages/shared/src/currency.ts (two-decimal currencies only).
+  if v_code not in ('PKR','USD','EUR','GBP','AED','SAR','QAR','INR','BDT','LKR','NPR','AFN',
+                    'MYR','SGD','THB','TRY','EGP','NGN','KES','ZAR','CAD','AUD','NZD','CNY') then
+    raise exception 'unsupported_currency' using errcode = 'check_violation';
+  end if;
+  select currency_code into v_old from public.business_settings where id = true;
+  update public.business_settings set currency_code = v_code where id = true;
+  if v_old is distinct from v_code then
+    perform app.log_action('settings.currency_changed', 'business_settings', 'currency_code',
+      jsonb_build_object('currency_code', v_old), jsonb_build_object('currency_code', v_code));
+  end if;
+  return v_code;
+end $fn$;
+revoke all on function public.set_currency(text) from public;
+grant execute on function public.set_currency(text) to authenticated, service_role;
+
+-- ── 0098_branches_foundation.sql ──
+-- ============================================================================
+-- 0098 — Multi-branch, phase 1: the foundation.
+--
+-- The restaurant (this database) is the organization; its physical locations
+-- are rows in public.branches. Every location-bound record gets branch_id.
+--
+--   • One default branch ('MAIN') is created per restaurant. Every existing
+--     row belongs to it — the restaurant had exactly one location, so this is
+--     the true assignment, not an arbitrary one. A row inserted without a
+--     branch inherits it from its parent (payment ← order, invoice ← PO, …)
+--     or falls back to the default branch (head-office costs go to it too), so every existing screen and
+--     function keeps working unchanged for single-branch restaurants.
+--   • Access: the owner (and any '*' login) sees every branch. A portal or
+--     member login may be limited to a list of branches (empty = all).
+--     RESTRICTIVE row-level policies on every branch-bound table AND that
+--     limit onto the existing policies — they can only narrow access.
+--   • Branches are never deleted: inactive / archived instead (history stays).
+--   • More than one active branch needs the 'branches.multi' plan feature.
+-- ============================================================================
+
+-- ── 1. Branches ─────────────────────────────────────────────────────────────
+create table if not exists public.branches (
+  id             uuid primary key default gen_random_uuid(),
+  code           text not null unique check (code ~ '^[A-Z0-9][A-Z0-9-]{1,11}$'),
+  name           text not null check (length(trim(name)) between 1 and 80),
+  address        text,
+  city           text,
+  country        text,
+  timezone       text,          -- null = the restaurant's own (business_settings.timezone)
+  currency_code  text check (currency_code is null or currency_code ~ '^[A-Z]{3}$'),
+  opening_hours  jsonb not null default '{}'::jsonb,
+  phone          text,
+  settings       jsonb not null default '{}'::jsonb,
+  status         text not null default 'active' check (status in ('active', 'inactive', 'archived')),
+  is_default     boolean not null default false,
+  status_reason  text,
+  created_at     timestamptz not null default now(),
+  updated_at     timestamptz not null default now(),
+  created_by     uuid
+);
+create unique index if not exists branches_one_default on public.branches ((true)) where is_default;
+
+insert into public.branches (code, name, is_default, status)
+select 'MAIN', 'Main branch', true, 'active'
+ where not exists (select 1 from public.branches where is_default);
+
+create or replace function app.default_branch_id() returns uuid
+language sql stable security definer set search_path = public as $fn$
+  select id from public.branches where is_default limit 1
+$fn$;
+
+-- ── 2. Who may see which branch ─────────────────────────────────────────────
+alter table public.portals     add column if not exists branch_ids uuid[] not null default '{}';
+alter table public.memberships add column if not exists branch_ids uuid[] not null default '{}';
+
+-- The branches this caller is limited to; NULL = no limit (every branch).
+create or replace function app.allowed_branch_ids() returns uuid[]
+language plpgsql stable security definer set search_path = public, app as $fn$
+declare v uuid[];
+begin
+  if app.jwt_role() is distinct from 'authenticated'      -- anon / service_role: other policies govern
+     or '*' = any(app.jwt_permissions())
+     or app.current_member_role() = 'owner' then
+    return null;
+  end if;
+  select coalesce(
+           (select p.branch_ids from public.portals p where p.portal_user_id = app.jwt_sub() and cardinality(p.branch_ids) > 0 limit 1),
+           (select m.branch_ids from public.memberships m where m.user_id = app.jwt_sub() and cardinality(m.branch_ids) > 0 limit 1))
+    into v;
+  return v;   -- null when nothing limits the login
+end $fn$;
+
+create or replace function app.branch_access(p_branch uuid) returns boolean
+language sql stable as $fn$
+  select p_branch is null or (select app.allowed_branch_ids()) is null or p_branch = any(cast((select app.allowed_branch_ids()) as uuid[]))
+$fn$;
+
+grant execute on function app.default_branch_id() to authenticated, anon, service_role;
+grant execute on function app.allowed_branch_ids() to authenticated, anon, service_role;
+grant execute on function app.branch_access(uuid) to authenticated, anon, service_role;
+
+alter table public.branches enable row level security;
+drop policy if exists branches_read on public.branches;
+create policy branches_read on public.branches for select using (
+  app.jwt_role() = 'anon' and status = 'active'           -- the guest menu shows the branch name
+  or (app.is_staff() and app.branch_access(id))
+);
+-- No insert/update/delete policies: branches change only through the functions below.
+
+-- ── 3. branch_id on every location-bound table ──────────────────────────────
+do $mig$
+declare
+  t text;
+  def uuid := app.default_branch_id();
+  -- ledger lines may be organization-wide (supplier payments, credit notes, manual corrections)
+  nullable text[] := array['financial_events'];
+begin
+  foreach t in array array[
+    'orders', 'payments', 'table_sessions', 'restaurant_tables', 'reservations', 'stock_ledger',
+    'food_stock_log', 'low_stock_events', 'purchase_orders', 'supplier_invoices', 'daily_closings',
+    'expenses', 'cash_counts', 'cash_movements', 'financial_events', 'shifts', 'attendance'
+  ] loop
+    if to_regclass('public.' || t) is null then continue; end if;
+    execute format('alter table public.%I add column if not exists branch_id uuid references public.branches(id)', t);
+    if t = 'financial_events' then
+      execute 'alter table public.financial_events disable trigger ledger_no_update';
+    end if;
+    execute format('update public.%I set branch_id = $1 where branch_id is null', t) using def;
+    if t = 'financial_events' then
+      execute 'alter table public.financial_events enable trigger ledger_no_update';
+    end if;
+    if not (t = any(nullable)) then
+      execute format('alter table public.%I alter column branch_id set not null', t);
+    end if;
+    execute format('create index if not exists %I on public.%I (branch_id)', t || '_branch_idx', t);
+  end loop;
+end $mig$;
+
+-- Per-branch uniqueness where "one per restaurant" meant "one per location".
+alter table public.restaurant_tables drop constraint if exists restaurant_tables_label_key;
+create unique index if not exists restaurant_tables_branch_label on public.restaurant_tables (branch_id, label);
+alter table public.daily_closings drop constraint if exists daily_closings_business_date_key;
+create unique index if not exists daily_closings_branch_day on public.daily_closings (branch_id, business_date);
+
+-- ── 4. Fill branch_id on insert (parent first, then the default branch) ─────
+create or replace function app.fill_branch_id() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if new.branch_id is not null then return new; end if;
+  case tg_table_name
+    when 'payments' then
+      select o.branch_id into new.branch_id from public.orders o where o.id = new.order_id;
+    when 'orders' then
+      if new.session_id is not null then
+        select s.branch_id into new.branch_id from public.table_sessions s where s.id = new.session_id;
+      end if;
+    when 'supplier_invoices' then
+      if new.purchase_order_id is not null then
+        select po.branch_id into new.branch_id from public.purchase_orders po where po.id = new.purchase_order_id;
+      end if;
+    else null;
+  end case;
+  if new.branch_id is null then
+    new.branch_id := app.default_branch_id();
+  end if;
+  return new;
+end $fn$;
+
+do $mig$
+declare t text;
+begin
+  foreach t in array array[
+    'orders', 'payments', 'table_sessions', 'restaurant_tables', 'reservations', 'stock_ledger',
+    'food_stock_log', 'low_stock_events', 'purchase_orders', 'supplier_invoices', 'daily_closings',
+    'expenses', 'cash_counts', 'cash_movements', 'shifts', 'attendance'
+  ] loop
+    if to_regclass('public.' || t) is null then continue; end if;
+    execute format('drop trigger if exists fill_branch_id on public.%I', t);
+    execute format('create trigger fill_branch_id before insert on public.%I for each row execute function app.fill_branch_id()', t);
+  end loop;
+end $mig$;
+
+-- Ledger entries take the branch of the record they came from (shared when it has none).
+create or replace function app.ledger_fill_branch() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if new.branch_id is not null then return new; end if;
+  if new.order_id is not null then
+    select branch_id into new.branch_id from public.orders where id = new.order_id;
+  end if;
+  if new.branch_id is null and new.source_id is not null then
+    case new.source_table
+      when 'payments'         then select branch_id into new.branch_id from public.payments where id = new.source_id;
+      when 'expenses'         then select branch_id into new.branch_id from public.expenses where id = new.source_id;
+      when 'supplier_invoices' then select branch_id into new.branch_id from public.supplier_invoices where id = new.source_id;
+      when 'purchase_orders'  then select branch_id into new.branch_id from public.purchase_orders where id = new.source_id;
+      when 'cash_counts'      then select branch_id into new.branch_id from public.cash_counts where id = new.source_id;
+      when 'cash_movements'   then select branch_id into new.branch_id from public.cash_movements where id = new.source_id;
+      when 'daily_closings'   then select branch_id into new.branch_id from public.daily_closings where id = new.source_id;
+      when 'stock_ledger'     then select branch_id into new.branch_id from public.stock_ledger where id = new.source_id;
+      else null;
+    end case;
+  end if;
+  return new;   -- supplier payments, credit notes and manual corrections stay shared unless given a branch
+end $fn$;
+drop trigger if exists ledger_fill_branch on public.financial_events;
+create trigger ledger_fill_branch before insert on public.financial_events
+  for each row execute function app.ledger_fill_branch();
+
+-- ── 5. Branch walls (RESTRICTIVE: ANDed with the existing policies) ─────────
+do $mig$
+declare t text;
+begin
+  foreach t in array array[
+    'orders', 'payments', 'table_sessions', 'restaurant_tables', 'reservations', 'stock_ledger',
+    'food_stock_log', 'low_stock_events', 'purchase_orders', 'supplier_invoices', 'daily_closings',
+    'expenses', 'cash_counts', 'cash_movements', 'financial_events', 'shifts', 'attendance'
+  ] loop
+    if to_regclass('public.' || t) is null then continue; end if;
+    execute format('drop policy if exists branch_wall on public.%I', t);
+    execute format(
+      'create policy branch_wall on public.%I as restrictive for all using (app.branch_access(branch_id)) with check (app.branch_access(branch_id))', t);
+  end loop;
+end $mig$;
+-- Child rows follow their order.
+drop policy if exists branch_wall on public.order_lines;
+create policy branch_wall on public.order_lines as restrictive for all
+  using (app.branch_access((select o.branch_id from public.orders o where o.id = order_id)))
+  with check (app.branch_access((select o.branch_id from public.orders o where o.id = order_id)));
+drop policy if exists branch_wall on public.refunds;
+create policy branch_wall on public.refunds as restrictive for all
+  using (app.branch_access((select p.branch_id from public.payments p where p.id = payment_id)))
+  with check (app.branch_access((select p.branch_id from public.payments p where p.id = payment_id)));
+
+-- ── 6. Managing branches (audited) ──────────────────────────────────────────
+insert into public.permission_catalog (key, grp, label, type, risk_level) values
+  ('branches.view', 'Branches', 'View branches', 'read', 'normal'),
+  ('branches.manage', 'Branches', 'Create, edit and deactivate branches; assign logins to branches', 'write', 'high')
+on conflict (key) do update set grp = excluded.grp, label = excluded.label, type = excluded.type, risk_level = excluded.risk_level;
+
+create or replace function app.branch_limit_ok() returns boolean
+language sql stable security definer set search_path = public as $fn$
+  -- Plan never synced (plan_tier null) fails open, as entitlements do elsewhere.
+  select coalesce((select plan_tier is null or 'branches.multi' = any(coalesce(plan_features, '{}')) from public.business_settings where id = true), true)
+      or (select count(*) from public.branches where status = 'active') < 1
+$fn$;
+
+create or replace function public.create_branch(
+  p_code text, p_name text, p_address text default null, p_city text default null, p_country text default null,
+  p_timezone text default null, p_currency_code text default null, p_phone text default null,
+  p_opening_hours jsonb default '{}'::jsonb
+) returns public.branches
+language plpgsql security definer set search_path = public, app as $fn$
+declare v public.branches;
+begin
+  if not app.has_perm('branches.manage') then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  if not app.branch_limit_ok() then
+    raise exception 'branch_limit: your plan includes one branch — upgrade to add more' using errcode = 'check_violation';
+  end if;
+  if p_timezone is not null and not exists (select 1 from pg_timezone_names where name = p_timezone) then
+    raise exception 'bad_timezone' using errcode = 'check_violation';
+  end if;
+  insert into public.branches (code, name, address, city, country, timezone, currency_code, phone, opening_hours, created_by)
+  values (upper(trim(p_code)), trim(p_name), nullif(trim(p_address), ''), nullif(trim(p_city), ''), nullif(trim(p_country), ''),
+          nullif(trim(p_timezone), ''), nullif(upper(trim(p_currency_code)), ''), nullif(trim(p_phone), ''),
+          coalesce(p_opening_hours, '{}'::jsonb), app.jwt_sub())
+  returning * into v;
+  perform app.log_action('branch.created', 'branches', v.id::text, null, to_jsonb(v));
+  return v;
+end $fn$;
+
+create or replace function public.update_branch(
+  p_id uuid, p_name text, p_address text default null, p_city text default null, p_country text default null,
+  p_timezone text default null, p_currency_code text default null, p_phone text default null,
+  p_opening_hours jsonb default null, p_settings jsonb default null
+) returns public.branches
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_old public.branches; v public.branches;
+begin
+  if not app.has_perm('branches.manage') or not app.branch_access(p_id) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_timezone is not null and p_timezone <> '' and not exists (select 1 from pg_timezone_names where name = p_timezone) then
+    raise exception 'bad_timezone' using errcode = 'check_violation';
+  end if;
+  select * into v_old from public.branches where id = p_id for update;
+  if not found then raise exception 'branch_not_found' using errcode = 'no_data_found'; end if;
+  update public.branches set
+      name = trim(p_name), address = nullif(trim(p_address), ''), city = nullif(trim(p_city), ''),
+      country = nullif(trim(p_country), ''), timezone = nullif(trim(p_timezone), ''),
+      currency_code = nullif(upper(trim(p_currency_code)), ''), phone = nullif(trim(p_phone), ''),
+      opening_hours = coalesce(p_opening_hours, opening_hours), settings = coalesce(p_settings, settings),
+      updated_at = now()
+   where id = p_id returning * into v;
+  perform app.log_action('branch.updated', 'branches', p_id::text, to_jsonb(v_old), to_jsonb(v));
+  return v;
+end $fn$;
+
+create or replace function public.set_branch_status(p_id uuid, p_status text, p_reason text default null) returns public.branches
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_old public.branches; v public.branches;
+begin
+  if not app.has_perm('branches.manage') or not app.branch_access(p_id) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_status not in ('active', 'inactive', 'archived') then raise exception 'bad_status' using errcode = 'check_violation'; end if;
+  select * into v_old from public.branches where id = p_id for update;
+  if not found then raise exception 'branch_not_found' using errcode = 'no_data_found'; end if;
+  if p_status <> 'active' and v_old.is_default then
+    raise exception 'default_branch: make another branch the default first' using errcode = 'check_violation';
+  end if;
+  if p_status <> 'active' and coalesce(trim(p_reason), '') = '' then
+    raise exception 'reason_required' using errcode = 'check_violation';
+  end if;
+  if p_status = 'active' and v_old.status <> 'active' and not app.branch_limit_ok() then
+    raise exception 'branch_limit: your plan includes one branch — upgrade to add more' using errcode = 'check_violation';
+  end if;
+  update public.branches set status = p_status, status_reason = nullif(trim(p_reason), ''), updated_at = now()
+   where id = p_id returning * into v;
+  perform app.log_action('branch.status_changed', 'branches', p_id::text,
+    jsonb_build_object('status', v_old.status), jsonb_build_object('status', p_status, 'reason', p_reason));
+  return v;
+end $fn$;
+
+create or replace function public.set_default_branch(p_id uuid) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('branches.manage') and app.allowed_branch_ids() is null) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if not exists (select 1 from public.branches where id = p_id and status = 'active') then
+    raise exception 'branch_not_active' using errcode = 'check_violation';
+  end if;
+  update public.branches set is_default = false, updated_at = now() where is_default and id <> p_id;
+  update public.branches set is_default = true, updated_at = now() where id = p_id;
+  perform app.log_action('branch.default_changed', 'branches', p_id::text, null, null);
+end $fn$;
+
+-- Which branches a portal / member login may use (empty = all).
+create or replace function public.set_login_branches(p_kind text, p_id uuid, p_branch_ids uuid[]) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_ids uuid[] := coalesce(p_branch_ids, '{}');
+begin
+  if not app.has_perm('branches.manage') then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  -- A login limited to some branches may only hand out branches it has itself.
+  if app.allowed_branch_ids() is not null
+     and (cardinality(v_ids) = 0 or exists (select 1 from unnest(v_ids) b where not (b = any(app.allowed_branch_ids())))) then
+    raise exception 'forbidden: you can only assign your own branches' using errcode = 'insufficient_privilege';
+  end if;
+  if exists (select 1 from unnest(v_ids) b where not exists (select 1 from public.branches where id = b)) then
+    raise exception 'unknown_branch' using errcode = 'check_violation';
+  end if;
+  if p_kind = 'portal' then
+    update public.portals set branch_ids = v_ids where id = p_id;
+  elsif p_kind = 'member' then
+    update public.memberships set branch_ids = v_ids where id = p_id;
+  else
+    raise exception 'bad_kind' using errcode = 'check_violation';
+  end if;
+  if not found then raise exception 'not_found' using errcode = 'no_data_found'; end if;
+  perform app.log_action('branch.login_assigned', p_kind || 's', p_id::text, null, jsonb_build_object('branch_ids', v_ids));
+end $fn$;
+
+-- The branches the caller can use (for the branch selector).
+create or replace function public.my_branches() returns setof public.branches
+language sql stable security definer set search_path = public, app as $fn$
+  select * from public.branches b
+   where app.is_staff() and app.branch_access(b.id) and b.status <> 'archived'
+   order by b.is_default desc, b.name
+$fn$;
+
+revoke all on function public.create_branch(text, text, text, text, text, text, text, text, jsonb) from public;
+revoke all on function public.update_branch(uuid, text, text, text, text, text, text, text, jsonb, jsonb) from public;
+revoke all on function public.set_branch_status(uuid, text, text) from public;
+revoke all on function public.set_default_branch(uuid) from public;
+revoke all on function public.set_login_branches(text, uuid, uuid[]) from public;
+revoke all on function public.my_branches() from public;
+grant execute on function public.create_branch(text, text, text, text, text, text, text, text, jsonb) to authenticated, service_role;
+grant execute on function public.update_branch(uuid, text, text, text, text, text, text, text, jsonb, jsonb) to authenticated, service_role;
+grant execute on function public.set_branch_status(uuid, text, text) to authenticated, service_role;
+grant execute on function public.set_default_branch(uuid) to authenticated, service_role;
+grant execute on function public.set_login_branches(text, uuid, uuid[]) to authenticated, service_role;
+grant execute on function public.my_branches() to authenticated, service_role;
+
+-- Audit every branch row change too (same trigger the other tables use).
+do $$ begin
+  if exists (select 1 from pg_proc where proname = 'audit_row' and pronamespace = 'app'::regnamespace) then
+    drop trigger if exists audit on public.branches;
+    create trigger audit after insert or update or delete on public.branches for each row execute function app.audit_row();
+  end if;
+end $$;
+
+-- ── 0099_branch_scope.sql ──
+-- ============================================================================
+-- 0099 — Multi-branch, phase 2-3 (database side): the selected branch.
+--
+-- The app sends the branch(es) the user is looking at in the `x-branch-ids`
+-- request header (PostgREST exposes request headers to SQL). It is a VIEW
+-- choice, never a permission: every use is intersected with the branches the
+-- login may use (app.branch_access, 0098). No header = all permitted branches.
+--
+--   • Reads: the branch walls now also narrow to the selected branch(es), and
+--     the read-only reporting functions (which run as definer and so bypass
+--     RLS) read through branch-scoped views — every screen, report and RPC is
+--     scoped the same way, with no signature changes.
+--   • Writes: a new row without a branch takes its parent's, else the
+--     selected branch, else the default. A row may only be changed by a login
+--     allowed in its branch, whichever function makes the change.
+--   • Day close is per branch: its own cash, preview, close and reopen.
+-- ============================================================================
+
+-- ── 1. The selected branch(es) ──────────────────────────────────────────────
+create or replace function app.selected_branch_ids() returns uuid[]
+language plpgsql stable set search_path = public, app as $fn$
+declare
+  raw text := nullif(trim(coalesce(nullif(current_setting('request.headers', true), '')::json ->> 'x-branch-ids', '')), '');
+  v uuid[];
+begin
+  if raw is null then return null; end if;
+  select array_agg(x::uuid) into v
+    from unnest(string_to_array(raw, ',')) x
+   where trim(x) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+  return v;   -- null when nothing valid was sent
+end $fn$;
+
+-- In scope = the login may use the branch AND it is one of the selected ones.
+-- Organization-wide ledger lines (no branch: supplier payments, credit notes,
+-- manual corrections) show only when no single branch is selected.
+create or replace function app.in_scope(p_branch uuid) returns boolean
+language sql stable as $fn$
+  select app.branch_access(p_branch)
+     and ((select app.selected_branch_ids()) is null
+          or (p_branch is not null and p_branch = any(cast((select app.selected_branch_ids()) as uuid[]))))
+$fn$;
+
+-- The branch a new record belongs to when nothing more specific applies.
+create or replace function app.request_branch_id() returns uuid
+language plpgsql stable security definer set search_path = public, app as $fn$
+declare v uuid; v_allowed uuid[] := app.allowed_branch_ids();
+begin
+  select b.id into v from public.branches b
+   where b.id = any(coalesce(app.selected_branch_ids(), '{}')) and b.status = 'active'
+     and (v_allowed is null or b.id = any(v_allowed))
+   order by b.is_default desc, b.name limit 1;
+  if v is not null then return v; end if;
+  if v_allowed is null then return app.default_branch_id(); end if;
+  select b.id into v from public.branches b
+   where b.id = any(v_allowed) and b.status = 'active' order by b.is_default desc, b.name limit 1;
+  return v;
+end $fn$;
+
+grant execute on function app.selected_branch_ids() to authenticated, anon, service_role;
+grant execute on function app.in_scope(uuid) to authenticated, anon, service_role;
+grant execute on function app.request_branch_id() to authenticated, anon, service_role;
+
+-- ── 2. Branch walls narrow to the selection (writes still need access only) ─
+do $mig$
+declare t text;
+begin
+  foreach t in array array[
+    'orders', 'payments', 'table_sessions', 'restaurant_tables', 'reservations', 'stock_ledger',
+    'food_stock_log', 'low_stock_events', 'purchase_orders', 'supplier_invoices', 'daily_closings',
+    'expenses', 'cash_counts', 'cash_movements', 'financial_events', 'shifts', 'attendance'
+  ] loop
+    if to_regclass('public.' || t) is null then continue; end if;
+    execute format('drop policy if exists branch_wall on public.%I', t);
+    execute format(
+      'create policy branch_wall on public.%I as restrictive for all using (app.in_scope(branch_id)) with check (app.branch_access(branch_id))', t);
+  end loop;
+end $mig$;
+drop policy if exists branch_wall on public.order_lines;
+create policy branch_wall on public.order_lines as restrictive for all
+  using (app.in_scope((select o.branch_id from public.orders o where o.id = order_id)))
+  with check (app.branch_access((select o.branch_id from public.orders o where o.id = order_id)));
+drop policy if exists branch_wall on public.refunds;
+create policy branch_wall on public.refunds as restrictive for all
+  using (app.in_scope((select p.branch_id from public.payments p where p.id = payment_id)))
+  with check (app.branch_access((select p.branch_id from public.payments p where p.id = payment_id)));
+
+-- ── 3. Branch on insert; branch access on every change ──────────────────────
+create or replace function app.fill_branch_id() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if new.branch_id is null then
+    case tg_table_name
+      when 'payments' then
+        select o.branch_id into new.branch_id from public.orders o where o.id = new.order_id;
+      when 'orders' then
+        if new.session_id is not null then
+          select s.branch_id into new.branch_id from public.table_sessions s where s.id = new.session_id;
+        end if;
+      when 'supplier_invoices' then
+        if new.purchase_order_id is not null then
+          select po.branch_id into new.branch_id from public.purchase_orders po where po.id = new.purchase_order_id;
+        end if;
+      else null;
+    end case;
+    if new.branch_id is null then
+      new.branch_id := coalesce(app.request_branch_id(), app.default_branch_id());
+    end if;
+  end if;
+  -- Definer functions bypass RLS: the branch rule is enforced here for them too.
+  if new.branch_id is not null and not app.branch_access(new.branch_id) then
+    raise exception 'forbidden: this login cannot work in that branch' using errcode = 'insufficient_privilege';
+  end if;
+  if tg_table_name = 'orders' and not exists (select 1 from public.branches where id = new.branch_id and status = 'active') then
+    raise exception 'branch_inactive: this branch is not taking orders' using errcode = 'check_violation';
+  end if;
+  return new;
+end $fn$;
+
+create or replace function app.guard_branch_change() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not app.branch_access(old.branch_id) then
+    raise exception 'forbidden: this record belongs to another branch' using errcode = 'insufficient_privilege';
+  end if;
+  if tg_op = 'UPDATE' and new.branch_id is distinct from old.branch_id and not app.branch_access(new.branch_id) then
+    raise exception 'forbidden: this login cannot move records to that branch' using errcode = 'insufficient_privilege';
+  end if;
+  return coalesce(new, old);
+end $fn$;
+
+do $mig$
+declare t text;
+begin
+  foreach t in array array[
+    'orders', 'payments', 'table_sessions', 'restaurant_tables', 'reservations', 'stock_ledger',
+    'food_stock_log', 'low_stock_events', 'purchase_orders', 'supplier_invoices', 'daily_closings',
+    'expenses', 'cash_counts', 'cash_movements', 'shifts', 'attendance'
+  ] loop
+    if to_regclass('public.' || t) is null then continue; end if;
+    execute format('drop trigger if exists fill_branch_id on public.%I', t);
+    execute format('create trigger fill_branch_id before insert on public.%I for each row execute function app.fill_branch_id()', t);
+    execute format('drop trigger if exists guard_branch_change on public.%I', t);
+    execute format('create trigger guard_branch_change before update or delete on public.%I for each row execute function app.guard_branch_change()', t);
+  end loop;
+end $mig$;
+-- Order lines follow their order.
+create or replace function app.guard_branch_order_line() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+declare v uuid;
+begin
+  select branch_id into v from public.orders where id = coalesce(new.order_id, old.order_id);
+  if not app.branch_access(v) then
+    raise exception 'forbidden: this order belongs to another branch' using errcode = 'insufficient_privilege';
+  end if;
+  return coalesce(new, old);
+end $fn$;
+drop trigger if exists guard_branch_change on public.order_lines;
+create trigger guard_branch_change before insert or update or delete on public.order_lines
+  for each row execute function app.guard_branch_order_line();
+
+-- ── 4. Branch-scoped views for the read-only reporting functions ────────────
+do $mig$
+declare t text;
+begin
+  foreach t in array array[
+    'orders', 'payments', 'expenses', 'financial_events', 'daily_closings', 'purchase_orders',
+    'supplier_invoices', 'stock_ledger', 'cash_movements', 'cash_counts', 'reservations',
+    'restaurant_tables', 'attendance', 'shifts', 'low_stock_events', 'food_stock_log', 'table_sessions'
+  ] loop
+    if to_regclass('public.' || t) is null then continue; end if;
+    execute format('create or replace view app.%I with (security_barrier) as select * from public.%I where app.in_scope(branch_id)', 's_' || t, t);
+  end loop;
+end $mig$;
+
+do $mig$
+declare
+  fn record;
+  def text;
+  pat constant text := 'public\.(orders|payments|expenses|financial_events|daily_closings|purchase_orders|supplier_invoices|stock_ledger|cash_movements|cash_counts|reservations|restaurant_tables|attendance|shifts|low_stock_events|food_stock_log|table_sessions)\M';
+begin
+  for fn in
+    select p.oid from pg_proc p
+     where p.pronamespace = 'public'::regnamespace and p.prokind = 'f'
+       and p.proname in (
+         'attendance_dashboard', 'attendance_history', 'attendance_month_summary', 'attendance_roster',
+         'customer_stats', 'deal_performance', 'deal_performance_daily', 'deal_profitability', 'deal_sales',
+         'item_profitability', 'order_profitability', 'orders_on_day', 'payables_aging', 'payment_mix',
+         'payment_reconciliation', 'period_profitability', 'period_tax', 'promotion_performance',
+         'revenue_by_category', 'sales_by_hour', 'sales_by_day', 'supplier_payable', 'supplier_statement',
+         'supplier_invoice_history', 'feedback_summary', 'food_cost_watch')
+  loop
+    def := pg_get_functiondef(fn.oid);
+    if def ~ pat then
+      execute regexp_replace(def, pat, 'app.s_\1', 'g');
+    end if;
+  end loop;
+end $mig$;
+
+-- ── 5. Orders: a table's open tab is looked up within its branch ────────────
+do $mig$
+declare
+  def text := pg_get_functiondef('public.place_order(text, text, text, integer, jsonb, integer, text, text)'::regprocedure);
+  old_q constant text := 'where table_label = p_table_label and status = ''open''';
+  new_q constant text := 'where table_label = p_table_label and status = ''open'' and branch_id = coalesce(app.request_branch_id(), app.default_branch_id())';
+begin
+  if position(old_q in def) > 0 then
+    execute replace(def, old_q, new_q);
+  elsif position(new_q in def) = 0 then
+    raise exception '0099: unexpected table-session lookup in place_order()';
+  end if;
+end $mig$;
+
+-- ── 6. Day close per branch ─────────────────────────────────────────────────
+create or replace function app.day_sales(p_date date, p_branch uuid) returns jsonb
+language sql stable set search_path = public, app as $fn$
+  with o as (
+    select * from public.orders
+     where status in ('served','paid') and app.business_day(coalesce(paid_at, created_at)) = p_date
+       and (p_branch is null or branch_id = p_branch)
+  )
+  select jsonb_build_object(
+    'gross_sales_cents', coalesce((select sum(subtotal_cents) from o), 0),
+    'discounts_cents',   coalesce((select sum(discount_cents) from o), 0),
+    'refunds_cents',     coalesce((select sum(refunded_cents) from o), 0),
+    'net_sales_cents',   coalesce((select sum(subtotal_cents - discount_cents - coalesce(refunded_cents,0)) from o), 0),
+    'order_count',       (select count(*) from o),
+    'cash_in_cents',     coalesce((select sum(p.amount_cents - p.refunded_cents)
+                                   from public.payments p join o on o.id = p.order_id
+                                   where p.status <> 'voided' and p.method = 'cash'), 0)
+  )
+$fn$;
+-- The one-argument forms keep working: they mean "the branch being worked in".
+create or replace function app.day_sales(p_date date) returns jsonb
+language sql stable set search_path = public, app as $fn$
+  select app.day_sales(p_date, coalesce(app.request_branch_id(), app.default_branch_id()))
+$fn$;
+
+create or replace function app.day_cash_movements(p_date date, p_branch uuid) returns integer
+language sql stable set search_path = public, app as $fn$
+  select coalesce(sum(signed_cents), 0)::int from public.cash_movements
+   where business_date = p_date and (p_branch is null or branch_id = p_branch)
+$fn$;
+create or replace function app.day_cash_movements(p_date date) returns integer
+language sql stable set search_path = public, app as $fn$
+  select app.day_cash_movements(p_date, coalesce(app.request_branch_id(), app.default_branch_id()))
+$fn$;
+
+create or replace function app.is_day_closed(p_date date, p_branch uuid) returns boolean
+language sql stable set search_path = public, app as $fn$
+  select p_date is not null and exists (
+    select 1 from public.daily_closings where business_date = p_date and status = 'closed' and branch_id = p_branch)
+$fn$;
+create or replace function app.is_day_closed(p_date date) returns boolean
+language sql stable set search_path = public, app as $fn$
+  select app.is_day_closed(p_date, coalesce(app.request_branch_id(), app.default_branch_id()))
+$fn$;
+
+-- The closed-day lock applies to the row's own branch.
+create or replace function app.guard_closed_day() returns trigger
+language plpgsql set search_path = public, app as $fn$
+declare v_day date; v_b uuid := coalesce(new.branch_id, old.branch_id);
+begin
+  case tg_table_name
+  when 'expenses' then
+    if tg_op = 'INSERT' and app.is_day_closed(new.expense_date, v_b) then v_day := new.expense_date;
+    elsif tg_op = 'DELETE' and app.is_day_closed(old.expense_date, v_b) then v_day := old.expense_date;
+    elsif tg_op = 'UPDATE'
+      and (new.category, new.description, new.amount_cents, new.expense_date, new.supplier_id, new.vendor)
+          is distinct from (old.category, old.description, old.amount_cents, old.expense_date, old.supplier_id, old.vendor) then
+      if app.is_day_closed(old.expense_date, v_b) then v_day := old.expense_date;
+      elsif app.is_day_closed(new.expense_date, v_b) then v_day := new.expense_date; end if;
+    end if;
+  when 'cash_counts' then
+    if app.is_day_closed(new.business_date, v_b) then v_day := new.business_date; end if;
+  when 'cash_movements' then
+    if app.is_day_closed(new.business_date, v_b) then v_day := new.business_date; end if;
+  when 'payments' then
+    if tg_op = 'INSERT' then
+      if app.is_day_closed(app.business_day(new.created_at), v_b) then v_day := app.business_day(new.created_at); end if;
+    elsif tg_op = 'DELETE' then
+      if app.is_day_closed(app.business_day(old.created_at), v_b) then v_day := app.business_day(old.created_at); end if;
+    elsif (new.amount_cents is distinct from old.amount_cents
+           or (new.status = 'voided' and old.status is distinct from 'voided'))
+          and app.is_day_closed(app.business_day(old.created_at), v_b) then
+      v_day := app.business_day(old.created_at);
+    end if;
+  when 'orders' then
+    if tg_op = 'DELETE' then
+      if old.status in ('served', 'paid') and app.is_day_closed(app.business_day(coalesce(old.paid_at, old.created_at)), v_b) then
+        v_day := app.business_day(coalesce(old.paid_at, old.created_at));
+      end if;
+    elsif old.status in ('served', 'paid')
+          and (new.status = 'void' or new.subtotal_cents is distinct from old.subtotal_cents
+               or new.discount_cents is distinct from old.discount_cents or new.total_cents is distinct from old.total_cents)
+          and app.is_day_closed(app.business_day(coalesce(old.paid_at, old.created_at)), v_b) then
+      v_day := app.business_day(coalesce(old.paid_at, old.created_at));
+    end if;
+  end case;
+  if v_day is not null then
+    raise exception 'day_closed: % is closed for this branch', v_day using errcode = 'insufficient_privilege',
+      hint = 'Reopen the day with a reason, or record the correction on an open day (a refund is always allowed).';
+  end if;
+  return coalesce(new, old);
+end $fn$;
+
+-- The closed-day guard on expenses now runs after the branch is filled in.
+create or replace function public.day_close_preview(p_business_date date, p_opening_cents integer default 0) returns jsonb
+language plpgsql stable security definer set search_path = public, app as $fn$
+declare
+  v_b uuid := coalesce(app.request_branch_id(), app.default_branch_id());
+  v_s jsonb; v_mov int; v_tax bigint; v_mix jsonb; v_exp jsonb; v_supp jsonb; v_count jsonb;
+  v_open_orders int; v_unpaid jsonb; v_awaiting int; v_holds int; v_closing public.daily_closings; v_branch public.branches;
+begin
+  if not (app.has_perm('finance.close_day') or app.has_perm('finance.view') or app.has_perm('finance.reconcile') or app.has_perm('cash.manage')) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if not app.branch_access(v_b) then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  select * into v_branch from public.branches where id = v_b;
+  v_s := app.day_sales(p_business_date, v_b);
+  v_mov := app.day_cash_movements(p_business_date, v_b);
+
+  select coalesce(sum(tax_cents), 0) into v_tax from public.orders
+   where branch_id = v_b and status in ('served', 'paid') and app.business_day(coalesce(paid_at, created_at)) = p_business_date;
+
+  with o as (
+    select id from public.orders
+     where branch_id = v_b and status in ('served', 'paid') and app.business_day(coalesce(paid_at, created_at)) = p_business_date
+  )
+  select coalesce(jsonb_object_agg(method, cents), '{}'::jsonb) into v_mix
+    from (select p.method, sum(p.amount_cents - p.refunded_cents)::bigint as cents
+            from public.payments p join o on o.id = p.order_id
+           where p.status <> 'voided' group by p.method) x;
+
+  select jsonb_build_object('count', count(*), 'cents', coalesce(sum(amount_cents), 0)) into v_exp
+    from public.expenses where branch_id = v_b and expense_date = p_business_date and status in ('approved', 'paid');
+  -- Supplier payments are made by the organization, not a till: shown for information.
+  select jsonb_build_object('count', count(*), 'cents', coalesce(sum(amount_cents), 0)) into v_supp
+    from public.supplier_payments where app.business_day(paid_at) = p_business_date;
+  select to_jsonb(c) - 'counted_by' into v_count from public.cash_counts c
+   where c.branch_id = v_b and c.business_date = p_business_date order by c.created_at desc limit 1;
+
+  select count(*) into v_open_orders from public.orders
+   where branch_id = v_b and status in ('pending', 'in_kitchen', 'ready') and app.business_day(created_at) = p_business_date;
+  select jsonb_build_object('count', count(*), 'cents', coalesce(sum(due), 0)) into v_unpaid
+    from (select o.total_cents - coalesce((select sum(p.amount_cents - p.refunded_cents) from public.payments p
+                                            where p.order_id = o.id and p.status <> 'voided'), 0) as due
+            from public.orders o
+           where o.branch_id = v_b and o.status = 'served' and app.business_day(coalesce(o.paid_at, o.created_at)) = p_business_date) u
+   where due > 0;
+  select count(*) into v_awaiting from public.expenses where branch_id = v_b and expense_date = p_business_date and status in ('draft', 'submitted');
+  select count(*) into v_holds from public.supplier_payment_holds where status = 'open';
+  select * into v_closing from public.daily_closings where branch_id = v_b and business_date = p_business_date;
+
+  return jsonb_build_object(
+    'business_date', p_business_date,
+    'branch', jsonb_build_object('id', v_branch.id, 'code', v_branch.code, 'name', v_branch.name),
+    'status', coalesce(v_closing.status, 'open'),
+    'is_future', p_business_date > app.business_day(now()),
+    'sales', v_s || jsonb_build_object('tax_cents', v_tax),
+    'payments_by_method', v_mix,
+    'cash', jsonb_build_object(
+      'opening_cents', coalesce(p_opening_cents, 0),
+      'cash_sales_cents', coalesce((v_s->>'cash_in_cents')::int, 0),
+      'movements_cents', v_mov,
+      'expected_cents', coalesce(p_opening_cents, 0) + coalesce((v_s->>'cash_in_cents')::int, 0) + v_mov,
+      'last_count', v_count),
+    'expenses', v_exp,
+    'supplier_payments', v_supp,
+    'exceptions', jsonb_build_object(
+      'open_orders', v_open_orders,
+      'unpaid_served_orders', v_unpaid,
+      'expenses_awaiting_approval', v_awaiting,
+      'invoice_holds_open', v_holds)
+  );
+end $fn$;
+
+create or replace function public.close_business_day(
+  p_business_date date, p_opening_cash integer default 0, p_closing_cash integer default null, p_note text default null
+) returns public.daily_closings
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_b uuid := coalesce(app.request_branch_id(), app.default_branch_id());
+  v_p jsonb; v_s jsonb; v_mov int; v_expected int; v_diff int; v_row public.daily_closings;
+begin
+  if not app.has_perm('finance.close_day') or not app.branch_access(v_b) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_business_date > app.business_day(now()) then
+    raise exception 'future_day: % has not happened yet', p_business_date using errcode = 'check_violation';
+  end if;
+  if app.is_day_closed(p_business_date, v_b) then
+    raise exception 'already_closed: reopen % first', p_business_date using errcode = 'check_violation';
+  end if;
+  if coalesce(p_opening_cash, 0) < 0 or coalesce(p_closing_cash, 0) < 0 then
+    raise exception 'bad_amount' using errcode = 'check_violation';
+  end if;
+
+  v_p := public.day_close_preview(p_business_date, coalesce(p_opening_cash, 0));
+  v_s := app.day_sales(p_business_date, v_b);
+  v_mov := app.day_cash_movements(p_business_date, v_b);
+  v_expected := coalesce(p_opening_cash, 0) + (v_s->>'cash_in_cents')::int + v_mov;
+  v_diff := case when p_closing_cash is null then null else p_closing_cash - v_expected end;
+  if v_diff is not null and v_diff <> 0 and coalesce(trim(p_note), '') = '' then
+    raise exception 'variance_reason_required: counted cash differs from expected by %', v_diff using errcode = 'check_violation';
+  end if;
+
+  insert into public.daily_closings (
+    branch_id, business_date, status, opening_cash_cents, closing_cash_cents, expected_cash_cents,
+    difference_cents, gross_sales_cents, discounts_cents, refunds_cents, net_sales_cents,
+    order_count, cash_movements_cents, summary, note, closed_by, closed_at
+  ) values (
+    v_b, p_business_date, 'closed', coalesce(p_opening_cash, 0), p_closing_cash, v_expected, v_diff,
+    (v_s->>'gross_sales_cents')::int, (v_s->>'discounts_cents')::int, (v_s->>'refunds_cents')::int,
+    (v_s->>'net_sales_cents')::int, (v_s->>'order_count')::int, v_mov, v_p,
+    nullif(trim(p_note), ''), app.jwt_sub(), now()
+  )
+  on conflict (branch_id, business_date) do update set
+    status = 'closed', opening_cash_cents = excluded.opening_cash_cents,
+    closing_cash_cents = excluded.closing_cash_cents, expected_cash_cents = excluded.expected_cash_cents,
+    difference_cents = excluded.difference_cents, gross_sales_cents = excluded.gross_sales_cents,
+    discounts_cents = excluded.discounts_cents, refunds_cents = excluded.refunds_cents,
+    net_sales_cents = excluded.net_sales_cents, order_count = excluded.order_count,
+    cash_movements_cents = excluded.cash_movements_cents, summary = excluded.summary,
+    note = coalesce(excluded.note, public.daily_closings.note),
+    closed_by = excluded.closed_by, closed_at = now()
+  returning * into v_row;
+
+  perform app.log_action('day.closed', 'daily_closings', p_business_date::text, null, to_jsonb(v_row) - 'summary');
+  return v_row;
+end $fn$;
+
+create or replace function public.reopen_business_day(p_business_date date, p_reason text) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_b uuid := coalesce(app.request_branch_id(), app.default_branch_id());
+begin
+  if not app.has_perm('finance.reopen_day') or not app.branch_access(v_b) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  update public.daily_closings
+     set status = 'open', reopened_by = app.jwt_sub(), reopened_at = now(), note = trim(p_reason)
+   where branch_id = v_b and business_date = p_business_date and status = 'closed';
+  if not found then raise exception 'not_closed' using errcode = 'no_data_found'; end if;
+  perform app.log_action('day.reopened', 'daily_closings', p_business_date::text, null,
+                         jsonb_build_object('reason', trim(p_reason), 'branch_id', v_b));
+end $fn$;
+
+create or replace function public.record_cash_count(p_business_date date, p_opening_cents integer, p_counted_cents integer, p_note text default null)
+returns public.cash_counts
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_b uuid := coalesce(app.request_branch_id(), app.default_branch_id()); v_expected int; v_row public.cash_counts;
+begin
+  if not app.has_perm('finance.reconcile') or not app.branch_access(v_b) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(p_counted_cents, -1) < 0 or coalesce(p_opening_cents, 0) < 0 then
+    raise exception 'bad_amount' using errcode = 'check_violation';
+  end if;
+  v_expected := coalesce(p_opening_cents, 0)
+              + coalesce((app.day_sales(p_business_date, v_b)->>'cash_in_cents')::int, 0)
+              + app.day_cash_movements(p_business_date, v_b);
+  insert into public.cash_counts
+    (branch_id, business_date, opening_cents, counted_cents, expected_cents, difference_cents, note, counted_by, counted_by_email)
+  values
+    (v_b, p_business_date, coalesce(p_opening_cents, 0), p_counted_cents, v_expected, p_counted_cents - v_expected,
+     nullif(trim(p_note), ''), app.jwt_sub(), nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'email')
+  returning * into v_row;
+  perform app.log_action('cash.counted', 'cash_counts', v_row.id::text, null,
+                         jsonb_build_object('counted', p_counted_cents, 'expected', v_expected, 'branch_id', v_b));
+  return v_row;
+end $fn$;
+
+create or replace function public.record_cash_movement(
+  p_business_date date, p_kind text, p_amount_cents integer, p_reason text, p_reference text default null
+) returns public.cash_movements
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_b uuid := coalesce(app.request_branch_id(), app.default_branch_id()); v_row public.cash_movements;
+begin
+  if not (app.has_perm('cash.manage') or app.has_perm('finance.reconcile')) or not app.branch_access(v_b) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  if p_business_date > app.business_day(now()) then raise exception 'future_day' using errcode = 'check_violation'; end if;
+  insert into public.cash_movements (branch_id, business_date, kind, amount_cents, reason, reference, created_by)
+  values (v_b, coalesce(p_business_date, app.business_day(now())), p_kind, p_amount_cents, trim(p_reason), nullif(trim(p_reference), ''), app.jwt_sub())
+  returning * into v_row;
+  perform app.log_action('cash.movement', 'cash_movements', v_row.id::text, null,
+    jsonb_build_object('kind', p_kind, 'amount_cents', v_row.signed_cents, 'reason', trim(p_reason), 'business_date', v_row.business_date, 'branch_id', v_b));
+  return v_row;
+end $fn$;
+
+-- ── 0100_branch_reporting.sql ──
+-- ============================================================================
+-- 0100 — Multi-branch: one row per branch for the group dashboard and the
+-- Branch comparison page.
+--
+-- Same authoritative sources as the Finance module: sales, food cost and
+-- expenses come from the ledger (financial_events), so the branch rows add up
+-- exactly to the consolidated Finance overview — every ledger line belongs to
+-- one branch, nothing is counted twice. Organization-wide ledger lines (no
+-- branch: supplier payments, credit notes, manual corrections) are reported
+-- separately by the caller, never spread across branches.
+-- Rows only for branches the login may use (and, with a selection, only those).
+-- ============================================================================
+
+create or replace function public.branch_summary(p_from date, p_to date)
+returns table (
+  branch_id uuid, code text, name text, status text, is_default boolean,
+  orders_count int, net_sales_cents bigint, cogs_cents bigint, expenses_cents bigint,
+  payments_cents bigint, open_low_stock int, payables_outstanding_cents bigint,
+  last_closed_day date, unclosed_days int, cash_difference_cents bigint
+)
+language plpgsql stable security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('finance.view') or app.has_perm('finance.view_profit') or app.has_perm('branches.view') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  return query
+  select b.id, b.code, b.name, b.status, b.is_default,
+         (select count(*)::int from public.orders o
+           where o.branch_id = b.id and o.status in ('served', 'paid')
+             and app.business_day(coalesce(o.paid_at, o.created_at)) between p_from and p_to),
+         coalesce((select sum(e.signed_cents) from public.financial_events e where e.branch_id = b.id and e.category = 'revenue' and e.business_date between p_from and p_to), 0)::bigint,
+         coalesce((select sum(e.signed_cents) from public.financial_events e where e.branch_id = b.id and e.category = 'cogs' and e.business_date between p_from and p_to), 0)::bigint,
+         coalesce((select sum(e.signed_cents) from public.financial_events e where e.branch_id = b.id and e.category = 'expense' and e.business_date between p_from and p_to), 0)::bigint,
+         coalesce((select sum(e.signed_cents) from public.financial_events e where e.branch_id = b.id and e.category = 'payment' and e.business_date between p_from and p_to), 0)::bigint,
+         (select count(*)::int from public.low_stock_events l where l.branch_id = b.id and l.status = 'open'),
+         coalesce((select sum(app.invoice_outstanding_cents(si.id)) from public.supplier_invoices si
+                    where si.branch_id = b.id and si.status in ('approved', 'partially_paid')), 0)::bigint,
+         (select max(c.business_date) from public.daily_closings c where c.branch_id = b.id and c.status = 'closed'),
+         (select count(distinct e.business_date)::int from public.financial_events e
+           where e.branch_id = b.id and e.category = 'revenue'
+             and e.business_date between greatest(p_from, app.business_day(now()) - 14) and least(p_to, app.business_day(now()) - 1)
+             and not exists (select 1 from public.daily_closings c where c.branch_id = b.id and c.business_date = e.business_date and c.status = 'closed')),
+         coalesce((select sum(c.difference_cents) from public.daily_closings c
+                    where c.branch_id = b.id and c.status = 'closed' and c.business_date between p_from and p_to), 0)::bigint
+    from public.branches b
+   where b.status <> 'archived' and app.in_scope(b.id)
+   order by b.is_default desc, b.name;
+end $fn$;
+revoke all on function public.branch_summary(date, date) from public;
+grant execute on function public.branch_summary(date, date) to authenticated, service_role;
+
+-- ── 0101_branch_stock.sql ──
+-- ============================================================================
+-- 0101 — Multi-branch, phase 4: stock per branch.
+--
+-- Ingredients (inventory_items) stay shared definitions; how much of each a
+-- branch holds lives in public.branch_stock. inventory_items.stock_qty is kept
+-- as the TOTAL across branches (for organization-wide screens and reports).
+--
+-- Rather than rewriting the 20 stock and availability functions, they now read
+-- and write through app.inv — the same columns as inventory_items, but with
+-- stock_qty = the stock of "the branch being worked in" (app.stock_branch_id:
+-- an explicit context, else the selected/request branch, else the default).
+-- So a DHA sale deducts DHA's stock, its "enough stock?" checks look at DHA,
+-- and a dish is available at DHA only if DHA can make it. Availability and
+-- low-stock alerts are recalculated per branch; receiving a purchase order
+-- always stocks THAT order's branch; a transfer moves stock between branches
+-- without touching revenue or expenses.
+--
+-- Single-branch restaurants: one branch holds all stock — nothing changes.
+-- ============================================================================
+
+-- ── 1. Branch stock ─────────────────────────────────────────────────────────
+create table if not exists public.branch_stock (
+  branch_id         uuid not null references public.branches(id),
+  inventory_item_id uuid not null references public.inventory_items(id) on delete cascade,
+  stock_qty         numeric(14,3) not null default 0,
+  updated_at        timestamptz not null default now(),
+  primary key (branch_id, inventory_item_id)
+);
+insert into public.branch_stock (branch_id, inventory_item_id, stock_qty)
+select app.default_branch_id(), i.id, coalesce(i.stock_qty, 0) from public.inventory_items i
+on conflict do nothing;
+
+alter table public.branch_stock enable row level security;
+drop policy if exists staff_read on public.branch_stock;
+create policy staff_read on public.branch_stock for select
+  using ((app.has_perm('stock.view') or app.is_staff()) and app.in_scope(branch_id));
+-- Written only by the stock functions and triggers below.
+
+-- ── 2. Which branch's stock a statement works on ───────────────────────────
+create or replace function app.stock_branch_id() returns uuid
+language sql stable security definer set search_path = public, app as $fn$
+  select coalesce(nullif(current_setting('app.stock_branch', true), '')::uuid,
+                  app.request_branch_id(), app.default_branch_id())
+$fn$;
+grant execute on function app.stock_branch_id() to authenticated, anon, service_role;
+
+create or replace function app.branch_qty(p_item uuid, p_branch uuid) returns numeric
+language sql stable security definer set search_path = public, app as $fn$
+  select coalesce((select stock_qty from public.branch_stock where inventory_item_id = p_item and branch_id = p_branch), 0)
+$fn$;
+
+-- ── 3. The branch view of ingredients (same columns, same order) ────────────
+do $mig$
+declare cols text; upd text; lhs text; rhs text;
+begin
+  select string_agg(case when attname = 'stock_qty'
+                           then 'coalesce((select bs.stock_qty from public.branch_stock bs where bs.inventory_item_id = i.id and bs.branch_id = app.stock_branch_id()), 0)::numeric(14,3) as stock_qty'
+                           else 'i.' || quote_ident(attname) end, ', ' order by attnum),
+         string_agg(case when attname not in ('id', 'stock_qty') then quote_ident(attname) || ' = new.' || quote_ident(attname) end, ', ' order by attnum),
+         string_agg(case when attname not in ('id', 'stock_qty') then 'i.' || quote_ident(attname) end, ', ' order by attnum),
+         string_agg(case when attname not in ('id', 'stock_qty') then 'new.' || quote_ident(attname) end, ', ' order by attnum)
+    into cols, upd, lhs, rhs
+    from pg_attribute where attrelid = 'public.inventory_items'::regclass and attnum > 0 and not attisdropped;
+  execute 'create or replace view app.inv as select ' || cols || ' from public.inventory_items i';
+
+  execute format($f$
+    create or replace function app.inv_write() returns trigger
+    language plpgsql security definer set search_path = public, app as $body$
+    declare v_b uuid := app.stock_branch_id();
+    begin
+      if tg_op = 'DELETE' then
+        delete from public.inventory_items where id = old.id;
+        return old;
+      end if;
+      if tg_op = 'INSERT' then
+        insert into public.inventory_items select new.*;
+        return new;
+      end if;
+      if new.stock_qty is distinct from old.stock_qty then
+        insert into public.branch_stock (branch_id, inventory_item_id, stock_qty, updated_at)
+        values (v_b, old.id, coalesce(new.stock_qty, 0), now())
+        on conflict (branch_id, inventory_item_id) do update set stock_qty = excluded.stock_qty, updated_at = now();
+        perform app.sync_stock_total(old.id);
+      end if;
+      -- Other columns only when they changed (no empty audit entries for a stock movement).
+      update public.inventory_items i set %s where i.id = old.id and (%s) is distinct from (%s);
+      return new;
+    end $body$;$f$, upd, lhs, rhs);
+end $mig$;
+
+drop trigger if exists inv_write on app.inv;
+create trigger inv_write instead of insert or update or delete on app.inv for each row execute function app.inv_write();
+
+-- inventory_items.stock_qty = the total across branches.
+create or replace function app.sync_stock_total(p_item uuid) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  perform set_config('app.stock_total_sync', 'on', true);
+  update public.inventory_items
+     set stock_qty = coalesce((select sum(stock_qty) from public.branch_stock where inventory_item_id = p_item), 0)
+   where id = p_item;
+  perform set_config('app.stock_total_sync', 'off', true);
+end $fn$;
+
+-- A direct write to inventory_items (the Inventory page, imports): new stock goes to the
+-- branch being worked in; a change to stock_qty is applied to that branch as a difference.
+create or replace function app.inventory_items_stock_write() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_b uuid := app.stock_branch_id();
+begin
+  if coalesce(current_setting('app.stock_total_sync', true), '') = 'on' then return new; end if;
+  if tg_op = 'INSERT' then
+    insert into public.branch_stock (branch_id, inventory_item_id, stock_qty)
+    values (v_b, new.id, coalesce(new.stock_qty, 0))
+    on conflict (branch_id, inventory_item_id) do update set stock_qty = excluded.stock_qty, updated_at = now();
+    return new;
+  end if;
+  if new.stock_qty is distinct from old.stock_qty then
+    insert into public.branch_stock (branch_id, inventory_item_id, stock_qty)
+    values (v_b, new.id, coalesce(new.stock_qty, 0) - coalesce(old.stock_qty, 0))
+    on conflict (branch_id, inventory_item_id) do update
+      set stock_qty = public.branch_stock.stock_qty + (coalesce(new.stock_qty, 0) - coalesce(old.stock_qty, 0)), updated_at = now();
+    new.stock_qty := coalesce((select sum(stock_qty) from public.branch_stock where inventory_item_id = new.id), 0);
+  end if;
+  return new;
+end $fn$;
+drop trigger if exists stock_write_after_insert on public.inventory_items;
+create trigger stock_write_after_insert after insert on public.inventory_items
+  for each row execute function app.inventory_items_stock_write();
+drop trigger if exists stock_write_before_update on public.inventory_items;
+create trigger stock_write_before_update before update of stock_qty on public.inventory_items
+  for each row execute function app.inventory_items_stock_write();
+
+-- ── 4. Availability per branch ──────────────────────────────────────────────
+alter table public.product_availability add column if not exists branch_id uuid references public.branches(id);
+update public.product_availability set branch_id = app.default_branch_id() where branch_id is null;
+alter table public.product_availability alter column branch_id set not null;
+drop index if exists public.product_availability_key_idx;
+create unique index if not exists product_availability_branch_key
+  on public.product_availability (branch_id, menu_item_id, variant_id) nulls not distinct;
+-- Readers (the guest menu, the kitchen, staff) see the availability of the branch in use.
+drop policy if exists branch_wall on public.product_availability;
+create policy branch_wall on public.product_availability as restrictive for select
+  using (branch_id = app.stock_branch_id());
+
+create or replace view app.pa as
+  select * from public.product_availability where branch_id = app.stock_branch_id();
+
+create or replace function app.apply_product_availability_result(
+  p_menu_item_id uuid, p_variant_id uuid, p_tracked boolean, p_status text, p_producible numeric,
+  p_bottleneck uuid, p_reason text, p_trigger_type text, p_trigger_reference text, p_actor text
+) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_prev record; v_b uuid := app.stock_branch_id();
+begin
+  if not p_tracked then
+    delete from public.product_availability
+     where branch_id = v_b and menu_item_id = p_menu_item_id and variant_id is not distinct from p_variant_id;
+    return;
+  end if;
+  select status, producible_qty into v_prev from public.product_availability
+   where branch_id = v_b and menu_item_id = p_menu_item_id and variant_id is not distinct from p_variant_id;
+  insert into public.product_availability
+    (branch_id, menu_item_id, variant_id, status, producible_qty, bottleneck_inventory_item_id, reason, updated_at)
+  values (v_b, p_menu_item_id, p_variant_id, p_status, p_producible, p_bottleneck, p_reason, now())
+  on conflict (branch_id, menu_item_id, variant_id) do update set
+    status = excluded.status, producible_qty = excluded.producible_qty,
+    bottleneck_inventory_item_id = excluded.bottleneck_inventory_item_id, reason = excluded.reason, updated_at = now();
+  if v_prev is null or v_prev.status is distinct from p_status or v_prev.producible_qty is distinct from p_producible then
+    insert into public.availability_audit_log
+      (menu_item_id, variant_id, previous_status, new_status, previous_producible_qty, new_producible_qty,
+       bottleneck_inventory_item_id, reason, trigger_type, trigger_reference, actor)
+    values (p_menu_item_id, p_variant_id, v_prev.status, p_status, v_prev.producible_qty, p_producible,
+            p_bottleneck, p_reason, p_trigger_type, p_trigger_reference, p_actor);
+    perform app.log_action('availability.changed', 'menu_items', p_menu_item_id::text, null,
+      jsonb_build_object('variant_id', p_variant_id, 'status', p_status, 'producible_qty', p_producible, 'reason', p_reason, 'branch_id', v_b));
+  end if;
+end $fn$;
+
+-- The stock and availability functions read and write the branch view.
+do $mig$
+declare fn record; def text; new_def text;
+begin
+  for fn in
+    select p.oid, p.proname from pg_proc p
+     where p.pronamespace in ('public'::regnamespace, 'app'::regnamespace) and p.prokind = 'f'
+       and p.proname in ('adjust_stock', 'place_order', 'receive_purchase_order', 'receive_purchase_order_line',
+                         'record_dish_waste', 'record_ingredient_waste', 'submit_stock_count', 'compute_product_capacity',
+                         'recalc_priority_allocation', 'get_product_availability_detail', 'deal_availability',
+                         'guard_order_line_availability', 'recalc_product_availability', 'recalc_products_for_ingredient',
+                         'on_modifier_option_availability_change', 'on_modifier_recipe_components_change')
+  loop
+    def := pg_get_functiondef(fn.oid);
+    new_def := regexp_replace(def, 'public\.inventory_items\M', 'app.inv', 'g');
+    new_def := regexp_replace(new_def, 'public\.product_availability\M', 'app.pa', 'g');
+    if new_def <> def then execute new_def; end if;
+  end loop;
+end $mig$;
+
+-- ── 5. Recalculate a branch when its stock changes; low stock per branch ────
+drop trigger if exists recalc_availability_on_stock_change on public.inventory_items;
+drop trigger if exists sync_low_stock_event on public.inventory_items;
+drop index if exists public.low_stock_events_one_open_idx;
+create unique index if not exists low_stock_events_one_open_per_branch
+  on public.low_stock_events (inventory_item_id, branch_id) where status = 'open';
+
+create or replace function app.on_branch_stock_change() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_prev text := current_setting('app.stock_branch', true); v_type text; v_min numeric; v_open uuid;
+begin
+  if tg_op = 'UPDATE' and new.stock_qty is not distinct from old.stock_qty then return new; end if;
+  perform set_config('app.stock_branch', new.branch_id::text, true);
+  -- Low stock, per branch, against the ingredient's reorder level.
+  select min_threshold into v_min from public.inventory_items where id = new.inventory_item_id;
+  select id into v_open from public.low_stock_events
+   where inventory_item_id = new.inventory_item_id and branch_id = new.branch_id and status = 'open';
+  if v_min is not null and new.stock_qty <= v_min then
+    if v_open is null then
+      insert into public.low_stock_events (inventory_item_id, branch_id, stock_at_open, threshold_at_open)
+      values (new.inventory_item_id, new.branch_id, new.stock_qty, v_min);
+    end if;
+  elsif v_open is not null then
+    update public.low_stock_events set status = 'resolved', resolved_at = now() where id = v_open;
+  end if;
+  -- Availability of the dishes that use it, in this branch.
+  v_type := case when tg_op = 'INSERT' or new.stock_qty > old.stock_qty then 'inventory_restock' else 'inventory_consumption' end;
+  if app.priority_allocation_on() then
+    perform app.recalc_priority_allocation(v_type, new.inventory_item_id::text, array[new.inventory_item_id]);
+  else
+    perform app.recalc_products_for_ingredient(new.inventory_item_id, v_type, null);
+  end if;
+  perform set_config('app.stock_branch', coalesce(v_prev, ''), true);
+  return new;
+end $fn$;
+drop trigger if exists on_branch_stock_change on public.branch_stock;
+create trigger on_branch_stock_change after insert or update of stock_qty on public.branch_stock
+  for each row execute function app.on_branch_stock_change();
+
+-- A changed reorder level re-checks every branch.
+create or replace function app.on_threshold_change() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if new.min_threshold is distinct from old.min_threshold then
+    update public.branch_stock set updated_at = now(), stock_qty = stock_qty where inventory_item_id = new.id;
+    -- (a no-op stock update does not fire the stock trigger, so check explicitly)
+    insert into public.low_stock_events (inventory_item_id, branch_id, stock_at_open, threshold_at_open)
+    select bs.inventory_item_id, bs.branch_id, bs.stock_qty, new.min_threshold from public.branch_stock bs
+     where bs.inventory_item_id = new.id and new.min_threshold is not null and bs.stock_qty <= new.min_threshold
+       and not exists (select 1 from public.low_stock_events l where l.inventory_item_id = bs.inventory_item_id and l.branch_id = bs.branch_id and l.status = 'open');
+    update public.low_stock_events l set status = 'resolved', resolved_at = now()
+      from public.branch_stock bs
+     where l.inventory_item_id = new.id and l.status = 'open' and bs.inventory_item_id = l.inventory_item_id and bs.branch_id = l.branch_id
+       and (new.min_threshold is null or bs.stock_qty > new.min_threshold);
+  end if;
+  return new;
+end $fn$;
+drop trigger if exists on_threshold_change on public.inventory_items;
+create trigger on_threshold_change after update of min_threshold on public.inventory_items
+  for each row execute function app.on_threshold_change();
+
+-- Reorder emails list each branch's low stock (the cron runs without a branch).
+do $mig$
+declare def text := pg_get_functiondef('public.pending_low_stock_reorders()'::regprocedure); before text;
+begin
+  before := def;
+  def := replace(def, 'select lse.id, ii.id, ii.name, ii.unit,
+           ii.stock_qty, ii.min_threshold, ii.target_stock_qty,',
+    'select lse.id, ii.id,
+           ii.name || case when (select count(*) from public.branches where status = ''active'') > 1
+                           then '' — '' || (select b.name from public.branches b where b.id = lse.branch_id) else '''' end,
+           ii.unit,
+           app.branch_qty(ii.id, lse.branch_id), ii.min_threshold, ii.target_stock_qty,');
+  def := replace(def, '- ii.stock_qty),', '- app.branch_qty(ii.id, lse.branch_id)),');
+  if def = before or position('ii.stock_qty' in def) > 0 then
+    raise exception '0101: unexpected shape of pending_low_stock_reorders()';
+  end if;
+  execute def;
+end $mig$;
+
+-- Stock rows and alerts belong to the branch whose stock moved.
+create or replace function app.fill_stock_branch() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if new.branch_id is null then new.branch_id := app.stock_branch_id(); end if;
+  return new;
+end $fn$;
+drop trigger if exists aa_fill_stock_branch on public.stock_ledger;
+create trigger aa_fill_stock_branch before insert on public.stock_ledger for each row execute function app.fill_stock_branch();
+
+-- ── 6. Receiving stocks the purchase order's own branch ─────────────────────
+do $mig$
+begin
+  if to_regprocedure('app._receive_purchase_order_impl(uuid)') is null then
+    alter function public.receive_purchase_order(uuid) set schema app;
+    alter function app.receive_purchase_order(uuid) rename to _receive_purchase_order_impl;
+  end if;
+  if to_regprocedure('app._receive_purchase_order_line_impl(uuid, numeric, numeric, text)') is null then
+    alter function public.receive_purchase_order_line(uuid, numeric, numeric, text) set schema app;
+    alter function app.receive_purchase_order_line(uuid, numeric, numeric, text) rename to _receive_purchase_order_line_impl;
+  end if;
+end $mig$;
+
+create or replace function public.receive_purchase_order(p_po_id uuid) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_b uuid; v_prev text := current_setting('app.stock_branch', true);
+begin
+  select branch_id into v_b from public.purchase_orders where id = p_po_id;
+  if v_b is not null and not app.branch_access(v_b) then
+    raise exception 'forbidden: this purchase order belongs to another branch' using errcode = 'insufficient_privilege';
+  end if;
+  perform set_config('app.stock_branch', coalesce(v_b::text, ''), true);
+  perform app._receive_purchase_order_impl(p_po_id);
+  perform set_config('app.stock_branch', coalesce(v_prev, ''), true);
+end $fn$;
+
+create or replace function public.receive_purchase_order_line(
+  p_line_id uuid, p_qty numeric, p_rejected_qty numeric default 0, p_reject_reason text default null
+) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_b uuid; v_prev text := current_setting('app.stock_branch', true);
+begin
+  select po.branch_id into v_b from public.purchase_order_lines l join public.purchase_orders po on po.id = l.purchase_order_id where l.id = p_line_id;
+  if v_b is not null and not app.branch_access(v_b) then
+    raise exception 'forbidden: this purchase order belongs to another branch' using errcode = 'insufficient_privilege';
+  end if;
+  perform set_config('app.stock_branch', coalesce(v_b::text, ''), true);
+  perform app._receive_purchase_order_line_impl(p_line_id, p_qty, p_rejected_qty, p_reject_reason);
+  perform set_config('app.stock_branch', coalesce(v_prev, ''), true);
+end $fn$;
+revoke all on function public.receive_purchase_order(uuid) from public;
+revoke all on function public.receive_purchase_order_line(uuid, numeric, numeric, text) from public;
+grant execute on function public.receive_purchase_order(uuid) to authenticated, service_role;
+grant execute on function public.receive_purchase_order_line(uuid, numeric, numeric, text) to authenticated, service_role;
+
+-- ── 7. Transfers between branches (never revenue or expense) ────────────────
+create or replace function public.transfer_stock(
+  p_inventory_item_id uuid, p_from_branch uuid, p_to_branch uuid, p_qty numeric, p_note text default null
+) returns uuid
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_transfer uuid := gen_random_uuid(); v_have numeric; v_cost numeric; v_name text; v_prev text := current_setting('app.stock_branch', true);
+begin
+  if not (app.has_perm('stock.update') or app.has_perm('inventory.manage') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if not app.branch_access(p_from_branch) then
+    raise exception 'forbidden: you cannot send stock from that branch' using errcode = 'insufficient_privilege';
+  end if;
+  if p_from_branch = p_to_branch then raise exception 'same_branch' using errcode = 'check_violation'; end if;
+  if coalesce(p_qty, 0) <= 0 then raise exception 'bad_qty' using errcode = 'check_violation'; end if;
+  if not exists (select 1 from public.branches where id = p_to_branch and status = 'active') then
+    raise exception 'branch_not_active' using errcode = 'check_violation';
+  end if;
+  select name, cost_cents_per_base_unit into v_name, v_cost from public.inventory_items where id = p_inventory_item_id;
+  if not found then raise exception 'item_not_found' using errcode = 'no_data_found'; end if;
+  v_have := app.branch_qty(p_inventory_item_id, p_from_branch);
+  if v_have < p_qty then
+    raise exception 'not_enough_stock: % has % of %', (select name from public.branches where id = p_from_branch), v_have, v_name
+      using errcode = 'check_violation';
+  end if;
+
+  perform set_config('app.stock_branch', p_from_branch::text, true);
+  update app.inv set stock_qty = stock_qty - p_qty where id = p_inventory_item_id;
+  insert into public.stock_ledger (inventory_item_id, branch_id, delta_qty, reason, note, unit_cost_cents_base)
+  values (p_inventory_item_id, p_from_branch, -p_qty, 'adjustment',
+          'Transfer to ' || (select name from public.branches where id = p_to_branch) || coalesce(' — ' || nullif(trim(p_note), ''), '') || ' [' || v_transfer || ']', v_cost);
+
+  perform set_config('app.stock_branch', p_to_branch::text, true);
+  update app.inv set stock_qty = stock_qty + p_qty where id = p_inventory_item_id;
+  insert into public.stock_ledger (inventory_item_id, branch_id, delta_qty, reason, note, unit_cost_cents_base)
+  values (p_inventory_item_id, p_to_branch, p_qty, 'adjustment',
+          'Transfer from ' || (select name from public.branches where id = p_from_branch) || coalesce(' — ' || nullif(trim(p_note), ''), '') || ' [' || v_transfer || ']', v_cost);
+
+  perform set_config('app.stock_branch', coalesce(v_prev, ''), true);
+  perform app.log_action('stock.transferred', 'inventory_items', p_inventory_item_id::text, null,
+    jsonb_build_object('from', p_from_branch, 'to', p_to_branch, 'qty', p_qty, 'transfer', v_transfer, 'note', p_note));
+  return v_transfer;
+end $fn$;
+revoke all on function public.transfer_stock(uuid, uuid, uuid, numeric, text) from public;
+grant execute on function public.transfer_stock(uuid, uuid, uuid, numeric, text) to authenticated, service_role;
+
+-- Stock in the branch being viewed, for the Inventory screen.
+create or replace function public.branch_stock_levels() returns table (inventory_item_id uuid, branch_id uuid, stock_qty numeric)
+language sql stable security definer set search_path = public, app as $fn$
+  select bs.inventory_item_id, bs.branch_id, bs.stock_qty from public.branch_stock bs
+   where (app.has_perm('stock.view') or app.is_staff()) and app.in_scope(bs.branch_id)
+$fn$;
+revoke all on function public.branch_stock_levels() from public;
+grant execute on function public.branch_stock_levels() to authenticated, service_role;
+
+-- Recompute every branch's availability once, from its own stock.
+do $mig$
+declare b record; prev text := current_setting('app.stock_branch', true);
+begin
+  for b in select id from public.branches where status = 'active' loop
+    perform set_config('app.stock_branch', b.id::text, true);
+    begin
+      perform public.recalculate_all_product_availability();
+    exception when others then
+      raise notice '0101: availability will refresh on the next stock change (%)', sqlerrm;
+    end;
+  end loop;
+  perform set_config('app.stock_branch', coalesce(prev, ''), true);
+end $mig$;
+
+-- ── 0102_branch_menu.sql ──
+-- ============================================================================
+-- 0102 — Multi-branch, phase 5: one menu, branch prices and availability.
+--
+-- Menu items, sizes, recipes and deals stay shared (no duplicated records).
+-- A branch may override a dish — or one size of it — with its own price,
+-- and may take it off its menu. place_order() charges the branch price and
+-- refuses a dish the branch has switched off; the guest menu and checkout
+-- show the same. Overrides are audited and need menu.update / branches.manage.
+-- ============================================================================
+
+create table if not exists public.branch_menu_overrides (
+  id           uuid primary key default gen_random_uuid(),
+  branch_id    uuid not null references public.branches(id) on delete cascade,
+  menu_item_id uuid not null references public.menu_items(id) on delete cascade,
+  variant_id   uuid references public.menu_variants(id) on delete cascade,
+  price_cents  int check (price_cents is null or price_cents >= 0),
+  is_available boolean,
+  updated_at   timestamptz not null default now(),
+  updated_by   uuid
+);
+create unique index if not exists branch_menu_overrides_key
+  on public.branch_menu_overrides (branch_id, menu_item_id, variant_id) nulls not distinct;
+
+alter table public.branch_menu_overrides enable row level security;
+drop policy if exists read_all on public.branch_menu_overrides;
+-- Prices and availability are public on the menu anyway; staff see their branches'.
+create policy read_all on public.branch_menu_overrides for select
+  using (app.jwt_role() = 'anon' or app.branch_access(branch_id));
+
+do $$ begin
+  if exists (select 1 from pg_proc where proname = 'audit_row' and pronamespace = 'app'::regnamespace) then
+    drop trigger if exists audit on public.branch_menu_overrides;
+    create trigger audit after insert or update or delete on public.branch_menu_overrides for each row execute function app.audit_row();
+  end if;
+end $$;
+
+-- Set (or clear, with both null) a branch's override for a dish or one of its sizes.
+create or replace function public.set_branch_menu_override(
+  p_branch_id uuid, p_menu_item_id uuid, p_variant_id uuid, p_price_cents int, p_is_available boolean
+) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not ((app.has_perm('menu.update') or app.has_perm('branches.manage') or app.can_write()) and app.branch_access(p_branch_id)) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_variant_id is not null and not exists (select 1 from public.menu_variants where id = p_variant_id and menu_item_id = p_menu_item_id) then
+    raise exception 'variant_not_of_item' using errcode = 'check_violation';
+  end if;
+  if p_price_cents is null and p_is_available is null then
+    delete from public.branch_menu_overrides
+     where branch_id = p_branch_id and menu_item_id = p_menu_item_id and variant_id is not distinct from p_variant_id;
+    return;
+  end if;
+  insert into public.branch_menu_overrides (branch_id, menu_item_id, variant_id, price_cents, is_available, updated_by)
+  values (p_branch_id, p_menu_item_id, p_variant_id, p_price_cents, p_is_available, app.jwt_sub())
+  on conflict (branch_id, menu_item_id, variant_id) do update
+    set price_cents = excluded.price_cents, is_available = excluded.is_available, updated_at = now(), updated_by = excluded.updated_by;
+end $fn$;
+revoke all on function public.set_branch_menu_override(uuid, uuid, uuid, int, boolean) from public;
+grant execute on function public.set_branch_menu_override(uuid, uuid, uuid, int, boolean) to authenticated, service_role;
+
+-- place_order: the branch's price and availability for a dish line.
+do $mig$
+declare
+  def text := pg_get_functiondef('public.place_order(text,text,text,integer,jsonb,integer,text,text)'::regprocedure);
+  anchor constant text := '       order by v.sort_order, v.created_at limit 1;
+    end if;
+
+    if not coalesce(v_avail, false) then
+      raise exception ''item_unavailable: %'', coalesce(v_item_name, v_item_id::text)';
+  addition constant text := '       order by v.sort_order, v.created_at limit 1;
+    end if;
+
+    -- Branch price / availability (0102): the order''s branch may price a dish (or a size) itself
+    -- or have switched it off. A size override wins over one for the whole dish.
+    select coalesce(o.price_cents, v_price), coalesce(v_avail, false) and coalesce(o.is_available, true)
+      into v_price, v_avail
+      from (select 1) x
+      left join lateral (
+        select bo.price_cents, bo.is_available from public.branch_menu_overrides bo
+         where bo.branch_id = app.stock_branch_id() and bo.menu_item_id = v_item_id
+           and (bo.variant_id = v_variant_id or bo.variant_id is null)
+         order by bo.variant_id nulls last limit 1) o on true;
+
+    if not coalesce(v_avail, false) then
+      raise exception ''item_unavailable: %'', coalesce(v_item_name, v_item_id::text)';
+begin
+  if position('branch_menu_overrides' in def) > 0 then return; end if;
+  if position(anchor in def) = 0 then raise exception '0102: unexpected shape of place_order()'; end if;
+  execute replace(def, anchor, addition);
+end $mig$;
+
+-- ── 0103_branch_deals.sql ──
+-- ============================================================================
+-- 0103 — Multi-branch: deals follow the branch menu.
+--
+-- A deal stays shared, at its own deal price. But a dish (or size) a branch
+-- has switched off (branch_menu_overrides.is_available = false, 0102) cannot
+-- be sold there inside a deal either: the deal's component lines are checked
+-- against the order's branch when they are written. The guest menu hides
+-- such deals and choices with the same rule.
+-- ============================================================================
+
+create or replace function app.guard_branch_deal_line() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_branch uuid; v_off boolean;
+begin
+  if new.deal_id is null or new.menu_item_id is null then return new; end if;
+  select o.branch_id into v_branch from public.orders o where o.id = new.order_id;
+  if v_branch is null then return new; end if;
+  -- A size override wins over one for the whole dish, as in place_order (0102).
+  select bo.is_available = false into v_off
+    from public.branch_menu_overrides bo
+   where bo.branch_id = v_branch and bo.menu_item_id = new.menu_item_id
+     and (bo.variant_id = new.variant_id or bo.variant_id is null)
+   order by bo.variant_id nulls last limit 1;
+  if coalesce(v_off, false) then
+    raise exception 'deal_item_unavailable: %', coalesce(new.name_snapshot, '?') using errcode = 'check_violation';
+  end if;
+  return new;
+end $fn$;
+
+drop trigger if exists guard_branch_deal_line on public.order_lines;
+create trigger guard_branch_deal_line before insert on public.order_lines
+  for each row execute function app.guard_branch_deal_line();
+
+-- ── 0104_branch_logins.sql ──
+-- ============================================================================
+-- 0104 — Multi-branch: branch panel logins, set up by the owner.
+--
+-- The owner's panel sees every branch. Each branch gets its own logins (a
+-- membership limited to that branch, created from the owner's Branches page):
+-- they sign in at the same login page and get the same panel, showing only
+-- their branch. This migration:
+--   1. lets only head office (a login with no branch limit) create, edit or
+--      deactivate branches — a branch login never manages branches;
+--   2. adds the Branch manager role: Manager without the keys that change what
+--      every branch shares (the menu, sizes, deals, suppliers, sold-out toggles);
+--   3. a selected branch the login can't use is ignored (it sees its own), never "nothing";
+--   4. my_branch_limited(): whether the signed-in login is limited to branches.
+-- ============================================================================
+
+-- 1. Branch management is head office only.
+do $mig$
+declare f text; def text;
+begin
+  foreach f in array array[
+    'public.create_branch(text,text,text,text,text,text,text,text,jsonb)',
+    'public.update_branch(uuid,text,text,text,text,text,text,text,jsonb,jsonb)',
+    'public.set_branch_status(uuid,text,text)'
+  ] loop
+    def := pg_get_functiondef(f::regprocedure);
+    if position('app.allowed_branch_ids() is not null or not app.has_perm(''branches.manage'')' in def) > 0 then continue; end if;
+    if position('if not app.has_perm(''branches.manage'')' in def) = 0 then
+      raise exception '0104: unexpected shape of %', f;
+    end if;
+    execute replace(def, 'if not app.has_perm(''branches.manage'')',
+                         'if app.allowed_branch_ids() is not null or not app.has_perm(''branches.manage'')');
+  end loop;
+end $mig$;
+
+-- 2. The Branch manager role (memberships.role is an enum; the new value is used by later requests).
+alter type app.member_role add value if not exists 'branch_manager';
+
+insert into public.roles (key, name, permissions, is_system)
+select 'branch_manager', 'Branch manager',
+       array(select p from unnest(r.permissions) p
+              where p not in ('menu.create', 'menu.update', 'menu.archive',
+                              'variants.create', 'variants.update', 'variants.archive',
+                              'deals.create', 'deals.update', 'deals.archive',
+                              'supplier.create', 'supplier.update', 'supplier.manage',
+                              'availability.update', 'branches.manage', 'permissions.assign')
+                and p not like 'staff.%' and p not like 'roles.%' and p not like 'portals.%' and p not like 'settings.%'
+              order by p),
+       true
+  from public.roles r where r.key = 'manager'
+on conflict (key) do nothing;
+
+-- 3. The selected branches only ever narrow a login to its own: a selection naming none of
+--    them (e.g. a branch cookie left in a browser shared with the owner) means "all of mine",
+--    not "nothing".
+create or replace function app.selected_branch_ids() returns uuid[]
+language plpgsql stable set search_path = public, app as $fn$
+declare
+  raw text := nullif(trim(coalesce(nullif(current_setting('request.headers', true), '')::json ->> 'x-branch-ids', '')), '');
+  v uuid[];
+  v_allowed uuid[];
+begin
+  if raw is null then return null; end if;
+  select array_agg(x::uuid) into v
+    from unnest(string_to_array(raw, ',')) x
+   where trim(x) ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$';
+  if v is null then return null; end if;
+  v_allowed := app.allowed_branch_ids();
+  if v_allowed is not null then
+    v := array(select x from unnest(v) x where x = any(v_allowed));
+    if cardinality(v) = 0 then return null; end if;
+  end if;
+  return v;
+end $fn$;
+
+-- 4. Is the signed-in login limited to some branches?
+create or replace function public.my_branch_limited() returns boolean
+language sql stable security definer set search_path = public, app as $fn$
+  select app.allowed_branch_ids() is not null
+$fn$;
+revoke all on function public.my_branch_limited() from public;
+grant execute on function public.my_branch_limited() to authenticated, service_role;
+
+-- ── 0105_branch_operations.sql ──
+-- ============================================================================
+-- 0105 — Multi-branch: every branch runs its own operations.
+--
+-- A branch login (limited to its branch, 0104) works the whole panel for its
+-- branch and never sees another branch's data:
+--   1. Suppliers belong to a branch or are shared. The owner's suppliers stay
+--      shared (branch_id null); a supplier a branch login adds is that branch's
+--      own. Its price list, messages, payments and credit notes follow it, so
+--      DHA's suppliers and what DHA pays them are invisible to Clifton. A branch
+--      reads shared suppliers but only the owner changes them. Supplier
+--      payments/credit notes to shared suppliers are made by head office and
+--      stay with the owner.
+--   2. The Branch manager role gets every feature, except what belongs to the
+--      owner: portals, branches, billing, staff and roles, settings, the shared
+--      menu, sizes, deals and recipes, sold-out toggles on the shared menu,
+--      ledger corrections, adding ingredients to the shared list, and social.
+-- ============================================================================
+
+-- 1. Suppliers per branch ------------------------------------------------------
+alter table public.suppliers add column if not exists branch_id uuid references public.branches(id);
+create index if not exists suppliers_branch_idx on public.suppliers (branch_id);
+
+-- May the caller change a supplier of this branch (null = shared)? Shared: head office only.
+create or replace function app.supplier_write_ok(p_branch uuid) returns boolean
+language sql stable security definer set search_path = public, app as $fn$
+  select case when p_branch is null then app.allowed_branch_ids() is null else app.branch_access(p_branch) end
+$fn$;
+grant execute on function app.supplier_write_ok(uuid) to authenticated, anon, service_role;
+
+-- A branch login's new supplier is its branch's own; only head office moves a supplier.
+create or replace function app.fill_supplier_branch() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if tg_op = 'INSERT' then
+    if new.branch_id is null and app.allowed_branch_ids() is not null then
+      new.branch_id := app.request_branch_id();
+    end if;
+  elsif new.branch_id is distinct from old.branch_id and app.allowed_branch_ids() is not null then
+    raise exception 'forbidden: only the owner moves a supplier between branches' using errcode = 'insufficient_privilege';
+  end if;
+  return new;
+end $fn$;
+drop trigger if exists fill_supplier_branch on public.suppliers;
+create trigger fill_supplier_branch before insert or update of branch_id on public.suppliers
+  for each row execute function app.fill_supplier_branch();
+
+drop policy if exists branch_wall_read on public.suppliers;
+drop policy if exists branch_wall_insert on public.suppliers;
+drop policy if exists branch_wall_update on public.suppliers;
+drop policy if exists branch_wall_delete on public.suppliers;
+create policy branch_wall_read on public.suppliers as restrictive for select
+  using (branch_id is null or app.in_scope(branch_id));
+create policy branch_wall_insert on public.suppliers as restrictive for insert
+  with check (app.supplier_write_ok(branch_id));
+create policy branch_wall_update on public.suppliers as restrictive for update
+  using (app.supplier_write_ok(branch_id)) with check (app.supplier_write_ok(branch_id));
+create policy branch_wall_delete on public.suppliers as restrictive for delete
+  using (app.supplier_write_ok(branch_id));
+
+-- Price lists and messages follow their supplier: visible when it is, changed only when it may be.
+do $mig$
+declare t text;
+begin
+  foreach t in array array['supplier_items', 'supplier_communications'] loop
+    if to_regclass('public.' || t) is null then continue; end if;
+    execute format('drop policy if exists branch_wall_read on public.%I', t);
+    execute format('drop policy if exists branch_wall_write on public.%I', t);
+    execute format('drop policy if exists branch_wall_insert on public.%I', t);
+    execute format('drop policy if exists branch_wall_update on public.%I', t);
+    execute format('drop policy if exists branch_wall_delete on public.%I', t);
+    execute format($p$create policy branch_wall_read on public.%I as restrictive for select
+      using (exists (select 1 from public.suppliers s where s.id = supplier_id))$p$, t);
+    execute format($p$create policy branch_wall_insert on public.%I as restrictive for insert
+      with check (exists (select 1 from public.suppliers s where s.id = supplier_id and app.supplier_write_ok(s.branch_id)))$p$, t);
+    execute format($p$create policy branch_wall_update on public.%I as restrictive for update
+      using (exists (select 1 from public.suppliers s where s.id = supplier_id and app.supplier_write_ok(s.branch_id)))
+      with check (exists (select 1 from public.suppliers s where s.id = supplier_id and app.supplier_write_ok(s.branch_id)))$p$, t);
+    execute format($p$create policy branch_wall_delete on public.%I as restrictive for delete
+      using (exists (select 1 from public.suppliers s where s.id = supplier_id and app.supplier_write_ok(s.branch_id)))$p$, t);
+  end loop;
+end $mig$;
+
+-- Supplier payments and credit notes: head office sees all; a branch login only those to its own suppliers.
+do $mig$
+declare t text;
+begin
+  foreach t in array array['supplier_payments', 'supplier_credit_notes'] loop
+    if to_regclass('public.' || t) is null then continue; end if;
+    execute format('drop policy if exists branch_wall_read on public.%I', t);
+    execute format($p$create policy branch_wall_read on public.%I as restrictive for select
+      using (app.allowed_branch_ids() is null
+             or exists (select 1 from public.suppliers s where s.id = supplier_id and s.branch_id is not null))$p$, t);
+  end loop;
+end $mig$;
+
+-- 2. The Branch manager role: the whole panel for its branch ----------------------
+update public.roles
+   set permissions = array(
+     select c.key from public.permission_catalog c
+      where c.key not like 'portals.%' and c.key not like 'branches.%' and c.key not like 'social.%'
+        and c.key not in (
+          'permissions.assign', 'settings.update',
+          'staff.create', 'staff.update', 'staff.delete',
+          'menu.create', 'menu.update', 'menu.delete',
+          'variants.create', 'variants.update', 'variants.archive',
+          'deals.create', 'deals.update', 'deals.archive',
+          'availability.update', 'inventory.manage', 'inventory.manage_recipes', 'finance.manage_recipes',
+          'finance.adjust_ledger')
+      order by c.key)
+ where key = 'branch_manager';
+
+-- Branch managers who already have a login pick the new permissions up on their next sign-in.
+do $mig$
+declare v_perms text[];
+begin
+  select permissions into v_perms from public.roles where key = 'branch_manager';
+  update auth.users u
+     set raw_app_meta_data = coalesce(u.raw_app_meta_data, '{}'::jsonb) || jsonb_build_object('permissions', to_jsonb(v_perms))
+    from public.memberships m
+   where m.user_id = u.id and m.role::text = 'branch_manager' and coalesce(cardinality(m.extra_permissions), 0) = 0;
+end $mig$;
+
+-- ── 0106_inventory_stock_view.sql ──
+-- ============================================================================
+-- 0106 — Multi-branch: stock as the branch in view sees it.
+--
+-- inventory_items.stock_qty is the total across every branch (0101). Screens,
+-- reports, exports and the AI read public.inventory_stock instead: the same
+-- columns, with stock_qty = the stock of the branches in view —
+--   * a branch login: its own branch(es), never another branch's stock;
+--   * the owner with a branch selected: that branch;
+--   * the owner on "All branches" (or a restaurant with one branch): the total.
+-- Writes still go to inventory_items (0101 applies them to the branch in use).
+-- ============================================================================
+
+do $mig$
+declare cols text;
+begin
+  select string_agg(case when attname = 'stock_qty'
+                         then $c$case when app.selected_branch_ids() is null and app.allowed_branch_ids() is null then i.stock_qty
+             else coalesce((select sum(bs.stock_qty) from public.branch_stock bs
+                             where bs.inventory_item_id = i.id and app.in_scope(bs.branch_id)), 0)::numeric(14,3) end as stock_qty$c$
+                         else 'i.' || quote_ident(attname) end, ', ' order by attnum)
+    into cols
+    from pg_attribute where attrelid = 'public.inventory_items'::regclass and attnum > 0 and not attisdropped;
+  execute 'drop view if exists public.inventory_stock';
+  -- security_invoker: inventory_items' own row security applies to whoever reads.
+  execute 'create view public.inventory_stock with (security_invoker = on) as select ' || cols || ' from public.inventory_items i';
+end $mig$;
+
+grant select on public.inventory_stock to authenticated, service_role;
+
+-- ── 0107_retire_in_db_branch_logins.sql ──
+-- ============================================================================
+-- 0107 — Retire the in-database branch logins (0098–0106).
+--
+-- Branches are now separate restaurants, each with its own project, created
+-- from the owner panel (control-plane 0025). The screens that limited a
+-- portal or staff login to some branches of this database are gone, so no
+-- login may stay limited by a setting nobody can see or change any more:
+-- every portal and membership works across the whole restaurant again.
+--
+-- The branch tables, their rows and the functions stay — nothing is deleted.
+-- ============================================================================
+
+update public.portals     set branch_ids = '{}' where cardinality(branch_ids) > 0;
+update public.memberships set branch_ids = '{}' where cardinality(branch_ids) > 0;
+-- ============================================================================
+-- 0108 — AI settings per module.
+--
+-- One restaurant-wide default (module = 'global') plus an optional override
+-- for each portal module (pos, kitchen, inventory, finance, …): the languages
+-- the assistant listens for and answers in, whether language is detected
+-- automatically, and whether voice input and spoken answers are offered. A NULL column inherits from 'global', and
+-- 'global' from the built-in defaults (packages/shared/src/aiConfig.ts).
+--
+-- Only the API writes here, with the service role, after checking
+-- settings.update — so no client policies are granted. These settings never
+-- widen access: the assistant still sees and does only what the signed-in
+-- person's own permissions allow.
+-- ============================================================================
+
+create table if not exists public.ai_module_settings (
+  module            text primary key check (module ~ '^[a-z_]{2,32}$'),
+  input_language    text check (input_language ~ '^(auto|[a-z]{2}(-[A-Za-z]{2,4})?)$'),
+  response_language text check (response_language ~ '^(auto|[a-z]{2}(-[A-Za-z]{2,4})?)$'),
+  auto_detect       boolean,
+  voice_input       boolean,
+  voice_output      boolean,
+  voice_name        text check (char_length(voice_name) <= 120),
+  updated_at        timestamptz not null default now(),
+  updated_by        uuid
+);
+
+alter table public.ai_module_settings enable row level security;
+revoke all on table public.ai_module_settings from anon, authenticated;
+grant all on table public.ai_module_settings to service_role;
+
+
+-- ============================================================================
+-- 0109 — Wastage management.
+--
+-- A waste entry records WHAT was wasted (ingredient, quantity in the unit it
+-- was entered in and in the base unit), WHY (reason + note), WHEN, at WHICH
+-- branch and WHO was responsible. It moves stock through the existing stock
+-- ledger (reason 'spoilage'), so Finance (WASTE_RECORDED), costing reports and
+-- the AI read it exactly as before; nothing else writes stock for waste.
+--
+--   pending  → approved  stock deducted once (ledger row), cost fixed at the
+--              weighted-average cost of that moment
+--   pending  → rejected  nothing moves
+--   approved → reversed  stock put back once, at the same cost (the finance
+--              event is a negative waste, see ledger_on_simple below)
+--
+-- Who: inventory.manage_waste / stock.adjust / inventory.manage / owner and
+-- manager record and approve (their entries apply at once, as before);
+-- kitchen.record_waste alone records entries that wait for approval.
+--
+-- Double counting: waste of food already deducted by an order's recipe (a
+-- cooked dish sent back, a cooking error on a ticket) is recorded against
+-- that order and is NEVER deducted again — it is "already consumed" and is
+-- capped at what the order actually used of that ingredient.
+--
+-- Idempotency: a client request id (unique) makes a retried submit return
+-- the first entry instead of recording it twice; status changes lock the row.
+--
+-- Expiry: there is no batch tracking, so an optional shelf life per
+-- ingredient lets the app estimate (first in, first out over receipts) which
+-- stock is getting old. It is an estimate and is labelled as one.
+-- ============================================================================
+
+-- ── 1. Waste entries ────────────────────────────────────────────────────────
+create table if not exists public.waste_entries (
+  id                    uuid primary key default gen_random_uuid(),
+  request_id            uuid unique,
+  branch_id             uuid references public.branches(id),
+  inventory_item_id     uuid not null references public.inventory_items(id) on delete restrict,
+  qty_base              numeric(14,3) not null check (qty_base > 0),
+  entered_qty           numeric(14,3) not null check (entered_qty > 0),
+  entered_unit          text not null check (char_length(entered_unit) between 1 and 40),
+  reason                text not null check (reason in ('expiry', 'spoilage', 'preparation', 'cooking_error', 'overproduction', 'spillage', 'other')),
+  note                  text check (char_length(note) <= 500),
+  occurred_on           date not null,
+  responsible_member_id uuid references public.memberships(id) on delete set null,
+  order_id              uuid references public.orders(id) on delete set null,
+  already_consumed      boolean not null default false,
+  status                text not null default 'pending' check (status in ('pending', 'approved', 'rejected', 'reversed')),
+  unit_cost_cents_base  numeric(14,4),
+  cost_cents            bigint,
+  stock_ledger_id       uuid references public.stock_ledger(id) on delete set null,
+  reversal_ledger_id    uuid references public.stock_ledger(id) on delete set null,
+  recorded_by           uuid,
+  recorded_at           timestamptz not null default now(),
+  decided_by            uuid,
+  decided_at            timestamptz,
+  decision_note         text check (char_length(decision_note) <= 500),
+  reversed_by           uuid,
+  reversed_at           timestamptz,
+  reversal_reason       text check (char_length(reversal_reason) <= 500)
+);
+create index if not exists waste_entries_recorded_idx on public.waste_entries (recorded_at desc);
+create index if not exists waste_entries_item_idx on public.waste_entries (inventory_item_id, recorded_at desc);
+create index if not exists waste_entries_pending_idx on public.waste_entries (status) where status = 'pending';
+create index if not exists waste_entries_order_idx on public.waste_entries (order_id, inventory_item_id) where order_id is not null;
+create index if not exists waste_entries_ledger_idx on public.waste_entries (stock_ledger_id);
+create index if not exists waste_entries_reversal_idx on public.waste_entries (reversal_ledger_id);
+
+-- ── 2. Shelf life per ingredient (for expiry estimates) ─────────────────────
+create table if not exists public.inventory_shelf_life (
+  inventory_item_id uuid primary key references public.inventory_items(id) on delete cascade,
+  shelf_life_days   int not null check (shelf_life_days between 1 and 3650),
+  updated_at        timestamptz not null default now(),
+  updated_by        uuid
+);
+
+-- ── 3. Permissions ──────────────────────────────────────────────────────────
+create or replace function app.can_approve_waste() returns boolean
+language sql stable set search_path = public, app as $fn$
+  select coalesce(app.has_perm('inventory.manage_waste') or app.has_perm('stock.adjust')
+                  or app.has_perm('inventory.manage') or app.can_write(), false)
+$fn$;
+create or replace function app.can_record_waste() returns boolean
+language sql stable set search_path = public, app as $fn$
+  select coalesce(app.can_approve_waste() or app.has_perm('kitchen.record_waste'), false)
+$fn$;
+create or replace function app.can_view_waste() returns boolean
+language sql stable set search_path = public, app as $fn$
+  select coalesce(app.can_record_waste() or app.has_perm('stock.history') or app.has_perm('inventory.view_cost'), false)
+$fn$;
+grant execute on function app.can_approve_waste(), app.can_record_waste(), app.can_view_waste() to authenticated, service_role;
+
+alter table public.waste_entries enable row level security;
+drop policy if exists staff_read on public.waste_entries;
+create policy staff_read on public.waste_entries for select
+  using (app.can_view_waste() and app.in_scope(branch_id));
+revoke insert, update, delete on public.waste_entries from anon, authenticated;
+grant select on public.waste_entries to authenticated;
+grant all on public.waste_entries to service_role;
+
+alter table public.inventory_shelf_life enable row level security;
+drop policy if exists staff_read on public.inventory_shelf_life;
+create policy staff_read on public.inventory_shelf_life for select
+  using (app.has_perm('stock.view') or app.is_staff());
+revoke insert, update, delete on public.inventory_shelf_life from anon, authenticated;
+grant select on public.inventory_shelf_life to authenticated;
+grant all on public.inventory_shelf_life to service_role;
+
+-- ── 4. Units ────────────────────────────────────────────────────────────────
+-- How many base units one entered unit is: the base unit itself (1), the
+-- item's purchase unit (purchase_unit_to_base), or a metric relative of the
+-- base unit (kg ↔ g, L ↔ ml). NULL = not convertible (rejected).
+create or replace function app.metric_unit(p_unit text, out family text, out scale numeric)
+language sql immutable as $fn$
+  select case when u in ('mg') then 'weight' when u in ('g', 'gm', 'gram', 'grams') then 'weight'
+              when u in ('kg', 'kgs', 'kilo', 'kilogram', 'kilograms') then 'weight'
+              when u in ('ml', 'millilitre', 'milliliter') then 'volume'
+              when u in ('l', 'ltr', 'litre', 'liter', 'litres', 'liters') then 'volume' end,
+         case when u in ('mg') then 0.001 when u in ('g', 'gm', 'gram', 'grams') then 1
+              when u in ('kg', 'kgs', 'kilo', 'kilogram', 'kilograms') then 1000
+              when u in ('ml', 'millilitre', 'milliliter') then 1
+              when u in ('l', 'ltr', 'litre', 'liter', 'litres', 'liters') then 1000 end
+    from (select lower(trim(coalesce(p_unit, ''))) as u) s
+$fn$;
+
+create or replace function app.waste_unit_factor(p_item uuid, p_unit text) returns numeric
+language plpgsql stable set search_path = public, app as $fn$
+declare i public.inventory_items; u text := lower(trim(coalesce(p_unit, ''))); a record; b record;
+begin
+  select * into i from public.inventory_items where id = p_item;
+  if not found then return null; end if;
+  if u = '' or u = lower(trim(i.unit)) then return 1; end if;
+  if i.purchase_unit_label is not null and u = lower(trim(i.purchase_unit_label)) then return i.purchase_unit_to_base; end if;
+  select * into a from app.metric_unit(u);
+  select * into b from app.metric_unit(i.unit);
+  if a.family is not null and a.family = b.family then return a.scale / b.scale; end if;
+  return null;
+end $fn$;
+
+-- ── 5. Recording, approving, rejecting, reversing ──────────────────────────
+create or replace function app.waste_entry_json(p_id uuid) returns jsonb
+language sql stable security definer set search_path = public, app as $fn$
+  select to_jsonb(e) || jsonb_build_object('stock_qty', app.branch_qty(e.inventory_item_id, e.branch_id))
+    from public.waste_entries e where e.id = p_id
+$fn$;
+revoke all on function app.waste_entry_json(uuid) from public;
+
+-- Deduct a pending entry exactly once. Internal: callers check permissions.
+create or replace function app.apply_waste_entry(p_id uuid, p_note text default null) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  e public.waste_entries; v_cost numeric; v_ledger uuid; v_new numeric;
+  v_prev text := current_setting('app.stock_branch', true);
+begin
+  select * into e from public.waste_entries where id = p_id for update;
+  if not found then raise exception 'waste_entry_not_found' using errcode = 'no_data_found'; end if;
+  if e.status <> 'pending' then raise exception 'waste_entry_already_%', e.status using errcode = 'check_violation'; end if;
+
+  select cost_cents_per_base_unit into v_cost from public.inventory_items where id = e.inventory_item_id;
+  if not e.already_consumed then
+    perform set_config('app.stock_branch', e.branch_id::text, true);
+    -- Lock this branch's stock row so two entries can't both pass the check.
+    perform 1 from public.branch_stock where branch_id = e.branch_id and inventory_item_id = e.inventory_item_id for update;
+    update app.inv set stock_qty = stock_qty - e.qty_base
+     where id = e.inventory_item_id and stock_qty >= e.qty_base
+     returning stock_qty into v_new;
+    if not found then
+      perform set_config('app.stock_branch', coalesce(v_prev, ''), true);
+      raise exception 'insufficient_stock: %', e.inventory_item_id using errcode = 'check_violation';
+    end if;
+    insert into public.stock_ledger (inventory_item_id, branch_id, delta_qty, reason, note, unit_cost_cents_base)
+    values (e.inventory_item_id, e.branch_id, -e.qty_base, 'spoilage',
+            'Waste (' || replace(e.reason, '_', ' ') || ')' || coalesce(': ' || nullif(trim(e.note), ''), ''), v_cost)
+    returning id into v_ledger;
+    perform set_config('app.stock_branch', coalesce(v_prev, ''), true);
+  end if;
+
+  update public.waste_entries
+     set status = 'approved', unit_cost_cents_base = v_cost, cost_cents = round(e.qty_base * coalesce(v_cost, 0))::bigint,
+         stock_ledger_id = v_ledger, decided_by = app.jwt_sub(), decided_at = now(),
+         decision_note = coalesce(nullif(trim(p_note), ''), decision_note)
+   where id = p_id;
+end $fn$;
+revoke all on function app.apply_waste_entry(uuid, text) from public;
+
+create or replace function public.record_waste_entry(
+  p_inventory_item_id uuid, p_qty numeric, p_unit text, p_reason text,
+  p_note text default null, p_occurred_on date default null,
+  p_responsible_member_id uuid default null, p_order_id uuid default null,
+  p_request_id uuid default null, p_branch_id uuid default null
+) returns jsonb
+language plpgsql security definer set search_path = public, app as $fn$
+declare
+  v_factor numeric; v_base numeric; v_branch uuid; v_today date := coalesce(app.business_day(now()), current_date);
+  v_on date; v_member uuid; v_id uuid; v_used numeric; v_logged numeric;
+begin
+  if not app.can_record_waste() then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+
+  if p_request_id is not null then
+    select id into v_id from public.waste_entries where request_id = p_request_id;
+    if found then return app.waste_entry_json(v_id) || '{"duplicate": true}'::jsonb; end if;
+  end if;
+
+  if coalesce(p_qty, 0) <= 0 then raise exception 'bad_qty' using errcode = 'check_violation'; end if;
+  if p_reason is null or p_reason not in ('expiry', 'spoilage', 'preparation', 'cooking_error', 'overproduction', 'spillage', 'other') then
+    raise exception 'bad_reason' using errcode = 'check_violation';
+  end if;
+  if p_reason = 'other' and coalesce(trim(p_note), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  if not exists (select 1 from public.inventory_items where id = p_inventory_item_id) then
+    raise exception 'inventory_item_not_found' using errcode = 'foreign_key_violation';
+  end if;
+  v_factor := app.waste_unit_factor(p_inventory_item_id, p_unit);
+  if v_factor is null then raise exception 'bad_unit' using errcode = 'check_violation'; end if;
+  v_base := round(p_qty * v_factor, 3);
+  if v_base <= 0 then raise exception 'bad_qty' using errcode = 'check_violation'; end if;
+
+  v_on := coalesce(p_occurred_on, v_today);
+  if v_on > v_today or v_on < v_today - 31 then raise exception 'bad_date' using errcode = 'check_violation'; end if;
+
+  v_branch := coalesce(p_branch_id, app.stock_branch_id());
+  if not app.branch_access(v_branch) then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+
+  v_member := coalesce(p_responsible_member_id, app.my_membership_id());
+  if p_responsible_member_id is not null and not exists (select 1 from public.memberships where id = p_responsible_member_id) then
+    raise exception 'bad_member' using errcode = 'foreign_key_violation';
+  end if;
+
+  -- Food an order already used: never deducted again, and no more than that order used.
+  if p_order_id is not null then
+    perform pg_advisory_xact_lock(hashtext('waste:' || p_order_id::text || ':' || p_inventory_item_id::text));
+    select coalesce(-sum(delta_qty), 0) into v_used from public.stock_ledger
+     where order_id = p_order_id and inventory_item_id = p_inventory_item_id and reason = 'order_deduction';
+    if v_used <= 0 then raise exception 'not_used_by_order' using errcode = 'check_violation'; end if;
+    select coalesce(sum(qty_base), 0) into v_logged from public.waste_entries
+     where order_id = p_order_id and inventory_item_id = p_inventory_item_id and status in ('pending', 'approved');
+    if v_logged + v_base > v_used then raise exception 'exceeds_order_usage' using errcode = 'check_violation'; end if;
+  end if;
+
+  begin
+    insert into public.waste_entries
+      (request_id, branch_id, inventory_item_id, qty_base, entered_qty, entered_unit, reason, note, occurred_on,
+       responsible_member_id, order_id, already_consumed, recorded_by)
+    values
+      (p_request_id, v_branch, p_inventory_item_id, v_base, p_qty,
+       coalesce(nullif(trim(p_unit), ''), (select unit from public.inventory_items where id = p_inventory_item_id)), p_reason,
+       nullif(trim(p_note), ''), v_on, v_member, p_order_id, p_order_id is not null, app.jwt_sub())
+    returning id into v_id;
+  exception when unique_violation then
+    -- The same request arrived twice at the same moment: return the first.
+    select id into v_id from public.waste_entries where request_id = p_request_id;
+    if v_id is null then raise; end if;
+    return app.waste_entry_json(v_id) || '{"duplicate": true}'::jsonb;
+  end;
+
+  perform app.log_action('inventory.waste_recorded', 'waste_entries', v_id::text, null,
+    jsonb_build_object('inventory_item_id', p_inventory_item_id, 'qty_base', v_base, 'entered', p_qty || ' ' || coalesce(p_unit, ''),
+                       'reason', p_reason, 'order_id', p_order_id, 'branch_id', v_branch));
+
+  if app.can_approve_waste() then perform app.apply_waste_entry(v_id, null); end if;
+  return app.waste_entry_json(v_id);
+end $fn$;
+revoke all on function public.record_waste_entry(uuid, numeric, text, text, text, date, uuid, uuid, uuid, uuid) from public;
+grant execute on function public.record_waste_entry(uuid, numeric, text, text, text, date, uuid, uuid, uuid, uuid) to authenticated, service_role;
+
+create or replace function public.approve_waste_entry(p_id uuid, p_note text default null) returns jsonb
+language plpgsql security definer set search_path = public, app as $fn$
+declare v_branch uuid;
+begin
+  if not app.can_approve_waste() then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  select branch_id into v_branch from public.waste_entries where id = p_id;
+  if not found then raise exception 'waste_entry_not_found' using errcode = 'no_data_found'; end if;
+  if not app.branch_access(v_branch) then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  perform app.apply_waste_entry(p_id, p_note);
+  perform app.log_action('inventory.waste_approved', 'waste_entries', p_id::text, null, jsonb_build_object('note', p_note));
+  return app.waste_entry_json(p_id);
+end $fn$;
+revoke all on function public.approve_waste_entry(uuid, text) from public;
+grant execute on function public.approve_waste_entry(uuid, text) to authenticated, service_role;
+
+create or replace function public.reject_waste_entry(p_id uuid, p_note text) returns jsonb
+language plpgsql security definer set search_path = public, app as $fn$
+declare e public.waste_entries;
+begin
+  if not app.can_approve_waste() then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  if coalesce(trim(p_note), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  select * into e from public.waste_entries where id = p_id for update;
+  if not found then raise exception 'waste_entry_not_found' using errcode = 'no_data_found'; end if;
+  if not app.branch_access(e.branch_id) then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  if e.status <> 'pending' then raise exception 'waste_entry_already_%', e.status using errcode = 'check_violation'; end if;
+  update public.waste_entries set status = 'rejected', decided_by = app.jwt_sub(), decided_at = now(), decision_note = trim(p_note)
+   where id = p_id;
+  perform app.log_action('inventory.waste_rejected', 'waste_entries', p_id::text, null, jsonb_build_object('note', p_note));
+  return app.waste_entry_json(p_id);
+end $fn$;
+revoke all on function public.reject_waste_entry(uuid, text) from public;
+grant execute on function public.reject_waste_entry(uuid, text) to authenticated, service_role;
+
+-- Put an approved entry's stock back, once, at the cost it was taken out at.
+create or replace function public.reverse_waste_entry(p_id uuid, p_reason text) returns jsonb
+language plpgsql security definer set search_path = public, app as $fn$
+declare e public.waste_entries; v_ledger uuid; v_prev text := current_setting('app.stock_branch', true);
+begin
+  if not app.can_approve_waste() then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  if coalesce(trim(p_reason), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  select * into e from public.waste_entries where id = p_id for update;
+  if not found then raise exception 'waste_entry_not_found' using errcode = 'no_data_found'; end if;
+  if not app.branch_access(e.branch_id) then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  if e.status <> 'approved' then raise exception 'waste_entry_not_reversible' using errcode = 'check_violation'; end if;
+
+  if e.stock_ledger_id is not null then
+    perform set_config('app.stock_branch', e.branch_id::text, true);
+    perform 1 from public.branch_stock where branch_id = e.branch_id and inventory_item_id = e.inventory_item_id for update;
+    update app.inv set stock_qty = stock_qty + e.qty_base where id = e.inventory_item_id;
+    insert into public.stock_ledger (inventory_item_id, branch_id, delta_qty, reason, note, unit_cost_cents_base)
+    values (e.inventory_item_id, e.branch_id, e.qty_base, 'spoilage', 'Waste reversed: ' || trim(p_reason), e.unit_cost_cents_base)
+    returning id into v_ledger;
+    perform set_config('app.stock_branch', coalesce(v_prev, ''), true);
+  end if;
+
+  update public.waste_entries
+     set status = 'reversed', reversal_ledger_id = v_ledger, reversed_by = app.jwt_sub(), reversed_at = now(), reversal_reason = trim(p_reason)
+   where id = p_id;
+  perform app.log_action('inventory.waste_reversed', 'waste_entries', p_id::text, null,
+    jsonb_build_object('reason', p_reason, 'qty_base', e.qty_base, 'stock_restored', e.stock_ledger_id is not null));
+  return app.waste_entry_json(p_id);
+end $fn$;
+revoke all on function public.reverse_waste_entry(uuid, text) from public;
+grant execute on function public.reverse_waste_entry(uuid, text) to authenticated, service_role;
+
+-- The Inventory screen's "− waste" button and the AI's record_waste keep their
+-- signature and guard, and now create a (spoilage) waste entry like everything else.
+create or replace function public.record_ingredient_waste(
+  p_inventory_item_id uuid, p_qty numeric, p_note text
+) returns numeric
+language plpgsql security definer set search_path = public, app as $fn$
+declare r jsonb;
+begin
+  if not (app.has_perm('inventory.manage_waste') or app.has_perm('stock.adjust') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if coalesce(trim(p_note), '') = '' then raise exception 'reason_required' using errcode = 'check_violation'; end if;
+  r := public.record_waste_entry(p_inventory_item_id, p_qty, null, 'spoilage', p_note);
+  return (r ->> 'stock_qty')::numeric;
+end $fn$;
+revoke all on function public.record_ingredient_waste(uuid, numeric, text) from public;
+grant execute on function public.record_ingredient_waste(uuid, numeric, text) to authenticated, service_role;
+
+create or replace function public.set_shelf_life(p_inventory_item_id uuid, p_days int) returns void
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  if not (app.has_perm('stock.update') or app.has_perm('inventory.manage') or app.can_write()) then
+    raise exception 'forbidden' using errcode = 'insufficient_privilege';
+  end if;
+  if p_days is null then
+    delete from public.inventory_shelf_life where inventory_item_id = p_inventory_item_id;
+  elsif p_days between 1 and 3650 then
+    insert into public.inventory_shelf_life (inventory_item_id, shelf_life_days, updated_at, updated_by)
+    values (p_inventory_item_id, p_days, now(), app.jwt_sub())
+    on conflict (inventory_item_id) do update set shelf_life_days = excluded.shelf_life_days, updated_at = now(), updated_by = excluded.updated_by;
+  else
+    raise exception 'bad_days' using errcode = 'check_violation';
+  end if;
+  perform app.log_action('inventory.shelf_life', 'inventory_items', p_inventory_item_id::text, null, jsonb_build_object('days', p_days));
+end $fn$;
+revoke all on function public.set_shelf_life(uuid, int) from public;
+grant execute on function public.set_shelf_life(uuid, int) to authenticated, service_role;
+
+-- ── 6. Finance: a reversed waste is a negative waste event ─────────────────
+create or replace function app.ledger_on_simple() returns trigger
+language plpgsql security definer set search_path = public, app as $fn$
+begin
+  case tg_table_name
+  when 'supplier_payments' then
+    perform app.ledger_post('SUPPLIER_PAYMENT_MADE', 'payable', (-1)::smallint, new.amount_cents, new.paid_at,
+      'supplier_payments', new.id, null, null, new.supplier_id, new.method,
+      jsonb_build_object('reference', new.reference, 'note', new.note));
+  when 'supplier_credit_notes' then
+    perform app.ledger_post('SUPPLIER_CREDIT_NOTE', 'payable', (-1)::smallint, new.amount_cents, now(),
+      'supplier_credit_notes', new.id, new.credit_date, null, new.supplier_id, null,
+      jsonb_build_object('reason', new.reason, 'invoice_id', new.invoice_id));
+  when 'cash_counts' then
+    perform app.ledger_post('CASH_COUNTED', 'cash', 0::smallint, new.counted_cents, new.created_at,
+      'cash_counts', new.id, new.business_date, null, null, 'cash',
+      jsonb_build_object('opening_cents', new.opening_cents, 'expected_cents', new.expected_cents,
+        'difference_cents', new.difference_cents, 'note', new.note));
+  when 'stock_ledger' then
+    if new.reason <> 'order_deduction' then
+      perform app.ledger_post(
+        case new.reason when 'restock' then 'GOODS_RECEIVED' when 'spoilage' then 'WASTE_RECORDED' else 'STOCK_ADJUSTED' end,
+        case new.reason when 'spoilage' then 'waste' else 'inventory' end,
+        -- Waste out is a cost (+1); waste put back (a reversal) takes it away again (−1).
+        case when new.reason = 'spoilage' then (case when new.delta_qty > 0 then -1 else 1 end) else sign(new.delta_qty) end::smallint,
+        round(abs(new.delta_qty) * coalesce(new.unit_cost_cents_base,
+          (select cost_cents_per_base_unit from public.inventory_items where id = new.inventory_item_id), 0))::bigint,
+        new.created_at, 'stock_ledger', new.id, null, new.order_id, null, null,
+        jsonb_build_object('inventory_item_id', new.inventory_item_id, 'qty', new.delta_qty,
+          'reason', new.reason, 'note', new.note, 'cost_estimated', new.unit_cost_cents_base is null));
+    end if;
+  end case;
+  return null;
+end $fn$;
+
+-- Costing reports summed |waste|; a reversal must subtract, so sum −Δ instead.
+do $mig$
+declare fn record; def text; new_def text;
+begin
+  for fn in
+    select p.oid from pg_proc p
+     where p.pronamespace in ('public'::regnamespace, 'app'::regnamespace) and p.prokind = 'f'
+       and p.prosrc like '%sum(abs(delta_qty * unit_cost_cents_base)) filter (where reason = ''spoilage'')%'
+  loop
+    def := pg_get_functiondef(fn.oid);
+    new_def := replace(def, 'sum(abs(delta_qty * unit_cost_cents_base)) filter (where reason = ''spoilage'')',
+                            'sum(-(delta_qty * unit_cost_cents_base)) filter (where reason = ''spoilage'')');
+    if new_def <> def then execute new_def; end if;
+  end loop;
+end $mig$;
+
+-- ── 7. The wastage report ───────────────────────────────────────────────────
+-- One period, per ingredient, straight off the stock ledger (business days in
+-- the restaurant's time zone). Stock at the end of the period is today's stock
+-- minus every movement after it; opening = closing minus the period's
+-- movements. Recorded waste (spoilage, net of reversals) is kept apart from
+-- stock-count differences (unexplained variance). Waste of food an order had
+-- already used is reported on its own and never subtracted from stock again.
+-- Costs are left out (null) without inventory.view_cost. With no branch given it
+-- covers the branches in view (the portal's branch selector, app.in_scope).
+create or replace function public.wastage_report(p_from date, p_to date, p_branch uuid default null) returns jsonb
+language plpgsql stable security definer set search_path = public, app as $fn$
+declare
+  v_tz text; v_min int; v_from timestamptz; v_to timestamptz; v_cost_ok boolean; v_out jsonb;
+begin
+  if not app.can_view_waste() then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  if p_from is null or p_to is null or p_from > p_to or p_to - p_from > 400 then raise exception 'bad_range' using errcode = 'check_violation'; end if;
+  if p_branch is not null and not app.branch_access(p_branch) then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  v_cost_ok := coalesce(app.has_perm('inventory.view_cost') or app.can_write(), false);
+
+  select coalesce(timezone, 'UTC'), coalesce(business_day_start_minutes, 0) into v_tz, v_min from public.business_settings where id;
+  v_tz := coalesce(v_tz, 'UTC'); v_min := coalesce(v_min, 0);
+  v_from := (p_from::timestamp + make_interval(mins => v_min)) at time zone v_tz;
+  v_to   := ((p_to + 1)::timestamp + make_interval(mins => v_min)) at time zone v_tz;
+
+  with led as (
+    select l.*, coalesce(l.unit_cost_cents_base, i.cost_cents_per_base_unit, 0) as cost, l.unit_cost_cents_base is null as estimated
+      from public.stock_ledger l join public.inventory_items i on i.id = l.inventory_item_id
+     where l.created_at >= v_from
+       and (case when p_branch is null then app.in_scope(l.branch_id) else l.branch_id = p_branch end)
+  ),
+  cur as (
+    select bs.inventory_item_id, sum(bs.stock_qty) as qty from public.branch_stock bs
+     where case when p_branch is null then app.in_scope(bs.branch_id) else bs.branch_id = p_branch end
+     group by 1
+  ),
+  per as (
+    select inventory_item_id,
+      coalesce(sum(delta_qty) filter (where created_at >= v_to), 0) as after_qty,
+      coalesce(sum(delta_qty) filter (where created_at < v_to), 0) as period_net,
+      coalesce(sum(delta_qty) filter (where created_at < v_to and reason = 'restock'), 0) as receipts,
+      coalesce(sum(delta_qty) filter (where created_at < v_to and reason = 'adjustment' and delta_qty > 0), 0) as adj_in,
+      coalesce(-sum(delta_qty) filter (where created_at < v_to and reason = 'adjustment' and delta_qty < 0), 0) as adj_out,
+      coalesce(-sum(delta_qty) filter (where created_at < v_to and reason = 'order_deduction'), 0) as usage,
+      coalesce(-sum(delta_qty * cost) filter (where created_at < v_to and reason = 'order_deduction'), 0) as usage_value,
+      coalesce(-sum(delta_qty) filter (where created_at < v_to and reason = 'spoilage'), 0) as waste,
+      coalesce(-sum(delta_qty * cost) filter (where created_at < v_to and reason = 'spoilage'), 0) as waste_value,
+      coalesce(sum(delta_qty) filter (where created_at < v_to and reason = 'stock_take'), 0) as stock_take,
+      count(*) filter (where created_at < v_to and reason in ('spoilage', 'order_deduction') and estimated) as estimated_rows,
+      count(*) filter (where created_at < v_to) as period_rows
+      from led group by 1
+  ),
+  consumed as (   -- waste of food an order already used (no stock movement of its own)
+    select e.inventory_item_id, sum(e.qty_base) as qty, sum(e.cost_cents) as value
+      from public.waste_entries e
+     where e.already_consumed and e.status = 'approved' and e.decided_at >= v_from and e.decided_at < v_to
+       and (case when p_branch is null then app.in_scope(e.branch_id) else e.branch_id = p_branch end)
+     group by 1
+  ),
+  items as (
+    select i.id, i.name, i.unit,
+           coalesce(c.qty, 0) - coalesce(p.after_qty, 0) as closing,
+           coalesce(p.period_net, 0) as period_net, p.receipts, p.adj_in, p.adj_out, p.usage, p.usage_value,
+           p.waste, p.waste_value, p.stock_take, p.estimated_rows,
+           coalesce(k.qty, 0) as waste_after_use, coalesce(k.value, 0) as waste_after_use_value,
+           i.cost_cents_per_base_unit as unit_cost
+      from public.inventory_items i
+      left join per p on p.inventory_item_id = i.id
+      left join cur c on c.inventory_item_id = i.id
+      left join consumed k on k.inventory_item_id = i.id
+     where coalesce(p.period_rows, 0) > 0 or k.inventory_item_id is not null
+  ),
+  wrows as (      -- every waste movement of the period, with its entry's reason
+    select l.inventory_item_id, l.delta_qty, l.cost, app.business_day(l.created_at) as day,
+           coalesce(e1.reason, e2.reason, 'unclassified') as reason
+      from led l
+      left join public.waste_entries e1 on e1.stock_ledger_id = l.id
+      left join public.waste_entries e2 on e2.reversal_ledger_id = l.id
+     where l.reason = 'spoilage' and l.created_at < v_to
+    union all
+    select e.inventory_item_id, -e.qty_base, coalesce(e.unit_cost_cents_base, 0), app.business_day(e.decided_at), e.reason
+      from public.waste_entries e
+     where e.already_consumed and e.status = 'approved' and e.decided_at >= v_from and e.decided_at < v_to
+       and (case when p_branch is null then app.in_scope(e.branch_id) else e.branch_id = p_branch end)
+  )
+  select jsonb_build_object(
+    'from', p_from, 'to', p_to, 'branch_id', p_branch, 'costs_visible', v_cost_ok,
+    'items', coalesce((select jsonb_agg(jsonb_build_object(
+        'inventory_item_id', id, 'name', name, 'unit', unit,
+        'opening_qty', closing - period_net, 'closing_qty', closing,
+        'receipts_qty', coalesce(receipts, 0), 'adjust_in_qty', coalesce(adj_in, 0), 'adjust_out_qty', coalesce(adj_out, 0),
+        'usage_qty', coalesce(usage, 0), 'waste_qty', coalesce(waste, 0), 'stock_take_qty', coalesce(stock_take, 0),
+        'waste_after_use_qty', waste_after_use,
+        'usage_value_cents', case when v_cost_ok then round(coalesce(usage_value, 0)) end,
+        'waste_cost_cents', case when v_cost_ok then round(coalesce(waste_value, 0)) end,
+        'waste_after_use_cost_cents', case when v_cost_ok then round(waste_after_use_value) end,
+        'unit_cost_cents', case when v_cost_ok then unit_cost end,
+        'estimated_cost_rows', coalesce(estimated_rows, 0)) order by name) from items), '[]'::jsonb),
+    'daily', coalesce((select jsonb_agg(jsonb_build_object('day', day, 'events', n,
+        'cost_cents', case when v_cost_ok then round(cost) end) order by day)
+        from (select day, count(*) as n, -sum(delta_qty * cost) as cost from wrows group by day) d), '[]'::jsonb),
+    'by_item_reason', coalesce((select jsonb_agg(jsonb_build_object('inventory_item_id', inventory_item_id, 'reason', reason,
+        'qty', qty, 'cost_cents', case when v_cost_ok then round(cost) end))
+        from (select inventory_item_id, reason, -sum(delta_qty) as qty, -sum(delta_qty * cost) as cost
+                from wrows group by 1, 2) r), '[]'::jsonb)
+  ) into v_out;
+  return v_out;
+end $fn$;
+revoke all on function public.wastage_report(date, date, uuid) from public;
+grant execute on function public.wastage_report(date, date, uuid) to authenticated, service_role;
+
+-- ============================================================================
+-- 0110 — Wastage trend by the day the waste happened.
+--
+-- wastage_report()'s daily series placed every waste movement on the day it
+-- was recorded, so a week of waste entered at once showed as one bar. It now
+-- uses the entry's own date (waste_entries.occurred_on) when that falls in
+-- the period, else the day it was recorded, so the series still adds up to
+-- the period total. Totals, stock and Finance are unchanged.
+-- ============================================================================
+
+create or replace function public.wastage_report(p_from date, p_to date, p_branch uuid default null) returns jsonb
+language plpgsql stable security definer set search_path = public, app as $fn$
+declare
+  v_tz text; v_min int; v_from timestamptz; v_to timestamptz; v_cost_ok boolean; v_out jsonb;
+begin
+  if not app.can_view_waste() then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  if p_from is null or p_to is null or p_from > p_to or p_to - p_from > 400 then raise exception 'bad_range' using errcode = 'check_violation'; end if;
+  if p_branch is not null and not app.branch_access(p_branch) then raise exception 'forbidden' using errcode = 'insufficient_privilege'; end if;
+  v_cost_ok := coalesce(app.has_perm('inventory.view_cost') or app.can_write(), false);
+
+  select coalesce(timezone, 'UTC'), coalesce(business_day_start_minutes, 0) into v_tz, v_min from public.business_settings where id;
+  v_tz := coalesce(v_tz, 'UTC'); v_min := coalesce(v_min, 0);
+  v_from := (p_from::timestamp + make_interval(mins => v_min)) at time zone v_tz;
+  v_to   := ((p_to + 1)::timestamp + make_interval(mins => v_min)) at time zone v_tz;
+
+  with led as (
+    select l.*, coalesce(l.unit_cost_cents_base, i.cost_cents_per_base_unit, 0) as cost, l.unit_cost_cents_base is null as estimated
+      from public.stock_ledger l join public.inventory_items i on i.id = l.inventory_item_id
+     where l.created_at >= v_from
+       and (case when p_branch is null then app.in_scope(l.branch_id) else l.branch_id = p_branch end)
+  ),
+  cur as (
+    select bs.inventory_item_id, sum(bs.stock_qty) as qty from public.branch_stock bs
+     where case when p_branch is null then app.in_scope(bs.branch_id) else bs.branch_id = p_branch end
+     group by 1
+  ),
+  per as (
+    select inventory_item_id,
+      coalesce(sum(delta_qty) filter (where created_at >= v_to), 0) as after_qty,
+      coalesce(sum(delta_qty) filter (where created_at < v_to), 0) as period_net,
+      coalesce(sum(delta_qty) filter (where created_at < v_to and reason = 'restock'), 0) as receipts,
+      coalesce(sum(delta_qty) filter (where created_at < v_to and reason = 'adjustment' and delta_qty > 0), 0) as adj_in,
+      coalesce(-sum(delta_qty) filter (where created_at < v_to and reason = 'adjustment' and delta_qty < 0), 0) as adj_out,
+      coalesce(-sum(delta_qty) filter (where created_at < v_to and reason = 'order_deduction'), 0) as usage,
+      coalesce(-sum(delta_qty * cost) filter (where created_at < v_to and reason = 'order_deduction'), 0) as usage_value,
+      coalesce(-sum(delta_qty) filter (where created_at < v_to and reason = 'spoilage'), 0) as waste,
+      coalesce(-sum(delta_qty * cost) filter (where created_at < v_to and reason = 'spoilage'), 0) as waste_value,
+      coalesce(sum(delta_qty) filter (where created_at < v_to and reason = 'stock_take'), 0) as stock_take,
+      count(*) filter (where created_at < v_to and reason in ('spoilage', 'order_deduction') and estimated) as estimated_rows,
+      count(*) filter (where created_at < v_to) as period_rows
+      from led group by 1
+  ),
+  consumed as (   -- waste of food an order already used (no stock movement of its own)
+    select e.inventory_item_id, sum(e.qty_base) as qty, sum(e.cost_cents) as value
+      from public.waste_entries e
+     where e.already_consumed and e.status = 'approved' and e.decided_at >= v_from and e.decided_at < v_to
+       and (case when p_branch is null then app.in_scope(e.branch_id) else e.branch_id = p_branch end)
+     group by 1
+  ),
+  items as (
+    select i.id, i.name, i.unit,
+           coalesce(c.qty, 0) - coalesce(p.after_qty, 0) as closing,
+           coalesce(p.period_net, 0) as period_net, p.receipts, p.adj_in, p.adj_out, p.usage, p.usage_value,
+           p.waste, p.waste_value, p.stock_take, p.estimated_rows,
+           coalesce(k.qty, 0) as waste_after_use, coalesce(k.value, 0) as waste_after_use_value,
+           i.cost_cents_per_base_unit as unit_cost
+      from public.inventory_items i
+      left join per p on p.inventory_item_id = i.id
+      left join cur c on c.inventory_item_id = i.id
+      left join consumed k on k.inventory_item_id = i.id
+     where coalesce(p.period_rows, 0) > 0 or k.inventory_item_id is not null
+  ),
+  wrows as (      -- every waste movement of the period, with its entry's reason
+    select l.inventory_item_id, l.delta_qty, l.cost,
+           case when coalesce(e1.occurred_on, e2.occurred_on) between p_from and p_to
+                then coalesce(e1.occurred_on, e2.occurred_on) else app.business_day(l.created_at) end as day,
+           coalesce(e1.reason, e2.reason, 'unclassified') as reason
+      from led l
+      left join public.waste_entries e1 on e1.stock_ledger_id = l.id
+      left join public.waste_entries e2 on e2.reversal_ledger_id = l.id
+     where l.reason = 'spoilage' and l.created_at < v_to
+    union all
+    select e.inventory_item_id, -e.qty_base, coalesce(e.unit_cost_cents_base, 0),
+           case when e.occurred_on between p_from and p_to then e.occurred_on else app.business_day(e.decided_at) end, e.reason
+      from public.waste_entries e
+     where e.already_consumed and e.status = 'approved' and e.decided_at >= v_from and e.decided_at < v_to
+       and (case when p_branch is null then app.in_scope(e.branch_id) else e.branch_id = p_branch end)
+  )
+  select jsonb_build_object(
+    'from', p_from, 'to', p_to, 'branch_id', p_branch, 'costs_visible', v_cost_ok,
+    'items', coalesce((select jsonb_agg(jsonb_build_object(
+        'inventory_item_id', id, 'name', name, 'unit', unit,
+        'opening_qty', closing - period_net, 'closing_qty', closing,
+        'receipts_qty', coalesce(receipts, 0), 'adjust_in_qty', coalesce(adj_in, 0), 'adjust_out_qty', coalesce(adj_out, 0),
+        'usage_qty', coalesce(usage, 0), 'waste_qty', coalesce(waste, 0), 'stock_take_qty', coalesce(stock_take, 0),
+        'waste_after_use_qty', waste_after_use,
+        'usage_value_cents', case when v_cost_ok then round(coalesce(usage_value, 0)) end,
+        'waste_cost_cents', case when v_cost_ok then round(coalesce(waste_value, 0)) end,
+        'waste_after_use_cost_cents', case when v_cost_ok then round(waste_after_use_value) end,
+        'unit_cost_cents', case when v_cost_ok then unit_cost end,
+        'estimated_cost_rows', coalesce(estimated_rows, 0)) order by name) from items), '[]'::jsonb),
+    'daily', coalesce((select jsonb_agg(jsonb_build_object('day', day, 'events', n,
+        'cost_cents', case when v_cost_ok then round(cost) end) order by day)
+        from (select day, count(*) as n, -sum(delta_qty * cost) as cost from wrows group by day) d), '[]'::jsonb),
+    'by_item_reason', coalesce((select jsonb_agg(jsonb_build_object('inventory_item_id', inventory_item_id, 'reason', reason,
+        'qty', qty, 'cost_cents', case when v_cost_ok then round(cost) end))
+        from (select inventory_item_id, reason, -sum(delta_qty) as qty, -sum(delta_qty * cost) as cost
+                from wrows group by 1, 2) r), '[]'::jsonb)
+  ) into v_out;
+  return v_out;
+end $fn$;
+revoke all on function public.wastage_report(date, date, uuid) from public;
+grant execute on function public.wastage_report(date, date, uuid) to authenticated, service_role;
+
+-- ============================================================================
+-- 0111 — Kiosk portals: idle sign-out, and waste entry from a kitchen station.
+--
+-- portals.idle_minutes: a station login (shared counter / kitchen tablet) is
+-- signed out after this many minutes without a touch or key press. NULL = never
+-- (the behaviour so far). Set in Portal Management; enforced by the kiosk page.
+--
+-- waste_item_options(): the ingredient list for the waste entry form. A kitchen
+-- station that may record waste (kitchen.record_waste) usually has no stock.view,
+-- so it can't read inventory_items itself; this returns only what the form needs
+-- (name, unit, purchase unit, this branch's stock) to anyone app.can_record_waste()
+-- allows (tenant-migrations/0109), and nothing to anyone else.
+-- ============================================================================
+
+alter table public.portals add column if not exists idle_minutes int
+  check (idle_minutes is null or idle_minutes between 1 and 720);
+
+create or replace function public.waste_item_options()
+returns table (id uuid, name text, unit text, stock_qty numeric, min_threshold numeric,
+               purchase_unit_label text, purchase_unit_to_base numeric)
+language sql stable security definer set search_path = public, app as $fn$
+  select i.id, i.name, i.unit, i.stock_qty, i.min_threshold, i.purchase_unit_label, i.purchase_unit_to_base
+    from app.inv i
+   where app.can_record_waste()
+   order by i.name
+$fn$;
+revoke all on function public.waste_item_options() from public;
+grant execute on function public.waste_item_options() to authenticated, service_role;
